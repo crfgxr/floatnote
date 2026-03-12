@@ -1,0 +1,8 @@
+.auth.json
+captures/
+node_modules/
+.build/
+.swiftpm/
+.chrome-profile/
+.DS_Store
+package-lock.json
