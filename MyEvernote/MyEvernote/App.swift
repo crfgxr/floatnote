@@ -129,6 +129,7 @@ class EditorViewModel: ObservableObject {
     var activeTab: NoteTab? { tabs.first { $0.id == activeTabId } }
     var attributedText = NSMutableAttributedString()
     var onContentLoaded: ((NSAttributedString) -> Void)?
+    var isLoadingContent = false
 
     private var api: EvernoteAPI?
     private var noteGuid: String?
@@ -307,6 +308,14 @@ class EditorViewModel: ObservableObject {
     func switchTab(_ id: UUID) {
         guard id != activeTabId, let newTab = tabs.first(where: { $0.id == id }) else { return }
 
+        // Commit any active rename
+        if let editId = editingTabId {
+            if let tab = tabs.first(where: { $0.id == editId }) {
+                renameTab(editId, title: tab.title)
+            }
+            editingTabId = nil
+        }
+
         // Save current tab's state
         if let current = activeTab {
             current.html = currentHTML
@@ -319,6 +328,7 @@ class EditorViewModel: ObservableObject {
         currentHTML = newTab.html
         lastSavedHTML = newTab.lastSavedHTML
 
+        isLoadingContent = true
         if let attrStr = htmlToAttributedString(newTab.html) {
             attributedText = NSMutableAttributedString(attributedString: attrStr)
             charCount = attributedText.length
@@ -328,6 +338,8 @@ class EditorViewModel: ObservableObject {
             charCount = 0
             onContentLoaded?(NSAttributedString(string: ""))
         }
+        // Reset flag after async onContentLoaded completes
+        DispatchQueue.main.async { self.isLoadingContent = false }
         status = "Loaded"
     }
 
@@ -348,15 +360,43 @@ class EditorViewModel: ObservableObject {
         onContentLoaded?(NSAttributedString(string: ""))
         saveTabsLocal()
         status = "New note"
+
+        // Create note on Evernote
+        if let api {
+            Task {
+                do {
+                    let guid = try await api.createNote(title: tab.title, body: "<p></p>", notebookGuid: BUCKET_GUID)
+                    tab.noteGuid = guid
+                    noteGuid = guid
+                    saveTabsLocal()
+                    status = "Created"
+                } catch {
+                    NSLog("Failed to create Evernote note: %@", "\(error)")
+                    status = "Local only"
+                }
+            }
+        }
     }
 
-    func closeTab(_ id: UUID) {
+    func deleteTab(_ id: UUID) {
         guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        tabs.remove(at: index)
+        let tab = tabs[index]
 
+        // Delete from Evernote
+        if let guid = tab.noteGuid, let api {
+            Task {
+                _ = try? await api.deleteNote(guid: guid)
+            }
+        }
+
+        // Switch away if deleting the active tab
         if activeTabId == id {
-            let newIndex = min(index, tabs.count - 1)
-            switchTab(tabs[newIndex].id)
+            let newIndex = index > 0 ? index - 1 : 1
+            let nextTab = tabs[newIndex]
+            tabs.remove(at: index)
+            switchTab(nextTab.id)
+        } else {
+            tabs.remove(at: index)
         }
         saveTabsLocal()
     }
@@ -366,9 +406,18 @@ class EditorViewModel: ObservableObject {
         tab.title = title
         editingTabId = nil
         saveTabsLocal()
+
+        // Sync title to Evernote
+        if let guid = tab.noteGuid, let api {
+            Task {
+                let enml = htmlToEnml(tab.html.isEmpty ? "<p></p>" : tab.html)
+                _ = try? await api.updateNote(guid: guid, title: title, content: enml)
+            }
+        }
     }
 
     func textDidChange(html: String, length: Int) {
+        guard !isLoadingContent else { return }
         charCount = length
         currentHTML = html
         activeTab?.html = html
@@ -435,7 +484,7 @@ class EditorViewModel: ObservableObject {
 
         let enml = htmlToEnml(html)
         do {
-            _ = try await api.updateNote(guid: guid, title: NOTE_TITLE, content: enml)
+            _ = try await api.updateNote(guid: guid, title: activeTab?.title ?? NOTE_TITLE, content: enml)
             lastSavedHTML = html
             status = "Saved"
         } catch {
@@ -585,18 +634,6 @@ struct TabItemView: View {
                     .font(.system(size: 11, weight: isActive ? .semibold : .regular))
                     .foregroundColor(isActive ? .primary : .secondary)
                     .lineLimit(1)
-                    .onTapGesture(count: 2) { vm.editingTabId = tab.id }
-                    .onTapGesture(count: 1) { vm.switchTab(tab.id) }
-            }
-            if vm.tabs.count > 1 {
-                Button(action: { vm.closeTab(tab.id) }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(.secondary)
-                        .frame(width: 14, height: 14)
-                }
-                .buttonStyle(.plain)
-                .opacity(isActive ? 1 : 0.5)
             }
         }
         .padding(.horizontal, 10)
@@ -606,6 +643,17 @@ struct TabItemView: View {
                 .fill(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
         )
         .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering { NSCursor.arrow.push() } else { NSCursor.pop() }
+        }
+        .onTapGesture(count: 2) {
+            vm.editingTabId = tab.id
+        }
+        .onTapGesture(count: 1) {
+            if vm.editingTabId != tab.id {
+                vm.switchTab(tab.id)
+            }
+        }
     }
 }
 
@@ -626,6 +674,15 @@ struct StatusBar: View {
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
             Spacer()
+            if vm.tabs.count > 1 {
+                Button(action: { vm.deleteTab(vm.activeTabId!) }) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Delete this notepad")
+            }
             Button(action: { Task { await vm.saveNow() } }) {
                 HStack(spacing: 3) {
                     Image(systemName: "arrow.triangle.2.circlepath")
@@ -1303,41 +1360,85 @@ struct RichTextEditor: NSViewRepresentable {
         private func insertAtLineStart(textView: NSTextView, prefix: String) {
             let range = textView.selectedRange()
             guard let storage = textView.textStorage else { return }
-            let lineRange = (storage.string as NSString).lineRange(for: range)
-            let attrPrefix = NSAttributedString(string: prefix, attributes: [
-                .font: bodyFont,
-                .foregroundColor: textColor
-            ])
-            storage.insert(attrPrefix, at: lineRange.location)
+            let str = storage.string as NSString
+            let fullLineRange = str.lineRange(for: range)
+
+            // Collect line start positions (iterate backwards to preserve offsets)
+            var lineStarts: [Int] = []
+            var pos = fullLineRange.location
+            while pos < NSMaxRange(fullLineRange) {
+                lineStarts.append(pos)
+                let lr = str.lineRange(for: NSRange(location: pos, length: 0))
+                pos = NSMaxRange(lr)
+            }
+
+            storage.beginEditing()
+            for start in lineStarts.reversed() {
+                let lineStr = str.substring(with: str.lineRange(for: NSRange(location: start, length: 0)))
+                let trimmed = lineStr.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                if lineStr.hasPrefix(prefix) {
+                    // Remove prefix (toggle off)
+                    storage.replaceCharacters(in: NSRange(location: start, length: prefix.count), with: "")
+                } else {
+                    let attrPrefix = NSAttributedString(string: prefix, attributes: [
+                        .font: bodyFont,
+                        .foregroundColor: textColor
+                    ])
+                    storage.insert(attrPrefix, at: start)
+                }
+            }
+            storage.endEditing()
         }
 
         private func toggleChecklist(textView: NSTextView, storage: NSTextStorage, range: NSRange) {
             let str = storage.string as NSString
-            let lineRange = str.lineRange(for: range)
-            let lineStr = str.substring(with: lineRange)
+            let fullLineRange = str.lineRange(for: range)
 
-            if lineStr.hasPrefix("☐ ") || lineStr.hasPrefix("☑ ") {
-                // Remove checkbox prefix
-                storage.replaceCharacters(in: NSRange(location: lineRange.location, length: 2), with: "")
-                let newLineRange = (storage.string as NSString).lineRange(for: NSRange(location: min(lineRange.location, storage.length - 1), length: 0))
-                if newLineRange.length > 0 {
-                    storage.removeAttribute(.strikethroughStyle, range: newLineRange)
-                    storage.addAttribute(.foregroundColor, value: textColor, range: newLineRange)
-                }
-            } else {
-                // Add checkbox
-                let attrPrefix = NSAttributedString(string: "☐ ", attributes: [
-                    .font: bodyFont,
-                    .foregroundColor: textColor
-                ])
-                storage.insert(attrPrefix, at: lineRange.location)
+            // Collect line start positions
+            var lineStarts: [Int] = []
+            var pos = fullLineRange.location
+            while pos < NSMaxRange(fullLineRange) {
+                lineStarts.append(pos)
+                let lr = str.lineRange(for: NSRange(location: pos, length: 0))
+                pos = NSMaxRange(lr)
             }
+
+            storage.beginEditing()
+            for start in lineStarts.reversed() {
+                let currentStr = storage.string as NSString
+                let lineRange = currentStr.lineRange(for: NSRange(location: min(start, currentStr.length - 1), length: 0))
+                let lineStr = currentStr.substring(with: lineRange)
+                let trimmed = lineStr.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+
+                if lineStr.hasPrefix("☐ ") || lineStr.hasPrefix("☑ ") {
+                    // Remove checkbox prefix
+                    storage.replaceCharacters(in: NSRange(location: lineRange.location, length: 2), with: "")
+                    let newStr = storage.string as NSString
+                    let newLineRange = newStr.lineRange(for: NSRange(location: min(lineRange.location, newStr.length - 1), length: 0))
+                    if newLineRange.length > 0 {
+                        storage.removeAttribute(.strikethroughStyle, range: newLineRange)
+                        storage.addAttribute(.foregroundColor, value: textColor, range: newLineRange)
+                    }
+                } else {
+                    let attrPrefix = NSAttributedString(string: "☐ ", attributes: [
+                        .font: bodyFont,
+                        .foregroundColor: textColor
+                    ])
+                    storage.insert(attrPrefix, at: lineRange.location)
+                }
+            }
+            storage.endEditing()
         }
 
         // Handle bold/italic keyboard shortcuts
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
                 return handleNewline(textView: textView)
+            }
+            if commandSelector == #selector(NSResponder.insertTab(_:)) {
+                return handleTab(textView: textView)
             }
             return false
         }
@@ -1348,6 +1449,27 @@ struct RichTextEditor: NSViewRepresentable {
             let str = storage.string as NSString
             let lineRange = str.lineRange(for: NSRange(location: range.location, length: 0))
             let lineStr = str.substring(with: lineRange)
+
+            // Reset heading to body font on Enter
+            if range.location > 0 {
+                let charBefore = max(0, range.location - 1)
+                if let font = storage.attribute(.font, at: charBefore, effectiveRange: nil) as? NSFont {
+                    let size = font.pointSize
+                    if size == h1Font.pointSize || size == h2Font.pointSize || size == h3Font.pointSize {
+                        // Insert newline with body font, don't let heading continue
+                        let newline = NSAttributedString(string: "\n", attributes: [
+                            .font: bodyFont,
+                            .foregroundColor: textColor
+                        ])
+                        storage.replaceCharacters(in: range, with: newline)
+                        textView.setSelectedRange(NSRange(location: range.location + 1, length: 0))
+                        textView.typingAttributes[.font] = bodyFont
+                        textView.typingAttributes[.foregroundColor] = textColor
+                        textView.didChangeText()
+                        return true
+                    }
+                }
+            }
 
             // Checklist continuation
             for prefix in ["☐ ", "☑ "] {
@@ -1391,6 +1513,45 @@ struct RichTextEditor: NSViewRepresentable {
             }
 
             return false
+        }
+
+        private func handleTab(textView: NSTextView) -> Bool {
+            guard let storage = textView.textStorage else { return false }
+            let range = textView.selectedRange()
+            let str = storage.string as NSString
+            let fullLineRange = str.lineRange(for: range)
+            let indent = "    "
+
+            // Collect all line starts in selection
+            var lineStarts: [Int] = []
+            var pos = fullLineRange.location
+            while pos < NSMaxRange(fullLineRange) {
+                lineStarts.append(pos)
+                let lr = str.lineRange(for: NSRange(location: pos, length: 0))
+                pos = NSMaxRange(lr)
+            }
+
+            // If multiple lines or cursor is on a bullet/checklist line, indent lines
+            let firstLineStr = str.substring(with: str.lineRange(for: NSRange(location: fullLineRange.location, length: 0)))
+            let hasList = firstLineStr.hasPrefix("• ") || firstLineStr.hasPrefix("☐ ") || firstLineStr.hasPrefix("☑ ")
+
+            if lineStarts.count > 1 || hasList {
+                storage.beginEditing()
+                for start in lineStarts.reversed() {
+                    let attrIndent = NSAttributedString(string: indent, attributes: [
+                        .font: bodyFont,
+                        .foregroundColor: textColor
+                    ])
+                    storage.insert(attrIndent, at: start)
+                }
+                storage.endEditing()
+                textView.didChangeText()
+                return true
+            }
+
+            // Plain text: just insert spaces at cursor
+            textView.insertText(indent, replacementRange: range)
+            return true
         }
     }
 }
