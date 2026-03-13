@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "MyEvernote",
+    name: "FloatNote",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "MyEvernote",
-            path: "MyEvernote"
+            name: "FloatNote",
+            path: "FloatNote"
         ),
     ]
 )

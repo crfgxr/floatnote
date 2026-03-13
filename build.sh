@@ -1,7 +1,7 @@
 #!/bin/bash
-cd "$(dirname "$0")/MyEvernote"
-pkill -f "MyEvernote.app" 2>/dev/null
+cd "$(dirname "$0")/FloatNote"
+pkill -f "FloatNote.app" 2>/dev/null
 swift build -c release 2>&1
-cp .build/release/MyEvernote "/Applications/MyEvernote.app/Contents/MacOS/MyEvernote"
-open /Applications/MyEvernote.app
+cp .build/release/FloatNote "/Applications/FloatNote.app/Contents/MacOS/FloatNote"
+open /Applications/FloatNote.app
 echo "Done — app updated and launched."

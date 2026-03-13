@@ -1,4 +1,4 @@
-# MyEvernote
+# FloatNote
 
 A native macOS rich text editor that syncs to Evernote.
 
@@ -39,12 +39,12 @@ After any code change:
 ```
 ./build.sh
 ```
-This rebuilds the release binary and updates `/Applications/MyEvernote.app`.
+This rebuilds the release binary and updates `/Applications/FloatNote.app`.
 
 ## Architecture
 
-- `MyEvernote/MyEvernote/App.swift` — SwiftUI app, views, ViewModel, rich text editor
-- `MyEvernote/MyEvernote/EvernoteAPI.swift` — Evernote Thrift binary protocol client
+- `FloatNote/FloatNote/App.swift` — SwiftUI app, views, ViewModel, rich text editor
+- `FloatNote/FloatNote/EvernoteAPI.swift` — Evernote Thrift binary protocol client
 - `login.js` — Playwright-based browser login to capture auth tokens
 - `cli.js` — Node.js CLI for Evernote operations
 - `evernote-api.js` — Node.js Evernote API client

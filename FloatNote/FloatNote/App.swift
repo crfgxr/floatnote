@@ -1,13 +1,25 @@
 import SwiftUI
 import AppKit
 
+func dbg(_ msg: String) {
+    let path = NSHomeDirectory() + "/.floatnote-debug.log"
+    let line = "\(Date()): \(msg)\n"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let fh = FileHandle(forWritingAtPath: path) {
+                fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
+            }
+        } else { try? data.write(to: URL(fileURLWithPath: path)) }
+    }
+}
+
 let BUCKET_GUID = "bf100d62-31b3-ac11-298c-6a90ae689031"
 let NOTE_TITLE = "editor"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.evernote-editor-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.evernote-editor-tabs.json"
 
 @main
-struct EvernoteApp: App {
+struct FloatNoteApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var vm = EditorViewModel()
 
@@ -35,6 +47,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
+        dbg("APP LAUNCHED")
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -119,7 +132,6 @@ class NoteTab: Identifiable, ObservableObject {
 class EditorViewModel: ObservableObject {
     @Published var status: String = "Loading..."
     @Published var isSaving = false
-    @Published var formatAction: FormatAction? = nil
     @Published var charCount: Int = 0
     @Published var isPinned: Bool = false
     @Published var tabs: [NoteTab] = []
@@ -129,6 +141,7 @@ class EditorViewModel: ObservableObject {
     var activeTab: NoteTab? { tabs.first { $0.id == activeTabId } }
     var attributedText = NSMutableAttributedString()
     var onContentLoaded: ((NSAttributedString) -> Void)?
+    weak var editorCoordinator: RichTextEditor.Coordinator?
     var isLoadingContent = false
 
     private var api: EvernoteAPI?
@@ -435,6 +448,21 @@ class EditorViewModel: ObservableObject {
         }
     }
 
+    func performFormat(_ action: FormatAction) {
+        guard let coordinator = editorCoordinator, let textView = coordinator.textView else {
+            dbg("performFormat BAIL: coordinator=\(editorCoordinator != nil), textView=\(editorCoordinator?.textView != nil)")
+            return
+        }
+        textView.window?.makeFirstResponder(textView)
+        let savedRange = coordinator.lastSelectedRange
+        let maxLen = textView.textStorage?.length ?? 0
+        dbg("performFormat: action=\(action), savedRange=(\(savedRange.location),\(savedRange.length)), storageLen=\(maxLen)")
+        if savedRange.location <= maxLen && NSMaxRange(savedRange) <= maxLen {
+            textView.setSelectedRange(savedRange)
+        }
+        coordinator.applyFormat(action, textView: textView)
+    }
+
     func togglePin() {
         isPinned.toggle()
         if let window = NSApp.windows.first(where: { $0.isKeyWindow }) ?? NSApp.windows.first {
@@ -587,27 +615,80 @@ struct EditorView: View {
 
 struct TabBar: View {
     @EnvironmentObject var vm: EditorViewModel
+    @State private var scrollProxy: ScrollViewProxy?
+    @State private var contentWidth: CGFloat = 0
+    @State private var containerWidth: CGFloat = 0
+
+    private var overflows: Bool { contentWidth > containerWidth + 1 }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 0) {
-                ForEach(vm.tabs) { tab in
-                    TabItemView(tab: tab)
-                }
-                Button(action: { vm.addTab() }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 11))
-                        .frame(width: 24, height: 26)
+        HStack(spacing: 0) {
+            if overflows {
+                Button(action: { scrollTo(direction: -1) }) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 10, weight: .bold))
+                        .frame(width: 20, height: 26)
                 }
                 .buttonStyle(.plain)
-                .padding(.leading, 4)
-                Spacer()
+                .foregroundColor(.secondary)
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 0) {
+                        ForEach(vm.tabs) { tab in
+                            TabItemView(tab: tab)
+                                .id(tab.id)
+                        }
+                        Button(action: { vm.addTab() }) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 11))
+                                .frame(width: 24, height: 26)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.leading, 4)
+                    }
+                    .background(GeometryReader { inner in
+                        Color.clear.preference(key: ContentWidthKey.self, value: inner.size.width)
+                    })
+                }
+                .onAppear { scrollProxy = proxy }
+                .onChange(of: vm.activeTabId) { _, id in
+                    if let id { withAnimation { proxy.scrollTo(id, anchor: .center) } }
+                }
+            }
+
+            if overflows {
+                Button(action: { scrollTo(direction: 1) }) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .frame(width: 20, height: 26)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
             }
         }
-        .padding(.horizontal, 8)
+        .background(GeometryReader { geo in
+            Color.clear.onAppear { containerWidth = geo.size.width }
+                .onChange(of: geo.size.width) { _, w in containerWidth = w }
+        })
+        .onPreferenceChange(ContentWidthKey.self) { contentWidth = $0 }
+        .padding(.horizontal, 4)
         .padding(.vertical, 2)
         .background(.bar)
     }
+
+    private func scrollTo(direction: Int) {
+        guard let activeId = vm.activeTabId,
+              let idx = vm.tabs.firstIndex(where: { $0.id == activeId }) else { return }
+        let targetIdx = max(0, min(vm.tabs.count - 1, idx + direction))
+        withAnimation { scrollProxy?.scrollTo(vm.tabs[targetIdx].id, anchor: .center) }
+    }
+}
+
+private struct ContentWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 struct TabItemView: View {
@@ -764,18 +845,18 @@ struct FormatToolbar: View {
 
     var body: some View {
         FlowLayout(spacing: 4) {
-            toolBtn("H1") { vm.formatAction = .heading1 }
-            toolBtn("H2") { vm.formatAction = .heading2 }
-            toolBtn("H3") { vm.formatAction = .heading3 }
-            toolBtn("Body") { vm.formatAction = .body }
-            iconBtn("bold") { vm.formatAction = .bold }
-            iconBtn("italic") { vm.formatAction = .italic }
-            iconBtn("underline") { vm.formatAction = .underline }
-            iconBtn("chevron.left.forwardslash.chevron.right") { vm.formatAction = .code }
-            iconBtn("list.bullet") { vm.formatAction = .bulletList }
-            iconBtn("checklist") { vm.formatAction = .checklist }
-            iconBtn("link") { vm.formatAction = .link }
-            iconBtn("minus") { vm.formatAction = .divider }
+            toolBtn("H1") { vm.performFormat(.heading1) }
+            toolBtn("H2") { vm.performFormat(.heading2) }
+            toolBtn("H3") { vm.performFormat(.heading3) }
+            toolBtn("Body") { vm.performFormat(.body) }
+            iconBtn("bold") { vm.performFormat(.bold) }
+            iconBtn("italic") { vm.performFormat(.italic) }
+            iconBtn("underline") { vm.performFormat(.underline) }
+            iconBtn("chevron.left.forwardslash.chevron.right") { vm.performFormat(.code) }
+            iconBtn("list.bullet") { vm.performFormat(.bulletList) }
+            iconBtn("checklist") { vm.performFormat(.checklist) }
+            iconBtn("link") { vm.performFormat(.link) }
+            iconBtn("minus") { vm.performFormat(.divider) }
             Button(action: { vm.togglePin() }) {
                 Image(systemName: vm.isPinned ? "pin.fill" : "pin")
                     .frame(width: 28, height: 24)
@@ -1076,19 +1157,27 @@ struct RichTextEditor: NSViewRepresentable {
                 // Move cursor to start
                 textView.setSelectedRange(NSRange(location: 0, length: 0))
                 textView.updateCaretPosition()
+                // Reset typing attributes to defaults (prevents stale styles leaking between tabs)
+                let defaultParagraph = NSMutableParagraphStyle()
+                defaultParagraph.baseWritingDirection = .leftToRight
+                defaultParagraph.alignment = .left
+                let defaultFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
+                textView.typingAttributes = [
+                    .font: defaultFont,
+                    .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
+                    .paragraphStyle: defaultParagraph
+                ]
+                // Sync coordinator's lastSelectedRange so toolbar buttons work
+                self.vm.editorCoordinator?.lastSelectedRange = NSRange(location: 0, length: 0)
             }
         }
+
+        vm.editorCoordinator = context.coordinator
 
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let action = vm.formatAction else { return }
-        let textView = scrollView.documentView as! BlockCaretTextView
-        DispatchQueue.main.async {
-            context.coordinator.applyFormat(action, textView: textView)
-            self.vm.formatAction = nil
-        }
     }
 
     class Coordinator: NSObject, NSTextViewDelegate {
@@ -1103,8 +1192,14 @@ struct RichTextEditor: NSViewRepresentable {
         let textColor = NSColor(calibratedWhite: 0.88, alpha: 1.0)
 
         private var isProcessingMarkdown = false
+        var lastSelectedRange: NSRange = NSRange(location: 0, length: 0)
 
         init(vm: EditorViewModel) { self.vm = vm }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            lastSelectedRange = textView.selectedRange()
+        }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
@@ -1266,14 +1361,23 @@ struct RichTextEditor: NSViewRepresentable {
 
         func applyFormat(_ action: FormatAction, textView: NSTextView) {
             let range = textView.selectedRange()
-            guard let storage = textView.textStorage else { return }
+            guard let storage = textView.textStorage else {
+                dbg("applyFormat BAIL: storage is nil")
+                return
+            }
+            dbg("applyFormat: action=\(action), range=(\(range.location),\(range.length)), storageLen=\(storage.length), text='\(storage.string.prefix(50))'")
 
             switch action {
             case .bold:
+                storage.beginEditing()
                 toggleTrait(.boldFontMask, in: range, storage: storage, textView: textView)
+                storage.endEditing()
             case .italic:
+                storage.beginEditing()
                 toggleTrait(.italicFontMask, in: range, storage: storage, textView: textView)
+                storage.endEditing()
             case .underline:
+                storage.beginEditing()
                 if range.length > 0 {
                     let current = storage.attribute(.underlineStyle, at: range.location, effectiveRange: nil) as? Int ?? 0
                     let newVal = current == 0 ? NSUnderlineStyle.single.rawValue : 0
@@ -1282,19 +1386,30 @@ struct RichTextEditor: NSViewRepresentable {
                     let current = textView.typingAttributes[.underlineStyle] as? Int ?? 0
                     textView.typingAttributes[.underlineStyle] = current == 0 ? NSUnderlineStyle.single.rawValue : 0
                 }
+                storage.endEditing()
             case .heading1:
+                storage.beginEditing()
                 applyFont(h1Font, in: range, storage: storage, textView: textView)
+                storage.endEditing()
             case .heading2:
+                storage.beginEditing()
                 applyFont(h2Font, in: range, storage: storage, textView: textView)
+                storage.endEditing()
             case .heading3:
+                storage.beginEditing()
                 applyFont(h3Font, in: range, storage: storage, textView: textView)
+                storage.endEditing()
             case .body:
+                storage.beginEditing()
                 applyFont(bodyFont, in: range, storage: storage, textView: textView)
+                storage.endEditing()
             case .code:
+                storage.beginEditing()
                 applyFont(codeFont, in: range, storage: storage, textView: textView)
                 if range.length > 0 {
                     storage.addAttribute(.backgroundColor, value: NSColor(calibratedWhite: 0.18, alpha: 1.0), range: range)
                 }
+                storage.endEditing()
             case .bulletList:
                 insertAtLineStart(textView: textView, prefix: "• ")
             case .checklist:
@@ -1311,6 +1426,7 @@ struct RichTextEditor: NSViewRepresentable {
                 if alert.runModal() == .alertFirstButtonReturn {
                     let url = input.stringValue
                     if !url.isEmpty {
+                        storage.beginEditing()
                         let linkStr = NSMutableAttributedString(string: sel, attributes: [
                             .link: URL(string: url) as Any,
                             .foregroundColor: NSColor(calibratedRed: 0.42, green: 0.68, blue: 1.0, alpha: 1.0),
@@ -1318,15 +1434,19 @@ struct RichTextEditor: NSViewRepresentable {
                             .font: bodyFont
                         ])
                         storage.replaceCharacters(in: range, with: linkStr)
+                        storage.endEditing()
                     }
                 }
             case .divider:
+                storage.beginEditing()
                 let divider = NSMutableAttributedString(string: "\n───────────────────\n", attributes: [
                     .foregroundColor: NSColor(calibratedWhite: 0.35, alpha: 1.0),
                     .font: bodyFont
                 ])
                 storage.insert(divider, at: range.location)
+                storage.endEditing()
             }
+            textView.didChangeText()
         }
 
         private func toggleTrait(_ trait: NSFontTraitMask, in range: NSRange, storage: NSTextStorage, textView: NSTextView) {
@@ -1361,7 +1481,25 @@ struct RichTextEditor: NSViewRepresentable {
             let range = textView.selectedRange()
             guard let storage = textView.textStorage else { return }
             let str = storage.string as NSString
-            let fullLineRange = str.lineRange(for: range)
+
+            // Handle cursor at end of text or empty document — use previous character's line
+            let adjustedRange: NSRange
+            if str.length == 0 {
+                // Empty document — just insert prefix
+                storage.beginEditing()
+                let attrPrefix = NSAttributedString(string: prefix, attributes: [.font: bodyFont, .foregroundColor: textColor])
+                storage.insert(attrPrefix, at: 0)
+                storage.endEditing()
+                textView.setSelectedRange(NSRange(location: prefix.count, length: 0))
+                return
+            } else if range.location == str.length && range.length == 0 {
+                adjustedRange = NSRange(location: max(0, range.location - 1), length: 0)
+            } else {
+                adjustedRange = range
+            }
+
+            let fullLineRange = str.lineRange(for: adjustedRange)
+            dbg("insertAtLineStart: prefix='\(prefix)', range=(\(range.location),\(range.length)), adjusted=(\(adjustedRange.location),\(adjustedRange.length)), fullLine=(\(fullLineRange.location),\(fullLineRange.length)), strLen=\(str.length)")
 
             // Collect line start positions (iterate backwards to preserve offsets)
             var lineStarts: [Int] = []
@@ -1371,21 +1509,40 @@ struct RichTextEditor: NSViewRepresentable {
                 let lr = str.lineRange(for: NSRange(location: pos, length: 0))
                 pos = NSMaxRange(lr)
             }
+            dbg("insertAtLineStart: lineStarts=\(lineStarts)")
+
+            let skipEmpty = lineStarts.count > 1 // Only skip empty lines in multi-line selections
 
             storage.beginEditing()
             for start in lineStarts.reversed() {
-                let lineStr = str.substring(with: str.lineRange(for: NSRange(location: start, length: 0)))
+                let currentStr = storage.string as NSString
+                let lr = currentStr.lineRange(for: NSRange(location: min(start, max(0, currentStr.length - 1)), length: 0))
+                let lineStr = lr.length > 0 ? currentStr.substring(with: lr) : ""
                 let trimmed = lineStr.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty { continue }
+                if skipEmpty && trimmed.isEmpty { continue }
                 if lineStr.hasPrefix(prefix) {
-                    // Remove prefix (toggle off)
-                    storage.replaceCharacters(in: NSRange(location: start, length: prefix.count), with: "")
+                    // Toggle off
+                    storage.replaceCharacters(in: NSRange(location: lr.location, length: prefix.count), with: "")
                 } else {
+                    // Remove other list prefixes first
+                    let otherPrefixes = ["• ", "☐ ", "☑ "].filter { $0 != prefix }
+                    var insertAt = lr.location
+                    for other in otherPrefixes {
+                        let curStr = storage.string as NSString
+                        let curLr = curStr.lineRange(for: NSRange(location: min(insertAt, max(0, curStr.length - 1)), length: 0))
+                        let curLine = curLr.length > 0 ? curStr.substring(with: curLr) : ""
+                        if curLine.hasPrefix(other) {
+                            storage.replaceCharacters(in: NSRange(location: curLr.location, length: other.count), with: "")
+                            break
+                        }
+                    }
+                    let curStr2 = storage.string as NSString
+                    let curLr2 = curStr2.lineRange(for: NSRange(location: min(insertAt, max(0, curStr2.length - 1)), length: 0))
                     let attrPrefix = NSAttributedString(string: prefix, attributes: [
                         .font: bodyFont,
                         .foregroundColor: textColor
                     ])
-                    storage.insert(attrPrefix, at: start)
+                    storage.insert(attrPrefix, at: curLr2.location)
                 }
             }
             storage.endEditing()
@@ -1393,7 +1550,23 @@ struct RichTextEditor: NSViewRepresentable {
 
         private func toggleChecklist(textView: NSTextView, storage: NSTextStorage, range: NSRange) {
             let str = storage.string as NSString
-            let fullLineRange = str.lineRange(for: range)
+
+            // Handle cursor at end of text
+            let adjustedRange: NSRange
+            if str.length == 0 {
+                storage.beginEditing()
+                let attrPrefix = NSAttributedString(string: "☐ ", attributes: [.font: bodyFont, .foregroundColor: textColor])
+                storage.insert(attrPrefix, at: 0)
+                storage.endEditing()
+                textView.setSelectedRange(NSRange(location: 2, length: 0))
+                return
+            } else if range.location == str.length && range.length == 0 {
+                adjustedRange = NSRange(location: max(0, range.location - 1), length: 0)
+            } else {
+                adjustedRange = range
+            }
+
+            let fullLineRange = str.lineRange(for: adjustedRange)
 
             // Collect line start positions
             var lineStarts: [Int] = []
@@ -1404,13 +1577,15 @@ struct RichTextEditor: NSViewRepresentable {
                 pos = NSMaxRange(lr)
             }
 
+            let skipEmpty = lineStarts.count > 1
+
             storage.beginEditing()
             for start in lineStarts.reversed() {
                 let currentStr = storage.string as NSString
-                let lineRange = currentStr.lineRange(for: NSRange(location: min(start, currentStr.length - 1), length: 0))
-                let lineStr = currentStr.substring(with: lineRange)
+                let lineRange = currentStr.lineRange(for: NSRange(location: min(start, max(0, currentStr.length - 1)), length: 0))
+                let lineStr = lineRange.length > 0 ? currentStr.substring(with: lineRange) : ""
                 let trimmed = lineStr.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty { continue }
+                if skipEmpty && trimmed.isEmpty { continue }
 
                 if lineStr.hasPrefix("☐ ") || lineStr.hasPrefix("☑ ") {
                     // Remove checkbox prefix
@@ -1422,11 +1597,18 @@ struct RichTextEditor: NSViewRepresentable {
                         storage.addAttribute(.foregroundColor, value: textColor, range: newLineRange)
                     }
                 } else {
+                    // Remove bullet prefix first if present
+                    var insertAt = lineRange.location
+                    if lineStr.hasPrefix("• ") {
+                        storage.replaceCharacters(in: NSRange(location: lineRange.location, length: 2), with: "")
+                    }
+                    let curStr = storage.string as NSString
+                    let curLr = curStr.lineRange(for: NSRange(location: min(insertAt, max(0, curStr.length - 1)), length: 0))
                     let attrPrefix = NSAttributedString(string: "☐ ", attributes: [
                         .font: bodyFont,
                         .foregroundColor: textColor
                     ])
-                    storage.insert(attrPrefix, at: lineRange.location)
+                    storage.insert(attrPrefix, at: curLr.location)
                 }
             }
             storage.endEditing()

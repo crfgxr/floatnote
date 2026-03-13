@@ -1,14 +1,14 @@
-# MyEvernote macOS App
+# FloatNote macOS App
 
 ## Build & Deploy
-After ANY code change, run `./build.sh` to rebuild and update the app in `/Applications/MyEvernote.app`.
+After ANY code change, run `./build.sh` to rebuild and update the app in `/Applications/FloatNote.app`.
 
 Do NOT just run `swift build` — the app bundle in /Applications must be updated too.
 
 ## Project Layout
-- `MyEvernote/MyEvernote/App.swift` - SwiftUI app, views, ViewModel, editor
-- `MyEvernote/MyEvernote/EvernoteAPI.swift` - Evernote Thrift binary protocol client
-- `MyEvernote/Package.swift` - SPM manifest (macOS 14+)
+- `FloatNote/FloatNote/App.swift` - SwiftUI app, views, ViewModel, editor
+- `FloatNote/FloatNote/EvernoteAPI.swift` - Evernote Thrift binary protocol client
+- `FloatNote/Package.swift` - SPM manifest (macOS 14+)
 - `.auth.json` - Auth tokens (auto-refreshed by the app)
 - `build.sh` - Build + deploy script
 
