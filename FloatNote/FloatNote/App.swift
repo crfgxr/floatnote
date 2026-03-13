@@ -134,9 +134,11 @@ class EditorViewModel: ObservableObject {
     @Published var isSaving = false
     @Published var charCount: Int = 0
     @Published var isPinned: Bool = false
+    @Published var isDictating: Bool = false
     @Published var tabs: [NoteTab] = []
     @Published var activeTabId: UUID?
     @Published var editingTabId: UUID?
+    @Published var draggingTabId: UUID?
 
     var activeTab: NoteTab? { tabs.first { $0.id == activeTabId } }
     var attributedText = NSMutableAttributedString()
@@ -429,6 +431,16 @@ class EditorViewModel: ObservableObject {
         }
     }
 
+    func moveTab(from sourceId: UUID, to destId: UUID) {
+        guard sourceId != destId,
+              let fromIdx = tabs.firstIndex(where: { $0.id == sourceId }),
+              let toIdx = tabs.firstIndex(where: { $0.id == destId }) else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            tabs.move(fromOffsets: IndexSet(integer: fromIdx), toOffset: toIdx > fromIdx ? toIdx + 1 : toIdx)
+        }
+        saveTabsLocal()
+    }
+
     func textDidChange(html: String, length: Int) {
         guard !isLoadingContent else { return }
         charCount = length
@@ -579,15 +591,35 @@ class EditorViewModel: ObservableObject {
         a { color: #6cb6ff; }
         </style></head><body dir="ltr">\(html)</body></html>
         """
-        guard let data = styledHTML.data(using: .utf8) else { return nil }
-        return try? NSAttributedString(
-            data: data,
-            options: [
-                .documentType: NSAttributedString.DocumentType.html,
-                .characterEncoding: String.Encoding.utf8.rawValue
-            ],
-            documentAttributes: nil
-        )
+        guard let data = styledHTML.data(using: .utf8),
+              let attrStr = try? NSAttributedString(
+                data: data,
+                options: [
+                    .documentType: NSAttributedString.DocumentType.html,
+                    .characterEncoding: String.Encoding.utf8.rawValue
+                ],
+                documentAttributes: nil
+              ) else { return nil }
+
+        // Post-process: mark code spans with .codeBlock attribute and paragraph styling
+        let mutable = NSMutableAttributedString(attributedString: attrStr)
+        let fullStr = mutable.string as NSString
+        mutable.enumerateAttribute(.font, in: NSRange(location: 0, length: mutable.length), options: []) { value, range, _ in
+            if let font = value as? NSFont, font.fontName.lowercased().contains("menlo") {
+                let paraRange = fullStr.paragraphRange(for: range)
+                mutable.addAttribute(.codeBlock, value: true, range: paraRange)
+                mutable.removeAttribute(.backgroundColor, range: paraRange)
+                let ps = NSMutableParagraphStyle()
+                ps.baseWritingDirection = .leftToRight
+                ps.alignment = .left
+                ps.headIndent = 12
+                ps.firstLineHeadIndent = 12
+                ps.tailIndent = -12
+                mutable.addAttribute(.paragraphStyle, value: ps, range: paraRange)
+                mutable.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.78, alpha: 1.0), range: paraRange)
+            }
+        }
+        return mutable
     }
 }
 
@@ -613,83 +645,152 @@ struct EditorView: View {
 
 // MARK: - Tab Bar
 
+// Shared reference to allow programmatic scrolling
+class TabScrollState: ObservableObject {
+    weak var scrollView: NSScrollView?
+
+    func scroll(by delta: CGFloat) {
+        guard let sv = scrollView else { return }
+        let current = sv.contentView.bounds.origin.x
+        let maxOffset = (sv.documentView?.frame.width ?? 0) - sv.contentView.bounds.width
+        let target = max(0, min(maxOffset, current + delta))
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            sv.contentView.animator().setBoundsOrigin(NSPoint(x: target, y: 0))
+        }
+    }
+}
+
+// NSScrollView wrapper for smooth native horizontal scrolling with momentum
+struct NativeHScrollView<Content: View>: NSViewRepresentable {
+    let scrollState: TabScrollState
+    let onScroll: (CGFloat, CGFloat, CGFloat) -> Void // (offset, contentWidth, containerWidth)
+    @ViewBuilder let content: Content
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasHorizontalScroller = false
+        scrollView.hasVerticalScroller = false
+        scrollView.scrollerStyle = .overlay
+        scrollView.horizontalScrollElasticity = .allowed
+        scrollView.verticalScrollElasticity = .none
+        scrollView.drawsBackground = false
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = .init()
+
+        let hostView = NSHostingView(rootView: content)
+        hostView.translatesAutoresizingMaskIntoConstraints = false
+
+        let clipView = scrollView.contentView
+        clipView.drawsBackground = false
+
+        scrollView.documentView = hostView
+        scrollState.scrollView = scrollView
+
+        // Observe scroll changes
+        clipView.postsBoundsChangedNotifications = true
+        context.coordinator.observer = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: .main
+        ) { [weak scrollView] _ in
+            guard let sv = scrollView else { return }
+            let offset = sv.contentView.bounds.origin.x
+            let contentW = sv.documentView?.frame.width ?? 0
+            let containerW = sv.contentView.bounds.width
+            onScroll(offset, contentW, containerW)
+        }
+
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        if let hostView = scrollView.documentView as? NSHostingView<Content> {
+            hostView.rootView = content
+        }
+        scrollState.scrollView = scrollView
+        DispatchQueue.main.async {
+            if let docView = scrollView.documentView {
+                let fitting = docView.fittingSize
+                docView.frame.size = NSSize(width: max(fitting.width, scrollView.contentView.bounds.width), height: scrollView.contentView.bounds.height)
+            }
+            let offset = scrollView.contentView.bounds.origin.x
+            let contentW = scrollView.documentView?.frame.width ?? 0
+            let containerW = scrollView.contentView.bounds.width
+            onScroll(offset, contentW, containerW)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    class Coordinator {
+        var observer: Any?
+        deinit { if let o = observer { NotificationCenter.default.removeObserver(o) } }
+    }
+}
+
 struct TabBar: View {
     @EnvironmentObject var vm: EditorViewModel
-    @State private var scrollProxy: ScrollViewProxy?
+    @StateObject private var scrollState = TabScrollState()
+    @State private var scrollOffset: CGFloat = 0
     @State private var contentWidth: CGFloat = 0
     @State private var containerWidth: CGFloat = 0
 
     private var overflows: Bool { contentWidth > containerWidth + 1 }
+    private var clippedLeft: Bool { overflows && scrollOffset > 1 }
+    private var clippedRight: Bool { overflows && (scrollOffset + containerWidth) < contentWidth - 1 }
 
     var body: some View {
         HStack(spacing: 0) {
             if overflows {
-                Button(action: { scrollTo(direction: -1) }) {
+                Button(action: { scrollState.scroll(by: -100) }) {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 20, height: 26)
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 16, height: 26)
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(.secondary)
+                .foregroundColor(clippedLeft ? .secondary : .secondary.opacity(0.2))
             }
 
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 0) {
-                        ForEach(vm.tabs) { tab in
-                            TabItemView(tab: tab)
-                                .id(tab.id)
-                        }
-                        Button(action: { vm.addTab() }) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 11))
-                                .frame(width: 24, height: 26)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.leading, 4)
+            NativeHScrollView(scrollState: scrollState, onScroll: { offset, cw, vw in
+                scrollOffset = offset
+                contentWidth = cw
+                containerWidth = vw
+            }) {
+                HStack(spacing: 0) {
+                    ForEach(vm.tabs) { tab in
+                        TabItemView(tab: tab)
+                            .id(tab.id)
                     }
-                    .background(GeometryReader { inner in
-                        Color.clear.preference(key: ContentWidthKey.self, value: inner.size.width)
-                    })
-                }
-                .onAppear { scrollProxy = proxy }
-                .onChange(of: vm.activeTabId) { _, id in
-                    if let id { withAnimation { proxy.scrollTo(id, anchor: .center) } }
+                    Button(action: { vm.addTab() }) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11))
+                            .frame(width: 24, height: 26)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.leading, 4)
                 }
             }
+            .frame(height: 30)
 
             if overflows {
-                Button(action: { scrollTo(direction: 1) }) {
+                Button(action: { scrollState.scroll(by: 100) }) {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 20, height: 26)
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 16, height: 26)
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(.secondary)
+                .foregroundColor(clippedRight ? .secondary : .secondary.opacity(0.2))
             }
         }
-        .background(GeometryReader { geo in
-            Color.clear.onAppear { containerWidth = geo.size.width }
-                .onChange(of: geo.size.width) { _, w in containerWidth = w }
-        })
-        .onPreferenceChange(ContentWidthKey.self) { contentWidth = $0 }
         .padding(.horizontal, 4)
         .padding(.vertical, 2)
         .background(.bar)
     }
-
-    private func scrollTo(direction: Int) {
-        guard let activeId = vm.activeTabId,
-              let idx = vm.tabs.firstIndex(where: { $0.id == activeId }) else { return }
-        let targetIdx = max(0, min(vm.tabs.count - 1, idx + direction))
-        withAnimation { scrollProxy?.scrollTo(vm.tabs[targetIdx].id, anchor: .center) }
-    }
 }
 
-private struct ContentWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
+
 
 struct TabItemView: View {
     @ObservedObject var tab: NoteTab
@@ -697,6 +798,7 @@ struct TabItemView: View {
     @FocusState private var isFieldFocused: Bool
 
     var isActive: Bool { vm.activeTabId == tab.id }
+    var isDragging: Bool { vm.draggingTabId == tab.id }
 
     var body: some View {
         HStack(spacing: 4) {
@@ -723,6 +825,7 @@ struct TabItemView: View {
             RoundedRectangle(cornerRadius: 5)
                 .fill(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
         )
+        .opacity(isDragging ? 0.4 : 1.0)
         .contentShape(Rectangle())
         .onHover { hovering in
             if hovering { NSCursor.arrow.push() } else { NSCursor.pop() }
@@ -735,7 +838,35 @@ struct TabItemView: View {
                 vm.switchTab(tab.id)
             }
         }
+        .onDrag {
+            vm.draggingTabId = tab.id
+            return NSItemProvider(object: tab.id.uuidString as NSString)
+        }
+        .onDrop(of: [.text], delegate: TabDropDelegate(tab: tab, vm: vm))
     }
+}
+
+struct TabDropDelegate: DropDelegate {
+    let tab: NoteTab
+    let vm: EditorViewModel
+
+    func performDrop(info: DropInfo) -> Bool {
+        vm.draggingTabId = nil
+        return true
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard let dragId = vm.draggingTabId, dragId != tab.id else { return }
+        vm.moveTab(from: dragId, to: tab.id)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {}
+
+    func validateDrop(info: DropInfo) -> Bool { true }
 }
 
 // MARK: - Status Bar
@@ -864,6 +995,15 @@ struct FormatToolbar: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .help(vm.isPinned ? "Unpin from top" : "Pin to top")
+            Button(action: { toggleDictation() }) {
+                Image(systemName: vm.isDictating ? "mic.fill" : "mic")
+                    .foregroundColor(vm.isDictating ? .red : .primary)
+                    .frame(width: 28, height: 24)
+            }
+            .buttonStyle(.bordered)
+            .tint(vm.isDictating ? .red : nil)
+            .controlSize(.small)
+            .help(vm.isDictating ? "Stop Dictation" : "Start Dictation")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -881,6 +1021,26 @@ struct FormatToolbar: View {
         .controlSize(.small)
     }
 
+    func toggleDictation() {
+        vm.isDictating.toggle()
+        if vm.isDictating {
+            let sel = NSSelectorFromString("startDictation:")
+            NSApp.sendAction(sel, to: nil, from: nil)
+            // Watch for dictation ending (system can stop it)
+            NotificationCenter.default.addObserver(forName: NSNotification.Name("NSTextInputContextDictationDidEnd"), object: nil, queue: .main) { [weak vm] _ in
+                vm?.isDictating = false
+            }
+        } else {
+            // Send Escape to stop dictation
+            let src = CGEventSource(stateID: .hidSystemState)
+            if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: true),
+               let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: false) {
+                keyDown.post(tap: .cghidEventTap)
+                keyUp.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
     func iconBtn(_ icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
@@ -888,6 +1048,63 @@ struct FormatToolbar: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
+    }
+}
+
+// MARK: - Code Block Layout Manager
+
+extension NSAttributedString.Key {
+    static let codeBlock = NSAttributedString.Key("FloatNoteCodeBlock")
+}
+
+class CodeBlockLayoutManager: NSLayoutManager {
+    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        guard let textStorage = textStorage, let textContainer = textContainers.first else {
+            super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+            return
+        }
+
+        let charRange = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
+        let containerWidth = textContainer.containerSize.width
+        var drawnRanges: [NSRange] = []
+
+        // Find contiguous code block regions and merge them
+        textStorage.enumerateAttribute(.codeBlock, in: charRange, options: []) { value, attrRange, _ in
+            guard value != nil else { return }
+
+            // Expand to full paragraph lines
+            let str = textStorage.string as NSString
+            let paraRange = str.paragraphRange(for: attrRange)
+            let glyphRange = self.glyphRange(forCharacterRange: paraRange, actualCharacterRange: nil)
+
+            // Skip if already drawn (merged ranges)
+            if drawnRanges.contains(where: { NSIntersectionRange($0, paraRange).length > 0 }) { return }
+            drawnRanges.append(paraRange)
+
+            // Get bounding rect for all lines in this code block
+            self.enumerateLineFragments(forGlyphRange: glyphRange) { _, _, _, _, _ in }
+            var blockRect = self.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+
+            // Make full-width block
+            let fullRect = NSRect(
+                x: origin.x,
+                y: blockRect.origin.y + origin.y - 6,
+                width: containerWidth,
+                height: blockRect.height + 12
+            )
+
+            // Draw rounded container
+            let path = NSBezierPath(roundedRect: fullRect, xRadius: 6, yRadius: 6)
+            NSColor(calibratedRed: 0.07, green: 0.07, blue: 0.08, alpha: 1.0).setFill()
+            path.fill()
+
+            // Draw border
+            NSColor(calibratedWhite: 0.30, alpha: 1.0).setStroke()
+            path.lineWidth = 1.0
+            path.stroke()
+        }
+
+        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
     }
 }
 
@@ -1066,7 +1283,7 @@ struct RichTextEditor: NSViewRepresentable {
         let textContainer = NSTextContainer(containerSize: NSSize(width: contentSize.width, height: .greatestFiniteMagnitude))
         textContainer.widthTracksTextView = true
 
-        let layoutManager = NSLayoutManager()
+        let layoutManager = CodeBlockLayoutManager()
         layoutManager.addTextContainer(textContainer)
 
         let textStorage = NSTextStorage()
@@ -1405,11 +1622,62 @@ struct RichTextEditor: NSViewRepresentable {
                 storage.endEditing()
             case .code:
                 storage.beginEditing()
-                applyFont(codeFont, in: range, storage: storage, textView: textView)
-                if range.length > 0 {
-                    storage.addAttribute(.backgroundColor, value: NSColor(calibratedWhite: 0.18, alpha: 1.0), range: range)
+                let str = storage.string as NSString
+                var paraRange = str.paragraphRange(for: range)
+
+                // Check if already code — toggle off
+                var isCode = false
+                if paraRange.length > 0 {
+                    storage.enumerateAttribute(.codeBlock, in: paraRange, options: []) { val, _, _ in
+                        if val != nil { isCode = true }
+                    }
+                }
+                if isCode {
+                    storage.removeAttribute(.codeBlock, range: paraRange)
+                    storage.removeAttribute(.backgroundColor, range: paraRange)
+                    storage.removeAttribute(.foregroundColor, range: paraRange)
+                    applyFont(bodyFont, in: paraRange, storage: storage, textView: textView)
+                    storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: paraRange)
+                    let ps = NSMutableParagraphStyle()
+                    ps.baseWritingDirection = .leftToRight
+                    ps.alignment = .left
+                    storage.addAttribute(.paragraphStyle, value: ps, range: paraRange)
+                } else {
+                    // If cursor is on empty line with no content, insert a space placeholder
+                    let paraStr = str.substring(with: paraRange)
+                    if paraStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        let insertPos = paraRange.location
+                        // Insert a newline if we're at the very end without one, or use existing line
+                        if paraRange.length == 0 {
+                            storage.insert(NSAttributedString(string: " "), at: insertPos)
+                            paraRange = NSRange(location: insertPos, length: 1)
+                        }
+                    }
+
+                    applyFont(codeFont, in: paraRange, storage: storage, textView: textView)
+                    storage.addAttribute(.codeBlock, value: true, range: paraRange)
+                    let ps = NSMutableParagraphStyle()
+                    ps.baseWritingDirection = .leftToRight
+                    ps.alignment = .left
+                    ps.headIndent = 12
+                    ps.firstLineHeadIndent = 12
+                    ps.tailIndent = -12
+                    storage.addAttribute(.paragraphStyle, value: ps, range: paraRange)
+                    storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.78, alpha: 1.0), range: paraRange)
+
+                    // Set typing attributes so new text continues in code style
+                    var typingAttrs = textView.typingAttributes
+                    typingAttrs[.font] = codeFont
+                    typingAttrs[.codeBlock] = true
+                    typingAttrs[.paragraphStyle] = ps
+                    typingAttrs[.foregroundColor] = NSColor(calibratedWhite: 0.78, alpha: 1.0)
+                    textView.typingAttributes = typingAttrs
+
+                    // Place cursor inside the code block
+                    textView.setSelectedRange(NSRange(location: paraRange.location, length: 0))
                 }
                 storage.endEditing()
+                textView.needsDisplay = true
             case .bulletList:
                 insertAtLineStart(textView: textView, prefix: "• ")
             case .checklist:
