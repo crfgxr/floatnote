@@ -896,14 +896,11 @@ struct StatusBar: View {
                 .help("Delete this notepad")
             }
             Button(action: { Task { await vm.saveNow() } }) {
-                HStack(spacing: 3) {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                    Text("Sync")
-                }
-                .font(.system(size: 10))
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.mini)
+            .buttonStyle(.plain)
             .help("Sync to Evernote now")
             Text("\(vm.charCount) chars")
                 .font(.system(size: 11, design: .monospaced))
@@ -973,52 +970,92 @@ struct FlowLayout: Layout {
 
 struct FormatToolbar: View {
     @EnvironmentObject var vm: EditorViewModel
+    @State private var hoveredButton: String?
 
     var body: some View {
-        FlowLayout(spacing: 4) {
-            toolBtn("H1") { vm.performFormat(.heading1) }
-            toolBtn("H2") { vm.performFormat(.heading2) }
-            toolBtn("H3") { vm.performFormat(.heading3) }
-            toolBtn("Body") { vm.performFormat(.body) }
-            iconBtn("bold") { vm.performFormat(.bold) }
-            iconBtn("italic") { vm.performFormat(.italic) }
-            iconBtn("underline") { vm.performFormat(.underline) }
-            iconBtn("chevron.left.forwardslash.chevron.right") { vm.performFormat(.code) }
-            iconBtn("list.bullet") { vm.performFormat(.bulletList) }
-            iconBtn("checklist") { vm.performFormat(.checklist) }
-            iconBtn("link") { vm.performFormat(.link) }
-            iconBtn("minus") { vm.performFormat(.divider) }
-            Button(action: { vm.togglePin() }) {
-                Image(systemName: vm.isPinned ? "pin.fill" : "pin")
-                    .frame(width: 28, height: 24)
+        HStack(spacing: 0) {
+            Group {
+                toolBtn("H1", id: "h1") { vm.performFormat(.heading1) }
+                toolBtn("H2", id: "h2") { vm.performFormat(.heading2) }
+                toolBtn("H3", id: "h3") { vm.performFormat(.heading3) }
+                toolBtn("Aa", id: "body") { vm.performFormat(.body) }
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help(vm.isPinned ? "Unpin from top" : "Pin to top")
-            Button(action: { toggleDictation() }) {
-                Image(systemName: vm.isDictating ? "mic.fill" : "mic")
-                    .foregroundColor(vm.isDictating ? .red : .primary)
-                    .frame(width: 28, height: 24)
+
+            thinDivider()
+
+            Group {
+                iconBtn("bold", id: "bold") { vm.performFormat(.bold) }
+                iconBtn("italic", id: "italic") { vm.performFormat(.italic) }
+                iconBtn("underline", id: "underline") { vm.performFormat(.underline) }
+                iconBtn("chevron.left.forwardslash.chevron.right", id: "code") { vm.performFormat(.code) }
             }
-            .buttonStyle(.bordered)
-            .tint(vm.isDictating ? .red : nil)
-            .controlSize(.small)
-            .help(vm.isDictating ? "Stop Dictation" : "Start Dictation")
+
+            thinDivider()
+
+            Group {
+                iconBtn("list.bullet", id: "bullet") { vm.performFormat(.bulletList) }
+                iconBtn("checklist", id: "check") { vm.performFormat(.checklist) }
+                iconBtn("link", id: "link") { vm.performFormat(.link) }
+                iconBtn("minus", id: "divider") { vm.performFormat(.divider) }
+            }
+
+            thinDivider()
+
+            Group {
+                Button(action: { vm.togglePin() }) {
+                    Image(systemName: vm.isPinned ? "pin.fill" : "pin")
+                        .font(.system(size: 11))
+                        .frame(maxWidth: .infinity, minHeight: 22)
+                        .foregroundColor(vm.isPinned ? .accentColor : .secondary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(hoveredButton == "pin" ? Color.primary.opacity(0.08) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .onHover { hoveredButton = $0 ? "pin" : nil }
+                .help(vm.isPinned ? "Unpin from top" : "Pin to top")
+
+                Button(action: { toggleDictation() }) {
+                    Image(systemName: vm.isDictating ? "mic.fill" : "mic")
+                        .font(.system(size: 11))
+                        .frame(maxWidth: .infinity, minHeight: 22)
+                        .foregroundColor(vm.isDictating ? .red : .secondary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(hoveredButton == "mic" ? Color.primary.opacity(0.08) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .onHover { hoveredButton = $0 ? "mic" : nil }
+                .help(vm.isDictating ? "Stop Dictation" : "Start Dictation")
+            }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 3)
         .background(.bar)
     }
 
-    func toolBtn(_ title: String, action: @escaping () -> Void) -> some View {
+    func thinDivider() -> some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.1))
+            .frame(width: 1, height: 16)
+            .padding(.horizontal, 2)
+    }
+
+    func toolBtn(_ title: String, id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .frame(minWidth: 28, minHeight: 24)
-                .padding(.horizontal, 4)
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .frame(maxWidth: .infinity, minHeight: 22)
+                .foregroundColor(.secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(hoveredButton == id ? Color.primary.opacity(0.08) : Color.clear)
+                )
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? id : nil }
     }
 
     func toggleDictation() {
@@ -1026,12 +1063,10 @@ struct FormatToolbar: View {
         if vm.isDictating {
             let sel = NSSelectorFromString("startDictation:")
             NSApp.sendAction(sel, to: nil, from: nil)
-            // Watch for dictation ending (system can stop it)
             NotificationCenter.default.addObserver(forName: NSNotification.Name("NSTextInputContextDictationDidEnd"), object: nil, queue: .main) { [weak vm] _ in
                 vm?.isDictating = false
             }
         } else {
-            // Send Escape to stop dictation
             let src = CGEventSource(stateID: .hidSystemState)
             if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: true),
                let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: false) {
@@ -1041,13 +1076,19 @@ struct FormatToolbar: View {
         }
     }
 
-    func iconBtn(_ icon: String, action: @escaping () -> Void) -> some View {
+    func iconBtn(_ icon: String, id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .frame(width: 28, height: 24)
+                .font(.system(size: 11))
+                .frame(maxWidth: .infinity, minHeight: 22)
+                .foregroundColor(.secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(hoveredButton == id ? Color.primary.opacity(0.08) : Color.clear)
+                )
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? id : nil }
     }
 }
 
@@ -1171,8 +1212,21 @@ class BlockCaretTextView: NSTextView {
         updateCaretPosition()
     }
 
+    func recordUndoSnapshot() {
+        guard let storage = textStorage, let um = undoManager else { return }
+        let snapshot = NSAttributedString(attributedString: storage)
+        let sel = selectedRange()
+        um.registerUndo(withTarget: self) { tv in
+            tv.recordUndoSnapshot()
+            tv.textStorage?.setAttributedString(snapshot)
+            tv.setSelectedRange(sel)
+            tv.didChangeText()
+        }
+    }
+
     func toggleCheckbox(at charIndex: Int) {
         guard let storage = textStorage else { return }
+        recordUndoSnapshot()
         let str = storage.string as NSString
         let char = str.substring(with: NSRange(location: charIndex, length: 1))
         let lineRange = str.lineRange(for: NSRange(location: charIndex, length: 0))
@@ -1540,9 +1594,23 @@ struct RichTextEditor: NSViewRepresentable {
             }
         }
 
+        private func recordUndo(for textView: NSTextView) {
+            guard let storage = textView.textStorage, let um = textView.undoManager else { return }
+            let snapshot = NSAttributedString(attributedString: storage)
+            let sel = textView.selectedRange()
+            um.registerUndo(withTarget: textView) { [weak self] tv in
+                self?.recordUndo(for: tv)
+                tv.textStorage?.setAttributedString(snapshot)
+                tv.setSelectedRange(sel)
+                tv.didChangeText()
+            }
+        }
+
         @objc private func slashMenuItemClicked(_ sender: NSMenuItem) {
             guard let textView = self.textView else { return }
             guard let storage = textView.textStorage else { return }
+
+            recordUndo(for: textView)
 
             // Remove the "/" character
             if slashPosition < storage.length {
@@ -1583,6 +1651,8 @@ struct RichTextEditor: NSViewRepresentable {
                 return
             }
             dbg("applyFormat: action=\(action), range=(\(range.location),\(range.length)), storageLen=\(storage.length), text='\(storage.string.prefix(50))'")
+
+            recordUndo(for: textView)
 
             switch action {
             case .bold:
@@ -1750,6 +1820,21 @@ struct RichTextEditor: NSViewRepresentable {
             guard let storage = textView.textStorage else { return }
             let str = storage.string as NSString
 
+            // Caret at beginning of a list line → insert new line with prefix above, push current line down
+            if range.length == 0 && str.length > 0 && range.location < str.length {
+                let lineRange = str.lineRange(for: NSRange(location: range.location, length: 0))
+                let lineStr = str.substring(with: lineRange)
+                let isAtLineStart = range.location == lineRange.location
+                let hasListPrefix = lineStr.hasPrefix("• ") || lineStr.hasPrefix("☐ ") || lineStr.hasPrefix("☑ ")
+                if isAtLineStart && hasListPrefix {
+                    let newLine = NSAttributedString(string: prefix + "\n", attributes: [.font: bodyFont, .foregroundColor: textColor])
+                    storage.insert(newLine, at: lineRange.location)
+                    textView.setSelectedRange(NSRange(location: lineRange.location + prefix.count, length: 0))
+                    textView.didChangeText()
+                    return
+                }
+            }
+
             // Handle cursor at end of text or empty document — use previous character's line
             let adjustedRange: NSRange
             if str.length == 0 {
@@ -1818,6 +1903,21 @@ struct RichTextEditor: NSViewRepresentable {
 
         private func toggleChecklist(textView: NSTextView, storage: NSTextStorage, range: NSRange) {
             let str = storage.string as NSString
+
+            // Caret at beginning of a list line → insert new checklist line above, push current line down
+            if range.length == 0 && str.length > 0 && range.location < str.length {
+                let lineRange = str.lineRange(for: NSRange(location: range.location, length: 0))
+                let lineStr = str.substring(with: lineRange)
+                let isAtLineStart = range.location == lineRange.location
+                let hasListPrefix = lineStr.hasPrefix("• ") || lineStr.hasPrefix("☐ ") || lineStr.hasPrefix("☑ ")
+                if isAtLineStart && hasListPrefix {
+                    let newLine = NSAttributedString(string: "☐ \n", attributes: [.font: bodyFont, .foregroundColor: textColor])
+                    storage.insert(newLine, at: lineRange.location)
+                    textView.setSelectedRange(NSRange(location: lineRange.location + 2, length: 0))
+                    textView.didChangeText()
+                    return
+                }
+            }
 
             // Handle cursor at end of text
             let adjustedRange: NSRange
@@ -1890,6 +1990,9 @@ struct RichTextEditor: NSViewRepresentable {
             if commandSelector == #selector(NSResponder.insertTab(_:)) {
                 return handleTab(textView: textView)
             }
+            if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+                return handleBacktab(textView: textView)
+            }
             return false
         }
 
@@ -1906,6 +2009,7 @@ struct RichTextEditor: NSViewRepresentable {
                 if let font = storage.attribute(.font, at: charBefore, effectiveRange: nil) as? NSFont {
                     let size = font.pointSize
                     if size == h1Font.pointSize || size == h2Font.pointSize || size == h3Font.pointSize {
+                        recordUndo(for: textView)
                         // Insert newline with body font, don't let heading continue
                         let newline = NSAttributedString(string: "\n", attributes: [
                             .font: bodyFont,
@@ -1924,6 +2028,7 @@ struct RichTextEditor: NSViewRepresentable {
             // Checklist continuation
             for prefix in ["☐ ", "☑ "] {
                 if lineStr.hasPrefix(prefix) {
+                    recordUndo(for: textView)
                     let afterPrefix = String(lineStr.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
                     if afterPrefix.isEmpty {
                         // Empty checklist item - remove prefix to end the list
@@ -1945,6 +2050,7 @@ struct RichTextEditor: NSViewRepresentable {
 
             // Bullet list continuation
             if lineStr.hasPrefix("• ") {
+                recordUndo(for: textView)
                 let afterPrefix = String(lineStr.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
                 if afterPrefix.isEmpty {
                     storage.replaceCharacters(in: NSRange(location: lineRange.location, length: 2), with: "")
@@ -1967,6 +2073,7 @@ struct RichTextEditor: NSViewRepresentable {
 
         private func handleTab(textView: NSTextView) -> Bool {
             guard let storage = textView.textStorage else { return false }
+            recordUndo(for: textView)
             let range = textView.selectedRange()
             let str = storage.string as NSString
             let fullLineRange = str.lineRange(for: range)
@@ -2001,6 +2108,51 @@ struct RichTextEditor: NSViewRepresentable {
 
             // Plain text: just insert spaces at cursor
             textView.insertText(indent, replacementRange: range)
+            return true
+        }
+
+        private func handleBacktab(textView: NSTextView) -> Bool {
+            guard let storage = textView.textStorage else { return false }
+            recordUndo(for: textView)
+            let range = textView.selectedRange()
+            let str = storage.string as NSString
+            let fullLineRange = str.lineRange(for: range)
+            let indent = "    "
+
+            // Collect all line starts in selection
+            var lineStarts: [Int] = []
+            var pos = fullLineRange.location
+            while pos < NSMaxRange(fullLineRange) {
+                lineStarts.append(pos)
+                let lr = str.lineRange(for: NSRange(location: pos, length: 0))
+                pos = NSMaxRange(lr)
+            }
+
+            storage.beginEditing()
+            var removed = 0
+            for start in lineStarts.reversed() {
+                let lineRange = str.lineRange(for: NSRange(location: start, length: 0))
+                let lineStr = str.substring(with: lineRange)
+                if lineStr.hasPrefix(indent) {
+                    storage.deleteCharacters(in: NSRange(location: start, length: indent.count))
+                    removed += indent.count
+                } else {
+                    // Remove as many leading spaces as possible (up to 4)
+                    var count = 0
+                    for ch in lineStr {
+                        if ch == " " && count < 4 { count += 1 } else { break }
+                    }
+                    if count > 0 {
+                        storage.deleteCharacters(in: NSRange(location: start, length: count))
+                        removed += count
+                    }
+                }
+            }
+            storage.endEditing()
+
+            if removed > 0 {
+                textView.didChangeText()
+            }
             return true
         }
     }
