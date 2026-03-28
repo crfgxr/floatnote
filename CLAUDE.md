@@ -12,6 +12,10 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 - `.auth.json` - Auth tokens (auto-refreshed by the app)
 - `build.sh` - Build + deploy script
 
+## Versioning
+- Version constant `APP_VERSION` is at the top of `App.swift` — bump it on each update
+- Displayed in the status bar (bottom right)
+
 ## Key Details
 - Auth token path hardcoded in App.swift: `/Users/cagdas/CodTemp/myevernote-macos-app/.auth.json`
 - App auto-refreshes expired tokens via refresh_token grant

@@ -13,6 +13,7 @@ func dbg(_ msg: String) {
     }
 }
 
+let APP_VERSION = "v1.0.3"
 let BUCKET_GUID = "bf100d62-31b3-ac11-298c-6a90ae689031"
 let NOTE_TITLE = "editor"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.evernote-editor-local.html"
@@ -906,6 +907,9 @@ struct StatusBar: View {
             Text("\(vm.charCount) chars")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)
+            Text(APP_VERSION)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(.secondary.opacity(0.5))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -1217,13 +1221,15 @@ class BlockCaretTextView: NSTextView {
         updateCaretPosition()
     }
 
-    /// Returns the prefix length ("• ", "☐ ", "☑ ") for the line at the given position, or 0.
+    /// Returns the full prefix length (leading spaces + "• "/"☐ "/"☑ ") for the line at the given position, or 0.
     private func listPrefixLen(at pos: Int) -> (lineRange: NSRange, prefixLen: Int) {
         guard let str = textStorage?.string as NSString? else { return (NSRange(), 0) }
         let lineRange = str.lineRange(for: NSRange(location: pos, length: 0))
         let lineStr = str.substring(with: lineRange)
+        let leadingSpaces = lineStr.prefix(while: { $0 == " " }).count
+        let afterIndent = String(lineStr.dropFirst(leadingSpaces))
         for prefix in ["• ", "☐ ", "☑ "] {
-            if lineStr.hasPrefix(prefix) { return (lineRange, prefix.count) }
+            if afterIndent.hasPrefix(prefix) { return (lineRange, leadingSpaces + prefix.count) }
         }
         return (lineRange, 0)
     }
@@ -1735,10 +1741,62 @@ struct RichTextEditor: NSViewRepresentable {
                 isProcessingMarkdown = false
             }
 
+            applyListIndent(textView: textView)
+
             let html = extractHTML(from: textView)
             Task { @MainActor in
                 vm.textDidChange(html: html, length: textView.textStorage?.length ?? 0)
             }
+        }
+
+        /// Apply hanging indent to all list lines so wrapped text aligns after the prefix.
+        private func applyListIndent(textView: NSTextView) {
+            guard let storage = textView.textStorage else { return }
+            let str = storage.string as NSString
+
+            storage.beginEditing()
+            var pos = 0
+            while pos < str.length {
+                let lineRange = str.lineRange(for: NSRange(location: pos, length: 0))
+                let lineStr = str.substring(with: lineRange)
+
+                let leadingSpaces = lineStr.prefix(while: { $0 == " " })
+                let afterIndent = String(lineStr.dropFirst(leadingSpaces.count))
+
+                var prefixStr: String? = nil
+                for pfx in ["• ", "☐ ", "☑ "] {
+                    if afterIndent.hasPrefix(pfx) {
+                        prefixStr = String(leadingSpaces) + pfx
+                        break
+                    }
+                }
+
+                if let prefix = prefixStr {
+                    // Measure the prefix width in the body font
+                    let prefixWidth = (prefix as NSString).size(withAttributes: [.font: bodyFont]).width
+                    let ps = NSMutableParagraphStyle()
+                    ps.baseWritingDirection = .leftToRight
+                    ps.alignment = .left
+                    ps.headIndent = prefixWidth
+                    storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
+                } else if !lineStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // Non-list line: check if it has a stale headIndent and reset it
+                    if let existingPS = storage.attribute(.paragraphStyle, at: lineRange.location, effectiveRange: nil) as? NSParagraphStyle,
+                       existingPS.headIndent > 0 {
+                        // Check it's not a code block
+                        let isCode = storage.attribute(.codeBlock, at: lineRange.location, effectiveRange: nil) != nil
+                        if !isCode {
+                            let ps = NSMutableParagraphStyle()
+                            ps.baseWritingDirection = .leftToRight
+                            ps.alignment = .left
+                            storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
+                        }
+                    }
+                }
+
+                pos = NSMaxRange(lineRange)
+            }
+            storage.endEditing()
         }
 
         private func processMarkdownShortcuts(textView: NSTextView) {
@@ -2279,45 +2337,40 @@ struct RichTextEditor: NSViewRepresentable {
                 }
             }
 
-            // Checklist continuation
-            for prefix in ["☐ ", "☑ "] {
-                if lineStr.hasPrefix(prefix) {
-                    recordUndo(for: textView)
-                    let afterPrefix = String(lineStr.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if afterPrefix.isEmpty {
-                        // Empty checklist item - remove prefix to end the list
-                        storage.replaceCharacters(in: NSRange(location: lineRange.location, length: prefix.count), with: "")
-                        textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
-                        textView.didChangeText()
-                        return true
-                    }
-                    let insertion = NSAttributedString(string: "\n☐ ", attributes: [
-                        .font: bodyFont,
-                        .foregroundColor: textColor
-                    ])
-                    storage.replaceCharacters(in: range, with: insertion)
-                    textView.setSelectedRange(NSRange(location: range.location + 3, length: 0))
-                    textView.didChangeText()
-                    return true
+            // List continuation: detect leading whitespace + prefix (supports indented lists)
+            let leadingSpaces = String(lineStr.prefix(while: { $0 == " " }))
+            let afterIndent = String(lineStr.dropFirst(leadingSpaces.count))
+
+            var detectedPrefix: String? = nil
+            for pfx in ["☐ ", "☑ ", "• "] {
+                if afterIndent.hasPrefix(pfx) {
+                    detectedPrefix = pfx
+                    break
                 }
             }
 
-            // Bullet list continuation
-            if lineStr.hasPrefix("• ") {
+            if let prefix = detectedPrefix {
                 recordUndo(for: textView)
-                let afterPrefix = String(lineStr.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-                if afterPrefix.isEmpty {
-                    storage.replaceCharacters(in: NSRange(location: lineRange.location, length: 2), with: "")
+                let fullPrefix = leadingSpaces + prefix
+                let contentAfterPrefix = String(lineStr.dropFirst(fullPrefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if contentAfterPrefix.isEmpty {
+                    // Empty list item — remove indent + prefix to end the list
+                    storage.replaceCharacters(in: NSRange(location: lineRange.location, length: fullPrefix.count), with: "")
                     textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
                     textView.didChangeText()
                     return true
                 }
-                let insertion = NSAttributedString(string: "\n• ", attributes: [
+
+                // Continue with same indent + prefix (☑ continues as ☐)
+                let continuationPrefix = (prefix == "☑ ") ? "☐ " : prefix
+                let insertionStr = "\n" + leadingSpaces + continuationPrefix
+                let insertion = NSAttributedString(string: insertionStr, attributes: [
                     .font: bodyFont,
                     .foregroundColor: textColor
                 ])
                 storage.replaceCharacters(in: range, with: insertion)
-                textView.setSelectedRange(NSRange(location: range.location + 3, length: 0))
+                textView.setSelectedRange(NSRange(location: range.location + insertionStr.count, length: 0))
                 textView.didChangeText()
                 return true
             }
