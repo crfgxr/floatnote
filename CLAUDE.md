@@ -23,3 +23,8 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 - **Undo/Redo**: All programmatic edits (checkbox toggle, bullet/checklist continuation, indent/outdent, format toolbar, slash commands) are undoable via snapshot-based undo registration
 - **Tab/Shift-Tab**: Indent (4 spaces) / outdent selected lines or list items
 - **List insert**: Pressing bullet/checklist at the beginning of an existing list line inserts a new line above and pushes the current line down
+- **Smart Home**: Cmd+Left jumps to after list prefix first, then to column 0 on second press
+- **Smart Select**: Cmd+Shift+Left extends selection to after prefix, mirroring smart home
+- **Smart Backspace**: Backspace at/inside a list prefix removes the entire prefix; Cmd+Backspace deletes to prefix boundary first, then removes prefix on second press
+- **Move lines**: Option+Up/Down swaps lines, preserving caret position
+- **Dictation auto-restart**: When mic is enabled, dictation auto-restarts after system timeout or when app regains focus

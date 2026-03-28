@@ -135,6 +135,7 @@ class EditorViewModel: ObservableObject {
     @Published var charCount: Int = 0
     @Published var isPinned: Bool = false
     @Published var isDictating: Bool = false
+    var wantsDictation: Bool = false  // user intent: keep dictation alive
     @Published var tabs: [NoteTab] = []
     @Published var activeTabId: UUID?
     @Published var editingTabId: UUID?
@@ -1059,20 +1060,57 @@ struct FormatToolbar: View {
     }
 
     func toggleDictation() {
-        vm.isDictating.toggle()
-        if vm.isDictating {
-            let sel = NSSelectorFromString("startDictation:")
-            NSApp.sendAction(sel, to: nil, from: nil)
+        vm.wantsDictation.toggle()
+        if vm.wantsDictation {
+            startDictation()
+            // Watch for dictation stopping (system timeout, user switched away, etc.)
             NotificationCenter.default.addObserver(forName: NSNotification.Name("NSTextInputContextDictationDidEnd"), object: nil, queue: .main) { [weak vm] _ in
-                vm?.isDictating = false
+                MainActor.assumeIsolated {
+                    vm?.isDictating = false
+                    // Auto-restart after a short delay if user still wants dictation
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        MainActor.assumeIsolated {
+                            guard let vm = vm, vm.wantsDictation, NSApp.isActive else { return }
+                            vm.isDictating = true
+                            let sel = NSSelectorFromString("startDictation:")
+                            NSApp.sendAction(sel, to: nil, from: nil)
+                        }
+                    }
+                }
+            }
+            // Watch for app becoming active again → restart dictation
+            NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak vm] _ in
+                MainActor.assumeIsolated {
+                    guard let vm = vm, vm.wantsDictation, !vm.isDictating else { return }
+                    vm.isDictating = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        MainActor.assumeIsolated {
+                            let sel = NSSelectorFromString("startDictation:")
+                            NSApp.sendAction(sel, to: nil, from: nil)
+                        }
+                    }
+                }
             }
         } else {
-            let src = CGEventSource(stateID: .hidSystemState)
-            if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: true),
-               let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: false) {
-                keyDown.post(tap: .cghidEventTap)
-                keyUp.post(tap: .cghidEventTap)
-            }
+            stopDictation()
+            NotificationCenter.default.removeObserver(self, name: NSNotification.Name("NSTextInputContextDictationDidEnd"), object: nil)
+            NotificationCenter.default.removeObserver(self, name: NSApplication.didBecomeActiveNotification, object: nil)
+        }
+    }
+
+    private func startDictation() {
+        vm.isDictating = true
+        let sel = NSSelectorFromString("startDictation:")
+        NSApp.sendAction(sel, to: nil, from: nil)
+    }
+
+    private func stopDictation() {
+        vm.isDictating = false
+        let src = CGEventSource(stateID: .hidSystemState)
+        if let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: true),
+           let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: false) {
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
         }
     }
 
@@ -1179,9 +1217,225 @@ class BlockCaretTextView: NSTextView {
         updateCaretPosition()
     }
 
+    /// Returns the prefix length ("• ", "☐ ", "☑ ") for the line at the given position, or 0.
+    private func listPrefixLen(at pos: Int) -> (lineRange: NSRange, prefixLen: Int) {
+        guard let str = textStorage?.string as NSString? else { return (NSRange(), 0) }
+        let lineRange = str.lineRange(for: NSRange(location: pos, length: 0))
+        let lineStr = str.substring(with: lineRange)
+        for prefix in ["• ", "☐ ", "☑ "] {
+            if lineStr.hasPrefix(prefix) { return (lineRange, prefix.count) }
+        }
+        return (lineRange, 0)
+    }
+
+    // MARK: - Smart Home (Cmd+Left)
+    override func moveToBeginningOfLine(_ sender: Any?) {
+        let pos = selectedRange().location
+        let (lineRange, prefixLen) = listPrefixLen(at: pos)
+        guard prefixLen > 0 else { super.moveToBeginningOfLine(sender); return }
+
+        let afterPrefix = lineRange.location + prefixLen
+        if pos != afterPrefix {
+            setSelectedRange(NSRange(location: afterPrefix, length: 0))
+        } else {
+            setSelectedRange(NSRange(location: lineRange.location, length: 0))
+        }
+        updateCaretPosition()
+    }
+
+    // MARK: - Smart Home with Selection (Cmd+Shift+Left)
+    override func moveToBeginningOfLineAndModifySelection(_ sender: Any?) {
+        let sel = selectedRange()
+        let pos = sel.location
+        let (lineRange, prefixLen) = listPrefixLen(at: pos)
+        guard prefixLen > 0 else { super.moveToBeginningOfLineAndModifySelection(sender); return }
+
+        let afterPrefix = lineRange.location + prefixLen
+        if pos != afterPrefix && pos > afterPrefix {
+            // Extend selection back to after prefix
+            let newLen = sel.length + (pos - afterPrefix)
+            setSelectedRange(NSRange(location: afterPrefix, length: newLen))
+        } else {
+            // Extend selection to absolute line start
+            let newLen = sel.length + (pos - lineRange.location)
+            setSelectedRange(NSRange(location: lineRange.location, length: newLen))
+        }
+        updateCaretPosition()
+    }
+
+    // MARK: - Backspace removes full prefix
+    override func deleteBackward(_ sender: Any?) {
+        guard let storage = textStorage else { super.deleteBackward(sender); return }
+        let pos = selectedRange().location
+        let sel = selectedRange()
+
+        // Only handle when no selection (just caret)
+        if sel.length == 0 && pos > 0 {
+            let (lineRange, prefixLen) = listPrefixLen(at: pos)
+            if prefixLen > 0 {
+                let afterPrefix = lineRange.location + prefixLen
+                // Caret is at or inside the prefix — remove entire prefix
+                if pos <= afterPrefix && pos > lineRange.location {
+                    recordUndoSnapshot()
+                    storage.deleteCharacters(in: NSRange(location: lineRange.location, length: prefixLen))
+                    setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                    didChangeText()
+                    return
+                }
+            }
+        }
+        super.deleteBackward(sender)
+    }
+
+    // MARK: - Cmd+Backspace stops at prefix
+    override func deleteToBeginningOfLine(_ sender: Any?) {
+        guard let storage = textStorage else { super.deleteToBeginningOfLine(sender); return }
+        let pos = selectedRange().location
+        let (lineRange, prefixLen) = listPrefixLen(at: pos)
+
+        if prefixLen > 0 {
+            let afterPrefix = lineRange.location + prefixLen
+            if pos > afterPrefix {
+                // Delete from caret back to after prefix (preserve prefix)
+                recordUndoSnapshot()
+                let deleteRange = NSRange(location: afterPrefix, length: pos - afterPrefix)
+                storage.deleteCharacters(in: deleteRange)
+                setSelectedRange(NSRange(location: afterPrefix, length: 0))
+                didChangeText()
+                return
+            } else if pos == afterPrefix {
+                // Already at prefix boundary — delete the prefix itself
+                recordUndoSnapshot()
+                storage.deleteCharacters(in: NSRange(location: lineRange.location, length: prefixLen))
+                setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                didChangeText()
+                return
+            }
+        }
+        super.deleteToBeginningOfLine(sender)
+    }
+
+    // MARK: - Move line up/down (Option+Up/Down)
     override func keyDown(with event: NSEvent) {
+        // Option+Up or Option+Down to move lines
+        if event.modifierFlags.contains(.option) && !event.modifierFlags.contains(.command) {
+            if event.keyCode == 126 { // Up arrow
+                moveLineUp()
+                return
+            } else if event.keyCode == 125 { // Down arrow
+                moveLineDown()
+                return
+            }
+        }
         super.keyDown(with: event)
         updateCaretPosition()
+    }
+
+    private func moveLineUp() {
+        guard let storage = textStorage else { return }
+        let str = storage.string as NSString
+        let sel = selectedRange()
+        let lineRange = str.lineRange(for: sel)
+
+        // Can't move up if already at the first line
+        guard lineRange.location > 0 else { return }
+
+        let prevLineRange = str.lineRange(for: NSRange(location: lineRange.location - 1, length: 0))
+
+        recordUndoSnapshot()
+
+        let currentLine = storage.attributedSubstring(from: lineRange)
+        let prevLine = storage.attributedSubstring(from: prevLineRange)
+
+        // Ensure both lines end with newline for clean swap
+        let currentStr = currentLine.string
+        let prevStr = prevLine.string
+
+        let combinedRange = NSRange(location: prevLineRange.location, length: prevLineRange.length + lineRange.length)
+        let replacement = NSMutableAttributedString()
+
+        // Current line goes first (moving up)
+        replacement.append(currentLine)
+        if !currentStr.hasSuffix("\n") {
+            replacement.append(NSAttributedString(string: "\n"))
+        }
+
+        // Previous line goes second
+        let prevNoNewline = prevStr.hasSuffix("\n") ? String(prevStr.dropLast()) : prevStr
+        if prevNoNewline.isEmpty {
+            // Previous line was just a newline
+            replacement.append(NSAttributedString(string: "\n", attributes: prevLine.attributes(at: 0, effectiveRange: nil)))
+        } else {
+            let trimmedPrev = NSMutableAttributedString(attributedString: prevLine)
+            if prevStr.hasSuffix("\n") && !currentStr.hasSuffix("\n") {
+                // We added newline to current, so remove trailing newline from prev only if current didn't have one
+            }
+            replacement.append(trimmedPrev)
+        }
+
+        // Handle edge case: ensure combined replacement matches combined range length for clean swap
+        // Simpler approach: just swap the raw lines
+        let swapped = NSMutableAttributedString()
+        swapped.append(currentLine)
+        if !currentStr.hasSuffix("\n") && prevStr.hasSuffix("\n") {
+            // Current line is last line (no trailing newline) — add newline to it, remove from prev
+            swapped.append(NSAttributedString(string: "\n"))
+            let prevTrimmed = NSMutableAttributedString(attributedString: prevLine)
+            prevTrimmed.deleteCharacters(in: NSRange(location: prevTrimmed.length - 1, length: 1))
+            swapped.append(prevTrimmed)
+        } else {
+            swapped.append(prevLine)
+        }
+
+        storage.replaceCharacters(in: combinedRange, with: swapped)
+
+        // Place caret at same relative position in the moved line
+        let offset = sel.location - lineRange.location
+        setSelectedRange(NSRange(location: prevLineRange.location + offset, length: sel.length))
+        didChangeText()
+    }
+
+    private func moveLineDown() {
+        guard let storage = textStorage else { return }
+        let str = storage.string as NSString
+        let sel = selectedRange()
+        let lineRange = str.lineRange(for: sel)
+
+        // Can't move down if already at the last line
+        let lineEnd = NSMaxRange(lineRange)
+        guard lineEnd < str.length else { return }
+
+        let nextLineRange = str.lineRange(for: NSRange(location: lineEnd, length: 0))
+
+        recordUndoSnapshot()
+
+        let currentLine = storage.attributedSubstring(from: lineRange)
+        let nextLine = storage.attributedSubstring(from: nextLineRange)
+
+        let currentStr = currentLine.string
+        let nextStr = nextLine.string
+
+        let combinedRange = NSRange(location: lineRange.location, length: lineRange.length + nextLineRange.length)
+
+        let swapped = NSMutableAttributedString()
+        swapped.append(nextLine)
+        if !nextStr.hasSuffix("\n") && currentStr.hasSuffix("\n") {
+            // Next line is last line (no trailing newline) — add newline to it, remove from current
+            swapped.append(NSAttributedString(string: "\n"))
+            let currentTrimmed = NSMutableAttributedString(attributedString: currentLine)
+            currentTrimmed.deleteCharacters(in: NSRange(location: currentTrimmed.length - 1, length: 1))
+            swapped.append(currentTrimmed)
+        } else {
+            swapped.append(currentLine)
+        }
+
+        storage.replaceCharacters(in: combinedRange, with: swapped)
+
+        // Place caret at same relative position in the moved line
+        let offset = sel.location - lineRange.location
+        let newLineStart = lineRange.location + nextLineRange.length
+        setSelectedRange(NSRange(location: newLineStart + offset, length: sel.length))
+        didChangeText()
     }
 
     override func mouseDown(with event: NSEvent) {
