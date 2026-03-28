@@ -13,7 +13,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.4.4"
+let APP_VERSION = "v1.4.5"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 
@@ -1361,24 +1361,26 @@ class BlockCaretTextView: NSTextView {
             let newStr = storage.string as NSString
             insertPos = min(insertPos, newStr.length)
 
-            // Re-indent the source line to match target context
-            let sourceContent: String
-            let sourceLeading = String(sourceStr.prefix(while: { $0 == " " }))
-            let strippedSource = String(sourceStr.dropFirst(sourceLeading.count))
-            // Only re-indent if source has a list prefix
-            let hasPrefix = strippedSource.hasPrefix("• ") || strippedSource.hasPrefix("☐ ") || strippedSource.hasPrefix("☑ ")
-            if hasPrefix {
-                sourceContent = targetIndent + strippedSource
-            } else {
-                sourceContent = sourceStr
-            }
-
-            // Build the attributed line to insert
+            // Re-indent the source line to match target context (preserve attributed formatting)
             let mutable = NSMutableAttributedString(attributedString: sourceLine)
-            // Replace the text but keep attributes from the original
-            let attrRange = NSRange(location: 0, length: mutable.length)
-            let contentNoNewline = sourceContent.hasSuffix("\n") ? String(sourceContent.dropLast()) : sourceContent
-            mutable.replaceCharacters(in: attrRange, with: contentNoNewline)
+            // Remove trailing newline from the mutable copy
+            if mutable.string.hasSuffix("\n") {
+                mutable.deleteCharacters(in: NSRange(location: mutable.length - 1, length: 1))
+            }
+            // Adjust leading whitespace only — don't touch the rest of the attributed content
+            let sourceLeading = mutable.string.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
+            let strippedStr = String(mutable.string.dropFirst(sourceLeading.count))
+            let hasPrefix = strippedStr.hasPrefix("• ") || strippedStr.hasPrefix("☐ ") || strippedStr.hasPrefix("☑ ")
+            if hasPrefix && sourceLeading.count != targetIndent.count {
+                // Remove old indent, insert new indent
+                if sourceLeading.count > 0 {
+                    mutable.deleteCharacters(in: NSRange(location: 0, length: sourceLeading.count))
+                }
+                if !targetIndent.isEmpty {
+                    let indentAttr = NSAttributedString(string: targetIndent, attributes: mutable.length > 0 ? mutable.attributes(at: 0, effectiveRange: nil) : [:])
+                    mutable.insert(indentAttr, at: 0)
+                }
+            }
 
             // Insert
             if insertPos >= newStr.length {
