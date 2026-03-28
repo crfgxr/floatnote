@@ -13,7 +13,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.2.0"
+let APP_VERSION = "v1.4.4"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 
@@ -71,7 +71,7 @@ struct WindowAccessor: NSViewRepresentable {
 // MARK: - Format Actions
 
 enum FormatAction: Equatable {
-    case bold, italic, underline, code, heading1, heading2, heading3, bulletList, checklist, link, divider, body
+    case bold, italic, underline, heading1, heading2, heading3, bulletList, checklist, link, divider, body
 }
 
 // MARK: - Tab Model
@@ -267,14 +267,24 @@ class EditorViewModel: ObservableObject {
         saveTabsLocal()
     }
 
+    private var saveTimer: Timer?
+
     func textDidChange(html: String, length: Int) {
         guard !isLoadingContent else { return }
         charCount = length
         currentHTML = html
         activeTab?.html = html
-        saveLocal(html: html)
-        saveTabsLocal()
-        status = "Saved"
+        status = "Editing..."
+        // Debounce disk writes — save after 0.5s of idle
+        saveTimer?.invalidate()
+        saveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.saveLocal(html: self.currentHTML)
+                self.saveTabsLocal()
+                self.status = "Saved"
+            }
+        }
     }
 
     func performFormat(_ action: FormatAction) {
@@ -320,7 +330,6 @@ class EditorViewModel: ObservableObject {
         h1 { font-size: 28px; font-weight: 700; }
         h2 { font-size: 22px; font-weight: 600; }
         h3 { font-size: 18px; font-weight: 600; }
-        code { font-family: Menlo; font-size: 13px; background: #2a2a2a; padding: 2px 4px; border-radius: 3px; }
         a { color: #6cb6ff; }
         </style></head><body dir="ltr">\(html)</body></html>
         """
@@ -334,27 +343,7 @@ class EditorViewModel: ObservableObject {
                 documentAttributes: nil
               ) else { return nil }
 
-        // Post-process: mark code spans with .codeBlock attribute and paragraph styling
-        let mutable = NSMutableAttributedString(attributedString: attrStr)
-        let fullStr = mutable.string as NSString
-        mutable.enumerateAttribute(.font, in: NSRange(location: 0, length: mutable.length), options: []) { value, range, _ in
-            if let font = value as? NSFont, font.fontName.lowercased().contains("menlo") {
-                let paraRange = fullStr.paragraphRange(for: range)
-                mutable.addAttribute(.codeBlock, value: true, range: paraRange)
-                mutable.removeAttribute(.backgroundColor, range: paraRange)
-                let ps = NSMutableParagraphStyle()
-                ps.baseWritingDirection = .leftToRight
-                ps.alignment = .left
-                ps.headIndent = 12
-                ps.firstLineHeadIndent = 12
-                ps.tailIndent = -12
-                ps.paragraphSpacingBefore = 6
-                ps.paragraphSpacing = 6
-                mutable.addAttribute(.paragraphStyle, value: ps, range: paraRange)
-                mutable.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.78, alpha: 1.0), range: paraRange)
-            }
-        }
-        return mutable
+        return attrStr
     }
 }
 
@@ -398,13 +387,28 @@ class TabScrollState: ObservableObject {
 }
 
 // NSScrollView wrapper for smooth native horizontal scrolling with momentum
+/// NSScrollView that converts vertical mouse wheel to horizontal scrolling.
+class HorizontalWheelScrollView: NSScrollView {
+    override func scrollWheel(with event: NSEvent) {
+        if abs(event.deltaY) > abs(event.deltaX) {
+            let delta = event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? 1 : 10)
+            let current = contentView.bounds.origin.x
+            let maxOffset = max(0, (documentView?.frame.width ?? 0) - contentView.bounds.width)
+            let target = max(0, min(maxOffset, current + delta))
+            contentView.setBoundsOrigin(NSPoint(x: target, y: 0))
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+}
+
 struct NativeHScrollView<Content: View>: NSViewRepresentable {
     let scrollState: TabScrollState
     let onScroll: (CGFloat, CGFloat, CGFloat) -> Void // (offset, contentWidth, containerWidth)
     @ViewBuilder let content: Content
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = HorizontalWheelScrollView()
         scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = false
         scrollView.scrollerStyle = .overlay
@@ -477,12 +481,12 @@ struct TabBar: View {
     private var clippedRight: Bool { overflows && (scrollOffset + containerWidth) < contentWidth - 1 }
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(alignment: .center, spacing: 0) {
             if overflows {
                 Button(action: { scrollState.scroll(by: -100) }) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 9, weight: .bold))
-                        .frame(width: 16, height: 26)
+                        .frame(width: 16, height: 30)
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(clippedLeft ? .secondary : .secondary.opacity(0.2))
@@ -498,13 +502,6 @@ struct TabBar: View {
                         TabItemView(tab: tab)
                             .id(tab.id)
                     }
-                    Button(action: { vm.addTab() }) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 11))
-                            .frame(width: 24, height: 26)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.leading, 4)
                 }
             }
             .frame(height: 30)
@@ -513,14 +510,20 @@ struct TabBar: View {
                 Button(action: { scrollState.scroll(by: 100) }) {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 9, weight: .bold))
-                        .frame(width: 16, height: 26)
+                        .frame(width: 16, height: 30)
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(clippedRight ? .secondary : .secondary.opacity(0.2))
             }
+
+            Button(action: { vm.addTab() }) {
+                Image(systemName: "plus")
+                    .font(.system(size: 11))
+                    .frame(width: 24, height: 30)
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 4)
-        .padding(.vertical, 2)
         .background(.bar)
     }
 }
@@ -555,7 +558,8 @@ struct TabItemView: View {
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 5)
+        .padding(.vertical, 6)
+        .padding(.top, 1)
         .background(
             RoundedRectangle(cornerRadius: 5)
                 .fill(isActive ? Color.accentColor.opacity(0.15) : Color.clear)
@@ -718,7 +722,6 @@ struct FormatToolbar: View {
                 iconBtn("bold", id: "bold") { vm.performFormat(.bold) }
                 iconBtn("italic", id: "italic") { vm.performFormat(.italic) }
                 iconBtn("underline", id: "underline") { vm.performFormat(.underline) }
-                iconBtn("chevron.left.forwardslash.chevron.right", id: "code") { vm.performFormat(.code) }
             }
 
             thinDivider()
@@ -860,63 +863,6 @@ struct FormatToolbar: View {
     }
 }
 
-// MARK: - Code Block Layout Manager
-
-extension NSAttributedString.Key {
-    static let codeBlock = NSAttributedString.Key("FloatNoteCodeBlock")
-}
-
-class CodeBlockLayoutManager: NSLayoutManager {
-    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
-        guard let textStorage = textStorage, let textContainer = textContainers.first else {
-            super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
-            return
-        }
-
-        let charRange = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
-        let containerWidth = textContainer.containerSize.width
-        var drawnRanges: [NSRange] = []
-
-        // Find contiguous code block regions and merge them
-        textStorage.enumerateAttribute(.codeBlock, in: charRange, options: []) { value, attrRange, _ in
-            guard value != nil else { return }
-
-            // Expand to full paragraph lines
-            let str = textStorage.string as NSString
-            let paraRange = str.paragraphRange(for: attrRange)
-            let glyphRange = self.glyphRange(forCharacterRange: paraRange, actualCharacterRange: nil)
-
-            // Skip if already drawn (merged ranges)
-            if drawnRanges.contains(where: { NSIntersectionRange($0, paraRange).length > 0 }) { return }
-            drawnRanges.append(paraRange)
-
-            // Get bounding rect for all lines in this code block
-            self.enumerateLineFragments(forGlyphRange: glyphRange) { _, _, _, _, _ in }
-            var blockRect = self.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-
-            // Make full-width block
-            let fullRect = NSRect(
-                x: origin.x,
-                y: blockRect.origin.y + origin.y - 6,
-                width: containerWidth,
-                height: blockRect.height + 12
-            )
-
-            // Draw rounded container
-            let path = NSBezierPath(roundedRect: fullRect, xRadius: 6, yRadius: 6)
-            NSColor(calibratedRed: 0.07, green: 0.07, blue: 0.08, alpha: 1.0).setFill()
-            path.fill()
-
-            // Draw border
-            NSColor(calibratedWhite: 0.30, alpha: 1.0).setStroke()
-            path.lineWidth = 1.0
-            path.stroke()
-        }
-
-        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
-    }
-}
-
 // MARK: - Block Caret NSTextView
 
 class BlockCaretTextView: NSTextView {
@@ -1003,7 +949,7 @@ class BlockCaretTextView: NSTextView {
         guard let str = textStorage?.string as NSString? else { return (NSRange(), 0) }
         let lineRange = str.lineRange(for: NSRange(location: pos, length: 0))
         let lineStr = str.substring(with: lineRange)
-        let leadingSpaces = lineStr.prefix(while: { $0 == " " }).count
+        let leadingSpaces = lineStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" }).count
         let afterIndent = String(lineStr.dropFirst(leadingSpaces))
         for prefix in ["• ", "☐ ", "☑ "] {
             if afterIndent.hasPrefix(prefix) { return (lineRange, leadingSpaces + prefix.count) }
@@ -1060,7 +1006,8 @@ class BlockCaretTextView: NSTextView {
 
             // Divider line: delete the entire divider (including surrounding newlines)
             let trimmedLine = lineStr.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedLine.isEmpty && trimmedLine.allSatisfy({ $0 == "─" }) {
+            let hasListPrefix = trimmedLine.hasPrefix("• ") || trimmedLine.hasPrefix("☐ ") || trimmedLine.hasPrefix("☑ ")
+            if !hasListPrefix && !trimmedLine.isEmpty && trimmedLine.allSatisfy({ $0 == "─" }) {
                 recordUndoSnapshot()
                 // Include the newline before the divider if present
                 var deleteStart = lineRange.location
@@ -1072,68 +1019,6 @@ class BlockCaretTextView: NSTextView {
                 setSelectedRange(NSRange(location: min(deleteStart, storage.length), length: 0))
                 didChangeText()
                 return
-            }
-
-            let isEmptyLine = trimmedLine.isEmpty
-
-            // Backspace near code block: scan backwards through empty lines/newlines to find code block
-            if isEmptyLine {
-                var scanPos = pos - 1
-                // Walk backwards over newlines and empty content
-                while scanPos >= 0 {
-                    let ch = str.substring(with: NSRange(location: scanPos, length: 1))
-                    if ch == "\n" || ch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        // Check if this position has codeBlock attribute
-                        if storage.attribute(.codeBlock, at: scanPos, effectiveRange: nil) != nil {
-                            // Found the code block — delete from end of code content to current cursor line end
-                            recordUndoSnapshot()
-                            // Find last non-newline in the code block
-                            var codeEnd = scanPos
-                            while codeEnd >= 0 && str.substring(with: NSRange(location: codeEnd, length: 1)) == "\n" {
-                                codeEnd -= 1
-                            }
-                            codeEnd += 1 // position after last content char
-                            let deleteStart = codeEnd
-                            let deleteEnd = NSMaxRange(lineRange)
-                            if deleteEnd > deleteStart {
-                                storage.deleteCharacters(in: NSRange(location: deleteStart, length: deleteEnd - deleteStart))
-                            }
-                            let newPos = min(deleteStart, storage.length)
-                            setSelectedRange(NSRange(location: newPos, length: 0))
-
-                            // Re-apply .codeBlock to the paragraph at cursor so the attribute is consistent
-                            if newPos > 0 {
-                                let reapplyStr = storage.string as NSString
-                                let paraRange = reapplyStr.paragraphRange(for: NSRange(location: max(0, newPos - 1), length: 0))
-                                storage.addAttribute(.codeBlock, value: true, range: paraRange)
-                            }
-
-                            // Restore code block typing attributes
-                            let codeFont = NSFont(name: "Menlo", size: 13) ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-                            let codePS = NSMutableParagraphStyle()
-                            codePS.baseWritingDirection = .leftToRight
-                            codePS.alignment = .left
-                            codePS.headIndent = 12
-                            codePS.firstLineHeadIndent = 12
-                            codePS.tailIndent = -12
-                            codePS.paragraphSpacingBefore = 6
-                            codePS.paragraphSpacing = 6
-                            typingAttributes = [
-                                .font: codeFont,
-                                .foregroundColor: NSColor(calibratedWhite: 0.78, alpha: 1.0),
-                                .paragraphStyle: codePS,
-                                .codeBlock: true
-                            ]
-
-                            didChangeText()
-                            return
-                        }
-                        scanPos -= 1
-                    } else {
-                        // Hit non-empty, non-code content — not adjacent to code block
-                        break
-                    }
-                }
             }
 
             let (pfxLineRange, prefixLen) = listPrefixLen(at: pos)
@@ -1194,108 +1079,6 @@ class BlockCaretTextView: NSTextView {
         }
         super.keyDown(with: event)
         updateCaretPosition()
-    }
-
-    /// When pressing Down on the last line of a code block or at end of document,
-    /// create a new normal line below and move cursor there.
-    func handleDownAtBlockEnd() -> Bool {
-        guard let storage = textStorage else { return false }
-        let pos = selectedRange().location
-        let str = storage.string as NSString
-        guard str.length > 0 else { return false }
-
-        let checkPos = min(pos, max(0, storage.length - 1))
-        let lineRange = str.lineRange(for: NSRange(location: checkPos, length: 0))
-        let lineEnd = NSMaxRange(lineRange)
-
-        let isLastLine = lineEnd >= str.length
-
-        // Check if current line is in a code block (attribute OR Menlo font)
-        var inCodeBlock = false
-        for cp in [checkPos, max(0, checkPos - 1)] {
-            if cp < storage.length {
-                if storage.attribute(.codeBlock, at: cp, effectiveRange: nil) != nil {
-                    inCodeBlock = true; break
-                }
-                if let font = storage.attribute(.font, at: cp, effectiveRange: nil) as? NSFont,
-                   font.fontName.lowercased().contains("menlo") {
-                    inCodeBlock = true; break
-                }
-            }
-        }
-
-        if inCodeBlock {
-            // Check if this is the last line of the code block (next line is not code, or no next line)
-            let nextCheckPos = min(lineEnd, str.length - 1)
-            var nextIsCode = false
-            if lineEnd < str.length {
-                if storage.attribute(.codeBlock, at: nextCheckPos, effectiveRange: nil) != nil {
-                    nextIsCode = true
-                } else if let font = storage.attribute(.font, at: nextCheckPos, effectiveRange: nil) as? NSFont,
-                          font.fontName.lowercased().contains("menlo") {
-                    nextIsCode = true
-                }
-            }
-            let isLastCodeLine = lineEnd >= str.length || !nextIsCode
-
-            if isLastCodeLine {
-                if lineEnd >= str.length {
-                    // At end of document — create new line
-                    let ps = NSMutableParagraphStyle()
-                    ps.baseWritingDirection = .leftToRight
-                    ps.alignment = .left
-                    ps.paragraphSpacingBefore = 8
-
-                    let bodyFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
-                    let exitStr = NSMutableAttributedString(string: "\n\u{200B}", attributes: [
-                        .font: bodyFont,
-                        .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
-                        .paragraphStyle: ps
-                    ])
-                    storage.insert(exitStr, at: lineEnd)
-                    let insertedRange = NSRange(location: lineEnd, length: 2)
-                    storage.removeAttribute(.codeBlock, range: insertedRange)
-                    storage.removeAttribute(.backgroundColor, range: insertedRange)
-
-                    setSelectedRange(NSRange(location: lineEnd + 1, length: 0))
-                    typingAttributes = [
-                        .font: bodyFont,
-                        .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
-                        .paragraphStyle: ps
-                    ]
-                    didChangeText()
-                    updateCaretPosition()
-                    return true
-                }
-                // Next line exists and is not code — let default Down handle it
-                return false
-            }
-        }
-
-        // At end of document on any line — create new line
-        if isLastLine && pos >= str.length - 1 {
-            let bodyFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
-            let ps = NSMutableParagraphStyle()
-            ps.baseWritingDirection = .leftToRight
-            ps.alignment = .left
-            let newline = NSAttributedString(string: "\n", attributes: [
-                .font: bodyFont,
-                .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
-                .paragraphStyle: ps
-            ])
-            storage.insert(newline, at: str.length)
-            setSelectedRange(NSRange(location: str.length + 1, length: 0))
-            typingAttributes = [
-                .font: bodyFont,
-                .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
-                .paragraphStyle: ps
-            ]
-            didChangeText()
-            updateCaretPosition()
-            return true
-        }
-
-        return false
     }
 
     private func moveLineUp() {
@@ -1767,7 +1550,7 @@ struct RichTextEditor: NSViewRepresentable {
         let textContainer = NSTextContainer(containerSize: NSSize(width: contentSize.width, height: .greatestFiniteMagnitude))
         textContainer.widthTracksTextView = true
 
-        let layoutManager = CodeBlockLayoutManager()
+        let layoutManager = NSLayoutManager()
         layoutManager.addTextContainer(textContainer)
 
         let textStorage = NSTextStorage()
@@ -1827,13 +1610,9 @@ struct RichTextEditor: NSViewRepresentable {
                     let ltr = NSMutableParagraphStyle()
                     ltr.baseWritingDirection = .leftToRight
                     ltr.alignment = .left
-                    // Apply LTR paragraph style only to non-code-block lines
-                    fixed.enumerateAttribute(.codeBlock, in: fullRange, options: []) { val, range, _ in
-                        if val == nil {
-                            fixed.addAttribute(.paragraphStyle, value: ltr, range: range)
-                        }
-                    }
-                    // Apply text color to all (code blocks get their own color in post-processing)
+                    // Apply LTR paragraph style to all lines
+                    fixed.addAttribute(.paragraphStyle, value: ltr, range: fullRange)
+                    // Apply text color to all
                     fixed.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: fullRange)
                 }
                 textView.textStorage?.setAttributedString(fixed)
@@ -1887,6 +1666,11 @@ struct RichTextEditor: NSViewRepresentable {
 
         vm.editorCoordinator = context.coordinator
 
+        // Load initial content if it was ready before the view was created
+        if vm.attributedText.length > 0 {
+            vm.onContentLoaded?(vm.attributedText)
+        }
+
         return scrollView
     }
 
@@ -1901,7 +1685,6 @@ struct RichTextEditor: NSViewRepresentable {
         let h1Font = NSFont(name: "Times New Roman Bold", size: 28) ?? NSFont.boldSystemFont(ofSize: 28)
         let h2Font = NSFont(name: "Times New Roman Bold", size: 22) ?? NSFont.boldSystemFont(ofSize: 22)
         let h3Font = NSFont(name: "Times New Roman Bold", size: 18) ?? NSFont.boldSystemFont(ofSize: 18)
-        let codeFont = NSFont(name: "Menlo", size: 13) ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         let textColor = NSColor(calibratedWhite: 0.88, alpha: 1.0)
 
         private var isProcessingMarkdown = false
@@ -1924,7 +1707,6 @@ struct RichTextEditor: NSViewRepresentable {
             }
 
             applyListIndentForCurrentLine(textView: textView)
-            ensureCodeBlockConsistency(textView: textView)
 
             let html = extractHTML(from: textView)
             Task { @MainActor in
@@ -1970,71 +1752,6 @@ struct RichTextEditor: NSViewRepresentable {
             }
         }
 
-        /// Ensure .codeBlock attribute is consistent: if cursor is inside a code block region,
-        /// re-apply .codeBlock to the current line and fix typing attributes.
-        private func ensureCodeBlockConsistency(textView: NSTextView) {
-            guard let storage = textView.textStorage else { return }
-            let cursor = textView.selectedRange().location
-            guard cursor > 0 && storage.length > 0 else { return }
-
-            let str = storage.string as NSString
-            let codeFont = NSFont(name: "Menlo", size: 13) ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-            let codePS = NSMutableParagraphStyle()
-            codePS.baseWritingDirection = .leftToRight
-            codePS.alignment = .left
-            codePS.headIndent = 12
-            codePS.firstLineHeadIndent = 12
-            codePS.tailIndent = -12
-            codePS.paragraphSpacingBefore = 6
-            codePS.paragraphSpacing = 6
-
-            // Check multiple positions around cursor for .codeBlock
-            var foundCodeBlock = false
-            let positionsToCheck = [cursor - 1, cursor, cursor + 1, cursor - 2]
-            for checkAt in positionsToCheck {
-                if checkAt >= 0 && checkAt < storage.length {
-                    if storage.attribute(.codeBlock, at: checkAt, effectiveRange: nil) != nil {
-                        foundCodeBlock = true
-                        break
-                    }
-                }
-            }
-
-            // Also trust typing attributes
-            if !foundCodeBlock && textView.typingAttributes[.codeBlock] != nil {
-                foundCodeBlock = true
-            }
-
-            if foundCodeBlock {
-                // Apply .codeBlock to the current line and the previous line (covers newline splits)
-                let curLineRange = str.lineRange(for: NSRange(location: min(cursor, max(0, str.length - 1)), length: 0))
-                if storage.attribute(.codeBlock, at: curLineRange.location, effectiveRange: nil) == nil {
-                    storage.addAttribute(.codeBlock, value: true, range: curLineRange)
-                    storage.addAttribute(.font, value: codeFont, range: curLineRange)
-                    storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.78, alpha: 1.0), range: curLineRange)
-                    storage.addAttribute(.paragraphStyle, value: codePS, range: curLineRange)
-                }
-
-                // Also ensure the newline before cursor (if any) has .codeBlock
-                if cursor > 0 && cursor - 1 < storage.length {
-                    let prevChar = str.substring(with: NSRange(location: cursor - 1, length: 1))
-                    if prevChar == "\n" && storage.attribute(.codeBlock, at: cursor - 1, effectiveRange: nil) == nil {
-                        storage.addAttribute(.codeBlock, value: true, range: NSRange(location: cursor - 1, length: 1))
-                    }
-                }
-
-                // Fix typing attributes
-                if textView.typingAttributes[.codeBlock] == nil {
-                    var attrs = textView.typingAttributes
-                    attrs[.font] = codeFont
-                    attrs[.codeBlock] = true
-                    attrs[.foregroundColor] = NSColor(calibratedWhite: 0.78, alpha: 1.0)
-                    attrs[.paragraphStyle] = codePS
-                    textView.typingAttributes = attrs
-                }
-            }
-        }
-
         /// Apply hanging indent to ALL list lines (used on initial content load).
         func applyListIndentToAllLines(textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
@@ -2055,12 +1772,6 @@ struct RichTextEditor: NSViewRepresentable {
             guard let storage = textView.textStorage else { return }
             let cursor = textView.selectedRange().location
             guard cursor > 0 else { return }
-
-            // Don't process markdown inside code blocks
-            let checkPos = min(cursor - 1, storage.length - 1)
-            if checkPos >= 0, storage.attribute(.codeBlock, at: checkPos, effectiveRange: nil) != nil {
-                return
-            }
 
             let str = storage.string as NSString
             let lineRange = str.lineRange(for: NSRange(location: cursor - 1, length: 0))
@@ -2129,7 +1840,6 @@ struct RichTextEditor: NSViewRepresentable {
                 ("Bullet List", "list.bullet", 4),
                 ("Checklist", "checklist", 5),
                 nil,
-                ("Code", "chevron.left.forwardslash.chevron.right", 6),
                 ("Divider", "minus", 7),
             ]
 
@@ -2203,7 +1913,6 @@ struct RichTextEditor: NSViewRepresentable {
             case 3: applyFormat(.heading3, textView: textView)
             case 4: applyFormat(.bulletList, textView: textView)
             case 5: applyFormat(.checklist, textView: textView)
-            case 6: applyFormat(.code, textView: textView)
             case 7: applyFormat(.divider, textView: textView)
             default: break
             }
@@ -2267,66 +1976,6 @@ struct RichTextEditor: NSViewRepresentable {
                 storage.beginEditing()
                 applyFont(bodyFont, in: range, storage: storage, textView: textView)
                 storage.endEditing()
-            case .code:
-                storage.beginEditing()
-                let str = storage.string as NSString
-                var paraRange = str.paragraphRange(for: range)
-
-                // Check if already code — toggle off
-                var isCode = false
-                if paraRange.length > 0 {
-                    storage.enumerateAttribute(.codeBlock, in: paraRange, options: []) { val, _, _ in
-                        if val != nil { isCode = true }
-                    }
-                }
-                if isCode {
-                    storage.removeAttribute(.codeBlock, range: paraRange)
-                    storage.removeAttribute(.backgroundColor, range: paraRange)
-                    storage.removeAttribute(.foregroundColor, range: paraRange)
-                    applyFont(bodyFont, in: paraRange, storage: storage, textView: textView)
-                    storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: paraRange)
-                    let ps = NSMutableParagraphStyle()
-                    ps.baseWritingDirection = .leftToRight
-                    ps.alignment = .left
-                    storage.addAttribute(.paragraphStyle, value: ps, range: paraRange)
-                } else {
-                    // If cursor is on empty line with no content, insert a space placeholder
-                    let paraStr = str.substring(with: paraRange)
-                    if paraStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        let insertPos = paraRange.location
-                        // Insert a newline if we're at the very end without one, or use existing line
-                        if paraRange.length == 0 {
-                            storage.insert(NSAttributedString(string: " "), at: insertPos)
-                            paraRange = NSRange(location: insertPos, length: 1)
-                        }
-                    }
-
-                    applyFont(codeFont, in: paraRange, storage: storage, textView: textView)
-                    storage.addAttribute(.codeBlock, value: true, range: paraRange)
-                    let ps = NSMutableParagraphStyle()
-                    ps.baseWritingDirection = .leftToRight
-                    ps.alignment = .left
-                    ps.headIndent = 12
-                    ps.firstLineHeadIndent = 12
-                    ps.tailIndent = -12
-                    ps.paragraphSpacingBefore = 6
-                    ps.paragraphSpacing = 6
-                    storage.addAttribute(.paragraphStyle, value: ps, range: paraRange)
-                    storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.78, alpha: 1.0), range: paraRange)
-
-                    // Set typing attributes so new text continues in code style
-                    var typingAttrs = textView.typingAttributes
-                    typingAttrs[.font] = codeFont
-                    typingAttrs[.codeBlock] = true
-                    typingAttrs[.paragraphStyle] = ps
-                    typingAttrs[.foregroundColor] = NSColor(calibratedWhite: 0.78, alpha: 1.0)
-                    textView.typingAttributes = typingAttrs
-
-                    // Place cursor inside the code block
-                    textView.setSelectedRange(NSRange(location: paraRange.location, length: 0))
-                }
-                storage.endEditing()
-                textView.needsDisplay = true
             case .bulletList:
                 insertAtLineStart(textView: textView, prefix: "• ")
             case .checklist:
@@ -2575,11 +2224,6 @@ struct RichTextEditor: NSViewRepresentable {
             if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
                 return handleBacktab(textView: textView)
             }
-            if commandSelector == #selector(NSResponder.moveDown(_:)) {
-                if let blockTV = textView as? BlockCaretTextView, blockTV.handleDownAtBlockEnd() {
-                    return true
-                }
-            }
             return false
         }
 
@@ -2625,8 +2269,14 @@ struct RichTextEditor: NSViewRepresentable {
             }
 
             if let prefix = detectedPrefix {
-                recordUndo(for: textView)
                 let fullPrefix = leadingSpaces + prefix
+
+                // If cursor is at or before the prefix, just insert a plain newline (push line down)
+                if range.location <= lineRange.location + fullPrefix.count {
+                    return false  // let NSTextView handle the newline normally
+                }
+
+                recordUndo(for: textView)
                 let contentAfterPrefix = String(lineStr.dropFirst(fullPrefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
 
                 if contentAfterPrefix.isEmpty {
@@ -2738,6 +2388,5 @@ struct RichTextEditor: NSViewRepresentable {
             return true
         }
 
-        // handleEscape removed — Down arrow handles exiting code blocks/lists naturally
     }
 }
