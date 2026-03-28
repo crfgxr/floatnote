@@ -13,11 +13,9 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.0.3"
-let BUCKET_GUID = "bf100d62-31b3-ac11-298c-6a90ae689031"
-let NOTE_TITLE = "editor"
-let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.evernote-editor-local.html"
-let LOCAL_TABS_PATH = NSHomeDirectory() + "/.evernote-editor-tabs.json"
+let APP_VERSION = "v1.1.1"
+let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
+let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 
 @main
 struct FloatNoteApp: App {
@@ -35,10 +33,7 @@ struct FloatNoteApp: App {
         .defaultSize(width: 800, height: 600)
         .commands {
             CommandGroup(replacing: .newItem) { } // Disable Cmd+N / new window
-            CommandGroup(replacing: .saveItem) {
-                Button("Save Now") { Task { await vm.saveNow() } }
-                    .keyboardShortcut("s")
-            }
+            CommandGroup(replacing: .saveItem) { }
         }
     }
 }
@@ -53,22 +48,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let vm else { return .terminateNow }
-
-        // Synchronously save local
         vm.saveLocalSync()
-
-        // Try to sync to Evernote before quitting
-        let semaphore = DispatchSemaphore(value: 0)
-        Task { @MainActor in
-            await vm.syncToEvernote()
-            semaphore.signal()
-        }
-        // Wait up to 5 seconds for Evernote sync
-        let result = semaphore.wait(timeout: .now() + 5)
-        if result == .timedOut {
-            // Local save is already done, Evernote sync timed out but data is safe
-            NSLog("Evernote sync timed out on exit, local save is intact")
-        }
         return .terminateNow
     }
 }
@@ -99,29 +79,27 @@ enum FormatAction: Equatable {
 struct TabData: Codable {
     var id: String
     var title: String
-    var noteGuid: String?
+    var noteGuid: String?  // legacy field, ignored
     var html: String
 }
 
 class NoteTab: Identifiable, ObservableObject {
     let id: UUID
     @Published var title: String
-    var noteGuid: String?
     var html: String = ""
     var lastSavedHTML: String = ""
 
-    init(id: UUID = UUID(), title: String, noteGuid: String? = nil) {
+    init(id: UUID = UUID(), title: String) {
         self.id = id
         self.title = title
-        self.noteGuid = noteGuid
     }
 
     func toData() -> TabData {
-        TabData(id: id.uuidString, title: title, noteGuid: noteGuid, html: html)
+        TabData(id: id.uuidString, title: title, html: html)
     }
 
     static func from(_ data: TabData) -> NoteTab {
-        let tab = NoteTab(id: UUID(uuidString: data.id) ?? UUID(), title: data.title, noteGuid: data.noteGuid)
+        let tab = NoteTab(id: UUID(uuidString: data.id) ?? UUID(), title: data.title)
         tab.html = data.html
         return tab
     }
@@ -148,98 +126,24 @@ class EditorViewModel: ObservableObject {
     weak var editorCoordinator: RichTextEditor.Coordinator?
     var isLoadingContent = false
 
-    private var api: EvernoteAPI?
-    private var noteGuid: String?
-    private var saveTask: Task<Void, Never>?
     private var lastSavedHTML: String = ""
     private var currentHTML: String = ""
 
     init() {
-        loadToken()
-        Task { await loadOrCreateNote() }
+        loadOrCreateNote()
     }
 
-    static nonisolated let authPath = "/Users/cagdas/CodTemp/myevernote-macos-app/.auth.json"
-
-    private func loadToken() {
-        // Try to refresh if expired
-        let isoFmt = ISO8601DateFormatter()
-        isoFmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoFmtNoFrac = ISO8601DateFormatter()
-        isoFmtNoFrac.formatOptions = [.withInternetDateTime]
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: Self.authPath)),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let expiresAt = json["expiresAt"] as? String,
-           let expDate = isoFmt.date(from: expiresAt) ?? isoFmtNoFrac.date(from: expiresAt),
-           expDate < Date(),
-           let refreshToken = json["refreshToken"] as? String {
-            refreshAuthToken(refreshToken)
+    private func loadOrCreateNote() {
+        // Migrate old tabs file path if needed
+        let oldTabsPath = NSHomeDirectory() + "/.evernote-editor-tabs.json"
+        if !FileManager.default.fileExists(atPath: LOCAL_TABS_PATH),
+           FileManager.default.fileExists(atPath: oldTabsPath) {
+            try? FileManager.default.moveItem(atPath: oldTabsPath, toPath: LOCAL_TABS_PATH)
         }
 
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: Self.authPath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let token = json["monoToken"] as? String,
-              let shard = json["shard"] as? String else {
-            status = "No auth token. Run: node login.js"
-            return
-        }
-        api = EvernoteAPI(token: token, shard: shard)
-    }
-
-    private func refreshAuthToken(_ refreshToken: String) {
-        let url = URL(string: "https://accounts.evernote.com/auth/token")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let body = "refresh_token=\(refreshToken)&client_id=evernote-web-client&grant_type=refresh_token&redirect_uri=https://www.evernote.com/client/web"
-        request.httpBody = body.data(using: .utf8)
-
-        let semaphore = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            defer { semaphore.signal() }
-            guard let data,
-                  let resp = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let accessToken = resp["access_token"] as? String else { return }
-
-            // Decode JWT payload
-            let parts = accessToken.split(separator: ".")
-            guard parts.count >= 2,
-                  let payloadData = Data(base64Encoded: String(parts[1])
-                      .replacingOccurrences(of: "-", with: "+")
-                      .replacingOccurrences(of: "_", with: "/")
-                      .padding(toLength: ((String(parts[1]).count + 3) / 4) * 4, withPad: "=", startingAt: 0)),
-                  let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-                  let monoToken = payload["mono_authn_token"] as? String,
-                  let exp = payload["exp"] as? Double else { return }
-
-            let shardMatch = monoToken.range(of: #"S=(s\d+)"#, options: .regularExpression)
-            let shard = shardMatch.flatMap { String(monoToken[$0]).components(separatedBy: "=").last } ?? "s24"
-
-            var newAuth: [String: Any] = [
-                "accessToken": accessToken,
-                "refreshToken": (resp["refresh_token"] as? String) ?? refreshToken,
-                "monoToken": monoToken,
-                "expiresAt": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: exp)),
-                "savedAt": ISO8601DateFormatter().string(from: Date()),
-                "shard": shard
-            ]
-            if let userId = payload["evernote_user_id"] { newAuth["userId"] = userId }
-            if let clientId = payload["client_id"] { newAuth["clientId"] = clientId }
-
-            if let jsonData = try? JSONSerialization.data(withJSONObject: newAuth, options: .prettyPrinted) {
-                try? jsonData.write(to: URL(fileURLWithPath: Self.authPath))
-                NSLog("Token auto-refreshed, expires: %@", newAuth["expiresAt"] as? String ?? "?")
-            }
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + 10)
-    }
-
-    func loadOrCreateNote() async {
-        // Load tabs from local JSON
         loadTabsLocal()
 
         if tabs.isEmpty {
-            // Migrate from old single-file format
             let tab = NoteTab(title: "Untitled")
             if let localHTML = loadLocal(), !localHTML.isEmpty {
                 tab.html = localHTML
@@ -248,7 +152,6 @@ class EditorViewModel: ObservableObject {
             saveTabsLocal()
         }
 
-        // Activate first tab
         let firstTab = tabs[0]
         activeTabId = firstTab.id
         currentHTML = firstTab.html
@@ -258,53 +161,8 @@ class EditorViewModel: ObservableObject {
             attributedText = NSMutableAttributedString(attributedString: attrStr)
             charCount = attributedText.length
             onContentLoaded?(attributedText)
-            status = "Loaded (local)"
         }
-
-        // Try to sync active tab with Evernote
-        guard let api else {
-            if currentHTML.isEmpty { status = "Ready" }
-            return
-        }
-
-        status = "Syncing..."
-        do {
-            // Find or create an Evernote note for this tab
-            if firstTab.noteGuid == nil {
-                let result = try await api.listNotes(notebookGuid: BUCKET_GUID, maxNotes: 100)
-                if let existing = result.notes.first(where: { $0.title == firstTab.title }) {
-                    firstTab.noteGuid = existing.guid
-                } else {
-                    let guid = try await api.createNote(title: firstTab.title, body: "<p></p>", notebookGuid: BUCKET_GUID)
-                    firstTab.noteGuid = guid
-                }
-                noteGuid = firstTab.noteGuid
-                saveTabsLocal()
-            } else {
-                noteGuid = firstTab.noteGuid
-            }
-
-            // If tab has content, push to Evernote; otherwise pull from Evernote
-            if !currentHTML.isEmpty {
-                await save(html: currentHTML)
-            } else if let guid = firstTab.noteGuid {
-                let note = try await api.getNote(guid: guid)
-                let remoteHTML = enmlToHTML(note.content)
-                firstTab.html = remoteHTML
-                firstTab.lastSavedHTML = remoteHTML
-                currentHTML = remoteHTML
-                lastSavedHTML = remoteHTML
-                if let attrStr = htmlToAttributedString(remoteHTML) {
-                    attributedText = NSMutableAttributedString(attributedString: attrStr)
-                    charCount = attributedText.length
-                    onContentLoaded?(attributedText)
-                }
-                saveTabsLocal()
-            }
-            status = "Loaded"
-        } catch {
-            status = currentHTML.isEmpty ? "Error: \(error.localizedDescription)" : "Loaded (local)"
-        }
+        status = currentHTML.isEmpty ? "Ready" : "Loaded"
     }
 
     private func loadTabsLocal() {
@@ -341,7 +199,6 @@ class EditorViewModel: ObservableObject {
         saveTabsLocal()
 
         activeTabId = id
-        noteGuid = newTab.noteGuid
         currentHTML = newTab.html
         lastSavedHTML = newTab.lastSavedHTML
 
@@ -370,41 +227,16 @@ class EditorViewModel: ObservableObject {
         let tab = NoteTab(title: "Untitled")
         tabs.append(tab)
         activeTabId = tab.id
-        noteGuid = nil
         currentHTML = ""
         lastSavedHTML = ""
         charCount = 0
         onContentLoaded?(NSAttributedString(string: ""))
         saveTabsLocal()
         status = "New note"
-
-        // Create note on Evernote
-        if let api {
-            Task {
-                do {
-                    let guid = try await api.createNote(title: tab.title, body: "<p></p>", notebookGuid: BUCKET_GUID)
-                    tab.noteGuid = guid
-                    noteGuid = guid
-                    saveTabsLocal()
-                    status = "Created"
-                } catch {
-                    NSLog("Failed to create Evernote note: %@", "\(error)")
-                    status = "Local only"
-                }
-            }
-        }
     }
 
     func deleteTab(_ id: UUID) {
         guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        let tab = tabs[index]
-
-        // Delete from Evernote
-        if let guid = tab.noteGuid, let api {
-            Task {
-                _ = try? await api.deleteNote(guid: guid)
-            }
-        }
 
         // Switch away if deleting the active tab
         if activeTabId == id {
@@ -423,14 +255,6 @@ class EditorViewModel: ObservableObject {
         tab.title = title
         editingTabId = nil
         saveTabsLocal()
-
-        // Sync title to Evernote
-        if let guid = tab.noteGuid, let api {
-            Task {
-                let enml = htmlToEnml(tab.html.isEmpty ? "<p></p>" : tab.html)
-                _ = try? await api.updateNote(guid: guid, title: title, content: enml)
-            }
-        }
     }
 
     func moveTab(from sourceId: UUID, to destId: UUID) {
@@ -448,18 +272,9 @@ class EditorViewModel: ObservableObject {
         charCount = length
         currentHTML = html
         activeTab?.html = html
-        // Always save locally immediately
         saveLocal(html: html)
         saveTabsLocal()
-        guard html != lastSavedHTML else { return }
-        status = "Editing..."
-        // Debounce Evernote sync
-        saveTask?.cancel()
-        saveTask = Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard !Task.isCancelled else { return }
-            await save(html: html)
-        }
+        status = "Saved"
     }
 
     func performFormat(_ action: FormatAction) {
@@ -484,102 +299,18 @@ class EditorViewModel: ObservableObject {
         }
     }
 
-    func saveNow() async {
-        saveTask?.cancel()
-        saveLocal(html: currentHTML)
-        await save(html: currentHTML)
-    }
-
-    // Save to local file (fast, always works)
     private func saveLocal(html: String) {
         try? html.write(toFile: LOCAL_SAVE_PATH, atomically: true, encoding: .utf8)
     }
 
-    // Synchronous version for app exit
     func saveLocalSync() {
         activeTab?.html = currentHTML
         try? currentHTML.write(toFile: LOCAL_SAVE_PATH, atomically: true, encoding: .utf8)
         saveTabsLocal()
     }
 
-    // Load from local file
     private func loadLocal() -> String? {
         try? String(contentsOfFile: LOCAL_SAVE_PATH, encoding: .utf8)
-    }
-
-    // Sync current content to Evernote (used on exit)
-    func syncToEvernote() async {
-        guard currentHTML != lastSavedHTML else { return }
-        await save(html: currentHTML)
-    }
-
-    func save(html: String) async {
-        guard let api, let guid = noteGuid else {
-            saveLocal(html: html)
-            status = "Saved (local only)"
-            return
-        }
-        guard html != lastSavedHTML else { status = "Saved"; return }
-
-        isSaving = true
-        status = "Syncing..."
-
-        let enml = htmlToEnml(html)
-        do {
-            _ = try await api.updateNote(guid: guid, title: activeTab?.title ?? NOTE_TITLE, content: enml)
-            lastSavedHTML = html
-            status = "Saved"
-        } catch {
-            saveLocal(html: html)
-            let errMsg = "\(error)"
-            NSLog("Sync error: %@", errMsg)
-            if errMsg.contains("RTE room") || errMsg.contains("already been open") {
-                status = "Close note in Evernote first"
-            } else {
-                status = "Sync failed: \(error.localizedDescription)"
-            }
-        }
-        isSaving = false
-    }
-
-    private func enmlToHTML(_ enml: String) -> String {
-        var text = enml
-        text = text.replacingOccurrences(of: #"<\?xml[^?]*\?>"#, with: "", options: .regularExpression)
-        text = text.replacingOccurrences(of: #"<!DOCTYPE[^>]*>"#, with: "", options: .regularExpression)
-        text = text.replacingOccurrences(of: "<en-note>", with: "")
-        text = text.replacingOccurrences(of: "</en-note>", with: "")
-        text = text.replacingOccurrences(of: #"<en-note[^>]*>"#, with: "", options: .regularExpression)
-        // Convert en-todo tags to checkbox characters
-        text = text.replacingOccurrences(of: #"<en-todo\b[^>]*checked="true"[^>]*/?>"#, with: "☑ ", options: .regularExpression)
-        text = text.replacingOccurrences(of: #"<en-todo\b[^>]*/?>"#, with: "☐ ", options: .regularExpression)
-        text = text.replacingOccurrences(of: "</en-todo>", with: "")
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func htmlToEnml(_ html: String) -> String {
-        var clean = html
-        // Extract body content only (NSTextView exports full HTML documents)
-        if let bodyStart = clean.range(of: #"<body[^>]*>"#, options: .regularExpression),
-           let bodyEnd = clean.range(of: "</body>", options: .caseInsensitive) {
-            clean = String(clean[bodyStart.upperBound..<bodyEnd.lowerBound])
-        }
-        // Convert checkbox characters to en-todo tags
-        clean = clean.replacingOccurrences(of: "☑", with: "<en-todo checked=\"true\"/>")
-        clean = clean.replacingOccurrences(of: "☐", with: "<en-todo/>")
-        // Clean ENML-incompatible attributes (keep spans/fonts/styles for formatting)
-        clean = clean.replacingOccurrences(of: #" class=\"[^\"]*\""#, with: "", options: .regularExpression)
-        clean = clean.replacingOccurrences(of: #" dir=\"[^\"]*\""#, with: "", options: .regularExpression)
-        // Remove webkit-specific and unsupported CSS properties from style attrs
-        clean = clean.replacingOccurrences(of: #"-webkit-[^;\"]*;?\s*"#, with: "", options: .regularExpression)
-        clean = clean.replacingOccurrences(of: #"font-variant-ligatures:[^;\"]*;?\s*"#, with: "", options: .regularExpression)
-        clean = clean.replacingOccurrences(of: #"font-kerning:[^;\"]*;?\s*"#, with: "", options: .regularExpression)
-        // Remove empty style attributes left after cleanup
-        clean = clean.replacingOccurrences(of: #" style=\"\s*\""#, with: "", options: .regularExpression)
-        // Self-close void elements for XHTML/ENML compliance
-        clean = clean.replacingOccurrences(of: #"<br\s*>"#, with: "<br/>", options: .regularExpression)
-        clean = clean.replacingOccurrences(of: #"<hr\s*>"#, with: "<hr/>", options: .regularExpression)
-        clean = clean.replacingOccurrences(of: #"<img([^>]*[^/])>"#, with: "<img$1/>", options: .regularExpression)
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE en-note SYSTEM \"http://xml.evernote.com/pub/enml2.dtd\"><en-note>\(clean)</en-note>"
     }
 
     func htmlToAttributedString(_ html: String) -> NSAttributedString? {
@@ -617,6 +348,8 @@ class EditorViewModel: ObservableObject {
                 ps.headIndent = 12
                 ps.firstLineHeadIndent = 12
                 ps.tailIndent = -12
+                ps.paragraphSpacingBefore = 6
+                ps.paragraphSpacing = 6
                 mutable.addAttribute(.paragraphStyle, value: ps, range: paraRange)
                 mutable.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.78, alpha: 1.0), range: paraRange)
             }
@@ -897,13 +630,6 @@ struct StatusBar: View {
                 .buttonStyle(.plain)
                 .help("Delete this notepad")
             }
-            Button(action: { Task { await vm.saveNow() } }) {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Sync to Evernote now")
             Text("\(vm.charCount) chars")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)
@@ -1201,10 +927,61 @@ class BlockCaretTextView: NSTextView {
         return v
     }()
 
+    // MARK: - Drag-to-reorder state
+    private var isDraggingLine = false
+    private var dragStartLineIndex: Int = 0  // character index of dragged line start
+    private var dragInsertIndex: Int = -1     // character index where line will be inserted
+    private var dragDidMove = false
+    private var dragNestIndent: String = ""   // indentation to apply on drop
+    private let dragInsertionLine: NSView = {
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.9).cgColor
+        v.layer?.cornerRadius = 1
+        v.isHidden = true
+        return v
+    }()
+    private let dragSourceDim: NSView = {
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor
+        v.isHidden = true
+        return v
+    }()
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         addSubview(caretView)
+        addSubview(dragSourceDim)
+        addSubview(dragInsertionLine)
         DispatchQueue.main.async { self.updateCaretPosition() }
+
+        // Track mouse movement for cursor changes over list prefixes
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(trackingArea)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard let lm = layoutManager, let tc = textContainer, let ts = textStorage else {
+            super.mouseMoved(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        let adjusted = NSPoint(x: point.x - textContainerInset.width, y: point.y - textContainerInset.height)
+        var fraction: CGFloat = 0
+        let charIndex = lm.characterIndex(for: adjusted, in: tc, fractionOfDistanceBetweenInsertionPoints: &fraction)
+        if charIndex < ts.length {
+            let (lineRange, prefixLen) = listPrefixLen(at: charIndex)
+            if prefixLen > 0 && charIndex < lineRange.location + prefixLen {
+                NSCursor.pointingHand.set()
+                return
+            }
+        }
+        NSCursor.iBeam.set()
     }
 
     override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
@@ -1277,14 +1054,71 @@ class BlockCaretTextView: NSTextView {
 
         // Only handle when no selection (just caret)
         if sel.length == 0 && pos > 0 {
-            let (lineRange, prefixLen) = listPrefixLen(at: pos)
+            let str = storage.string as NSString
+            let lineRange = str.lineRange(for: NSRange(location: min(pos, max(0, str.length - 1)), length: 0))
+            let lineStr = str.substring(with: lineRange)
+
+            // Divider line: delete the entire divider (including surrounding newlines)
+            let trimmedLine = lineStr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedLine.isEmpty && trimmedLine.allSatisfy({ $0 == "─" }) {
+                recordUndoSnapshot()
+                // Include the newline before the divider if present
+                var deleteStart = lineRange.location
+                if deleteStart > 0 && str.substring(with: NSRange(location: deleteStart - 1, length: 1)) == "\n" {
+                    deleteStart -= 1
+                }
+                let deleteRange = NSRange(location: deleteStart, length: NSMaxRange(lineRange) - deleteStart)
+                storage.deleteCharacters(in: deleteRange)
+                setSelectedRange(NSRange(location: min(deleteStart, storage.length), length: 0))
+                didChangeText()
+                return
+            }
+
+            let isEmptyLine = trimmedLine.isEmpty
+
+            // Backspace near code block: scan backwards through empty lines/newlines to find code block
+            if isEmptyLine {
+                var scanPos = pos - 1
+                // Walk backwards over newlines and empty content
+                while scanPos >= 0 {
+                    let ch = str.substring(with: NSRange(location: scanPos, length: 1))
+                    if ch == "\n" || ch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        // Check if this position has codeBlock attribute
+                        if storage.attribute(.codeBlock, at: scanPos, effectiveRange: nil) != nil {
+                            // Found the code block — delete from end of code content to current cursor line end
+                            recordUndoSnapshot()
+                            // Find last non-newline in the code block
+                            var codeEnd = scanPos
+                            while codeEnd >= 0 && str.substring(with: NSRange(location: codeEnd, length: 1)) == "\n" {
+                                codeEnd -= 1
+                            }
+                            codeEnd += 1 // position after last content char
+                            let deleteStart = codeEnd
+                            let deleteEnd = NSMaxRange(lineRange)
+                            if deleteEnd > deleteStart {
+                                storage.deleteCharacters(in: NSRange(location: deleteStart, length: deleteEnd - deleteStart))
+                            }
+                            let newPos = min(deleteStart, storage.length)
+                            setSelectedRange(NSRange(location: newPos, length: 0))
+                            didChangeText()
+                            return
+                        }
+                        scanPos -= 1
+                    } else {
+                        // Hit non-empty, non-code content — not adjacent to code block
+                        break
+                    }
+                }
+            }
+
+            let (pfxLineRange, prefixLen) = listPrefixLen(at: pos)
             if prefixLen > 0 {
-                let afterPrefix = lineRange.location + prefixLen
+                let afterPrefix = pfxLineRange.location + prefixLen
                 // Caret is at or inside the prefix — remove entire prefix
-                if pos <= afterPrefix && pos > lineRange.location {
+                if pos <= afterPrefix && pos > pfxLineRange.location {
                     recordUndoSnapshot()
-                    storage.deleteCharacters(in: NSRange(location: lineRange.location, length: prefixLen))
-                    setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                    storage.deleteCharacters(in: NSRange(location: pfxLineRange.location, length: prefixLen))
+                    setSelectedRange(NSRange(location: pfxLineRange.location, length: 0))
                     didChangeText()
                     return
                 }
@@ -1395,9 +1229,10 @@ class BlockCaretTextView: NSTextView {
 
         storage.replaceCharacters(in: combinedRange, with: swapped)
 
-        // Place caret at same relative position in the moved line
-        let offset = sel.location - lineRange.location
-        setSelectedRange(NSRange(location: prevLineRange.location + offset, length: sel.length))
+        // Place caret after prefix of the moved line
+        let newLineStart = prevLineRange.location
+        let (_, movedPrefixLen) = listPrefixLen(at: newLineStart)
+        setSelectedRange(NSRange(location: newLineStart + movedPrefixLen, length: 0))
         didChangeText()
     }
 
@@ -1437,15 +1272,14 @@ class BlockCaretTextView: NSTextView {
 
         storage.replaceCharacters(in: combinedRange, with: swapped)
 
-        // Place caret at same relative position in the moved line
-        let offset = sel.location - lineRange.location
+        // Place caret after prefix of the moved line
         let newLineStart = lineRange.location + nextLineRange.length
-        setSelectedRange(NSRange(location: newLineStart + offset, length: sel.length))
+        let (_, movedPrefixLen) = listPrefixLen(at: newLineStart)
+        setSelectedRange(NSRange(location: newLineStart + movedPrefixLen, length: 0))
         didChangeText()
     }
 
     override func mouseDown(with event: NSEvent) {
-        // Check for checkbox click
         let point = convert(event.locationInWindow, from: nil)
         let adjustedPoint = NSPoint(
             x: point.x - textContainerInset.width,
@@ -1455,9 +1289,31 @@ class BlockCaretTextView: NSTextView {
             var fraction: CGFloat = 0
             let charIndex = lm.characterIndex(for: adjustedPoint, in: tc, fractionOfDistanceBetweenInsertionPoints: &fraction)
             if charIndex < ts.length {
-                let char = (ts.string as NSString).substring(with: NSRange(location: charIndex, length: 1))
-                if char == "☐" || char == "☑" {
-                    toggleCheckbox(at: charIndex)
+                let (lineRange, prefixLen) = listPrefixLen(at: charIndex)
+                if prefixLen > 0 && charIndex < lineRange.location + prefixLen {
+                    // Clicked on a list prefix — prepare for possible drag
+                    isDraggingLine = true
+                    dragDidMove = false
+                    dragStartLineIndex = lineRange.location
+                    dragInsertIndex = -1
+
+                    // Place caret at end of line (not beginning) to avoid visible jump
+                    let str = ts.string as NSString
+                    var lineEnd = lineRange.location + lineRange.length
+                    if lineEnd > 0 && str.substring(with: NSRange(location: lineEnd - 1, length: 1)) == "\n" {
+                        lineEnd -= 1
+                    }
+                    setSelectedRange(NSRange(location: lineEnd, length: 0))
+
+                    // Dim the source line
+                    let glyphRange = lm.glyphRange(forCharacterRange: lineRange, actualCharacterRange: nil)
+                    let lineRect = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
+                    dragSourceDim.frame = NSRect(
+                        x: textContainerInset.width,
+                        y: lineRect.origin.y + textContainerInset.height,
+                        width: bounds.width - textContainerInset.width * 2,
+                        height: lineRect.height
+                    )
                     updateCaretPosition()
                     return
                 }
@@ -1467,26 +1323,204 @@ class BlockCaretTextView: NSTextView {
         updateCaretPosition()
     }
 
+    /// Returns the Y position of the top edge of the line at character index, and its height.
+    private func lineGeometry(at charIndex: Int) -> (y: CGFloat, height: CGFloat)? {
+        guard let lm = layoutManager, let tc = textContainer, let ts = textStorage else { return nil }
+        let str = ts.string as NSString
+        let lineRange = str.lineRange(for: NSRange(location: min(charIndex, max(0, str.length - 1)), length: 0))
+        let glyphRange = lm.glyphRange(forCharacterRange: lineRange, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
+        return (rect.origin.y + textContainerInset.height, rect.height)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDraggingLine, let storage = textStorage, let lm = layoutManager, let tc = textContainer else {
+            super.mouseDragged(with: event)
+            return
+        }
+
+        dragDidMove = true
+        dragSourceDim.isHidden = false
+        NSCursor.closedHand.set()
+
+        let point = convert(event.locationInWindow, from: nil)
+        let adjustedPoint = NSPoint(
+            x: point.x - textContainerInset.width,
+            y: point.y - textContainerInset.height
+        )
+
+        let str = storage.string as NSString
+        var fraction: CGFloat = 0
+        let charIndex = lm.characterIndex(for: adjustedPoint, in: tc, fractionOfDistanceBetweenInsertionPoints: &fraction)
+        let hoverLineRange = str.lineRange(for: NSRange(location: min(charIndex, max(0, str.length - 1)), length: 0))
+        let sourceLineRange = str.lineRange(for: NSRange(location: min(dragStartLineIndex, max(0, str.length - 1)), length: 0))
+
+        // Determine nesting level from mouse X position
+        // Find the base indent of the neighbor line at drop target
+        let hoverStr = str.substring(with: hoverLineRange)
+        let neighborIndent = String(hoverStr.prefix(while: { $0 == " " }))
+        let indentUnit: CGFloat = 28  // approximate width of 4 spaces in body font
+        let baseX = textContainerInset.width + CGFloat(neighborIndent.count) * 7  // ~7pt per space
+
+        // Mouse further right → nest deeper (one level = 4 spaces)
+        let extraLevels = max(0, Int((point.x - baseX - 20) / indentUnit))
+        let clampedLevels = min(extraLevels, 2)  // max 2 extra nesting levels
+        let nestSpaces = String(repeating: " ", count: clampedLevels * 4)
+        dragNestIndent = neighborIndent + nestSpaces
+
+        // Determine if mouse is in top or bottom half of hovered line → insert above or below
+        if let geo = lineGeometry(at: hoverLineRange.location) {
+            let midY = geo.y + geo.height / 2
+            let insertAbove = point.y < midY
+
+            let insertCharIndex: Int
+            if insertAbove {
+                insertCharIndex = hoverLineRange.location
+            } else {
+                insertCharIndex = NSMaxRange(hoverLineRange)
+            }
+
+            let isOnSource = (insertCharIndex == sourceLineRange.location || insertCharIndex == NSMaxRange(sourceLineRange))
+            dragInsertIndex = isOnSource ? -1 : insertCharIndex
+
+            if isOnSource {
+                dragInsertionLine.isHidden = true
+            } else {
+                let lineY: CGFloat = insertAbove ? geo.y - 1 : geo.y + geo.height - 1
+                let indentOffset = CGFloat(dragNestIndent.count) * 7
+                dragInsertionLine.frame = NSRect(
+                    x: textContainerInset.width + 4 + indentOffset,
+                    y: lineY,
+                    width: bounds.width - textContainerInset.width * 2 - 8 - indentOffset,
+                    height: 2
+                )
+                dragInsertionLine.isHidden = false
+            }
+        }
+    }
+
     override func mouseUp(with event: NSEvent) {
+        if isDraggingLine {
+            isDraggingLine = false
+            dragInsertionLine.isHidden = true
+            dragSourceDim.isHidden = true
+            NSCursor.arrow.set()
+
+            guard let storage = textStorage else { return }
+            let str = storage.string as NSString
+
+            if !dragDidMove {
+                // Didn't drag — treat as checkbox toggle
+                let sourceLineRange = str.lineRange(for: NSRange(location: min(dragStartLineIndex, max(0, str.length - 1)), length: 0))
+                let lineStr = str.substring(with: sourceLineRange)
+                let leadingSpaces = lineStr.prefix(while: { $0 == " " }).count
+                let afterIndent = String(lineStr.dropFirst(leadingSpaces))
+                if afterIndent.hasPrefix("☐") || afterIndent.hasPrefix("☑") {
+                    toggleCheckbox(at: sourceLineRange.location + leadingSpaces)
+                }
+                updateCaretPosition()
+                return
+            }
+
+            guard dragInsertIndex >= 0 else {
+                updateCaretPosition()
+                return
+            }
+
+            let sourceLineRange = str.lineRange(for: NSRange(location: min(dragStartLineIndex, max(0, str.length - 1)), length: 0))
+
+            // Snapshot full state for proper undo/redo
+            let oldText = NSAttributedString(attributedString: storage)
+            let oldSel = selectedRange()
+
+            let sourceLine = storage.attributedSubstring(from: sourceLineRange)
+            let sourceStr = sourceLine.string
+
+            // Use the indentation determined during drag (based on mouse X position)
+            let targetIndent = dragNestIndent
+
+            // Calculate insert position relative to after source removal
+            var insertPos = dragInsertIndex
+            if insertPos > sourceLineRange.location {
+                insertPos -= sourceLineRange.length
+            }
+
+            // Remove source line
+            storage.deleteCharacters(in: sourceLineRange)
+
+            let newStr = storage.string as NSString
+            insertPos = min(insertPos, newStr.length)
+
+            // Re-indent the source line to match target context
+            let sourceContent: String
+            let sourceLeading = String(sourceStr.prefix(while: { $0 == " " }))
+            let strippedSource = String(sourceStr.dropFirst(sourceLeading.count))
+            // Only re-indent if source has a list prefix
+            let hasPrefix = strippedSource.hasPrefix("• ") || strippedSource.hasPrefix("☐ ") || strippedSource.hasPrefix("☑ ")
+            if hasPrefix {
+                sourceContent = targetIndent + strippedSource
+            } else {
+                sourceContent = sourceStr
+            }
+
+            // Build the attributed line to insert
+            let mutable = NSMutableAttributedString(attributedString: sourceLine)
+            // Replace the text but keep attributes from the original
+            let attrRange = NSRange(location: 0, length: mutable.length)
+            let contentNoNewline = sourceContent.hasSuffix("\n") ? String(sourceContent.dropLast()) : sourceContent
+            mutable.replaceCharacters(in: attrRange, with: contentNoNewline)
+
+            // Insert
+            if insertPos >= newStr.length {
+                // At end — prepend newline
+                let final = NSMutableAttributedString(string: "\n")
+                final.append(mutable)
+                storage.insert(final, at: min(insertPos, storage.length))
+            } else {
+                mutable.append(NSAttributedString(string: "\n"))
+                storage.insert(mutable, at: insertPos)
+            }
+
+            // Place caret after the prefix (smart home position)
+            let finalPos = min(insertPos, storage.length)
+            let (_, droppedPrefixLen) = listPrefixLen(at: min(finalPos, max(0, storage.length - 1)))
+            let caretPos = min(finalPos + droppedPrefixLen, storage.length)
+            setSelectedRange(NSRange(location: caretPos, length: 0))
+
+            // Register undo — uses same recursive pattern as recordUndoSnapshot
+            // so undo/redo chains indefinitely
+            registerUndoWithState(oldText, selection: oldSel)
+
+            didChangeText()
+            updateCaretPosition()
+            return
+        }
         super.mouseUp(with: event)
         updateCaretPosition()
     }
 
+    /// Captures current state for undo. Call BEFORE making changes.
     func recordUndoSnapshot() {
-        guard let storage = textStorage, let um = undoManager else { return }
-        let snapshot = NSAttributedString(attributedString: storage)
-        let sel = selectedRange()
+        guard let storage = textStorage else { return }
+        registerUndoWithState(NSAttributedString(attributedString: storage), selection: selectedRange())
+    }
+
+    /// Registers an undo action that restores the given state. Chains indefinitely.
+    private func registerUndoWithState(_ snapshot: NSAttributedString, selection: NSRange) {
+        guard let um = undoManager else { return }
         um.registerUndo(withTarget: self) { tv in
-            tv.recordUndoSnapshot()
-            tv.textStorage?.setAttributedString(snapshot)
-            tv.setSelectedRange(sel)
+            // Capture current state before restoring — this becomes the redo action
+            guard let s = tv.textStorage else { return }
+            tv.registerUndoWithState(NSAttributedString(attributedString: s), selection: tv.selectedRange())
+            // Restore the snapshot
+            s.setAttributedString(snapshot)
+            tv.setSelectedRange(selection)
             tv.didChangeText()
         }
     }
 
     func toggleCheckbox(at charIndex: Int) {
         guard let storage = textStorage else { return }
-        recordUndoSnapshot()
         let str = storage.string as NSString
         let char = str.substring(with: NSRange(location: charIndex, length: 1))
         let lineRange = str.lineRange(for: NSRange(location: charIndex, length: 0))
@@ -1498,6 +1532,12 @@ class BlockCaretTextView: NSTextView {
             lineEnd -= 1
         }
         let contentRange = NSRange(location: contentStart, length: max(0, lineEnd - contentStart))
+
+        // Don't toggle empty checkboxes (prefix only, no content)
+        let content = contentRange.length > 0 ? str.substring(with: contentRange).trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        guard !content.isEmpty else { return }
+
+        recordUndoSnapshot()
 
         if char == "☐" {
             storage.replaceCharacters(in: NSRange(location: charIndex, length: 1), with: "☑")
@@ -1512,6 +1552,9 @@ class BlockCaretTextView: NSTextView {
                 storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: contentRange)
             }
         }
+
+        // Place caret at end of line content
+        setSelectedRange(NSRange(location: lineEnd, length: 0))
         didChangeText()
     }
 
@@ -1657,19 +1700,29 @@ struct RichTextEditor: NSViewRepresentable {
                     let ltr = NSMutableParagraphStyle()
                     ltr.baseWritingDirection = .leftToRight
                     ltr.alignment = .left
-                    fixed.addAttribute(.paragraphStyle, value: ltr, range: fullRange)
+                    // Apply LTR paragraph style only to non-code-block lines
+                    fixed.enumerateAttribute(.codeBlock, in: fullRange, options: []) { val, range, _ in
+                        if val == nil {
+                            fixed.addAttribute(.paragraphStyle, value: ltr, range: range)
+                        }
+                    }
+                    // Apply text color to all (code blocks get their own color in post-processing)
                     fixed.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: fullRange)
                 }
                 textView.textStorage?.setAttributedString(fixed)
-                // Apply checklist styling to checked items
+                // Apply checklist styling and hanging indent to all lines
                 if let storage = textView.textStorage {
                     let str = storage.string as NSString
                     var pos = 0
                     while pos < str.length {
                         let lr = str.lineRange(for: NSRange(location: pos, length: 0))
                         let ls = str.substring(with: lr)
-                        if ls.hasPrefix("☑ ") {
-                            let cStart = lr.location + 2
+                        // Handle indented checkboxes too
+                        let leading = ls.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
+                        let afterIndent = String(ls.dropFirst(leading.count))
+                        if afterIndent.hasPrefix("☑") {
+                            let checkPos = lr.location + leading.count
+                            let cStart = checkPos + 2
                             var lEnd = lr.location + lr.length
                             if lEnd > cStart && str.substring(with: NSRange(location: lEnd - 1, length: 1)) == "\n" {
                                 lEnd -= 1
@@ -1685,6 +1738,8 @@ struct RichTextEditor: NSViewRepresentable {
                         pos = next
                     }
                 }
+                // Apply hanging indent to all list lines
+                context.coordinator.applyListIndentToAllLines(textView: textView)
                 // Move cursor to start
                 textView.setSelectedRange(NSRange(location: 0, length: 0))
                 textView.updateCaretPosition()
@@ -1741,7 +1796,7 @@ struct RichTextEditor: NSViewRepresentable {
                 isProcessingMarkdown = false
             }
 
-            applyListIndent(textView: textView)
+            applyListIndentForCurrentLine(textView: textView)
 
             let html = extractHTML(from: textView)
             Task { @MainActor in
@@ -1749,51 +1804,55 @@ struct RichTextEditor: NSViewRepresentable {
             }
         }
 
-        /// Apply hanging indent to all list lines so wrapped text aligns after the prefix.
-        private func applyListIndent(textView: NSTextView) {
+        /// Apply hanging indent to the current line only (where cursor is).
+        private func applyListIndentForCurrentLine(textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
             let str = storage.string as NSString
+            guard str.length > 0 else { return }
+
+            let cursor = textView.selectedRange().location
+            let lineRange = str.lineRange(for: NSRange(location: min(cursor, max(0, str.length - 1)), length: 0))
+            applyListIndentToRange(storage: storage, lineRange: lineRange)
+        }
+
+        /// Apply hanging indent to a specific line range.
+        private func applyListIndentToRange(storage: NSTextStorage, lineRange: NSRange) {
+            let str = storage.string as NSString
+            let lineStr = str.substring(with: lineRange)
+
+            // Count leading whitespace (regular spaces and non-breaking spaces)
+            let leadingWS = lineStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
+            let afterIndent = String(lineStr.dropFirst(leadingWS.count))
+
+            var prefixStr: String? = nil
+            for pfx in ["• ", "☐ ", "☑ "] {
+                if afterIndent.hasPrefix(pfx) {
+                    prefixStr = String(leadingWS) + pfx
+                    break
+                }
+            }
+
+            if let prefix = prefixStr {
+                let prefixWidth = (prefix as NSString).size(withAttributes: [.font: bodyFont]).width
+                let ps = NSMutableParagraphStyle()
+                ps.baseWritingDirection = .leftToRight
+                ps.alignment = .left
+                ps.headIndent = prefixWidth
+                storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
+            }
+        }
+
+        /// Apply hanging indent to ALL list lines (used on initial content load).
+        func applyListIndentToAllLines(textView: NSTextView) {
+            guard let storage = textView.textStorage else { return }
+            let str = storage.string as NSString
+            guard str.length > 0 else { return }
 
             storage.beginEditing()
             var pos = 0
             while pos < str.length {
                 let lineRange = str.lineRange(for: NSRange(location: pos, length: 0))
-                let lineStr = str.substring(with: lineRange)
-
-                let leadingSpaces = lineStr.prefix(while: { $0 == " " })
-                let afterIndent = String(lineStr.dropFirst(leadingSpaces.count))
-
-                var prefixStr: String? = nil
-                for pfx in ["• ", "☐ ", "☑ "] {
-                    if afterIndent.hasPrefix(pfx) {
-                        prefixStr = String(leadingSpaces) + pfx
-                        break
-                    }
-                }
-
-                if let prefix = prefixStr {
-                    // Measure the prefix width in the body font
-                    let prefixWidth = (prefix as NSString).size(withAttributes: [.font: bodyFont]).width
-                    let ps = NSMutableParagraphStyle()
-                    ps.baseWritingDirection = .leftToRight
-                    ps.alignment = .left
-                    ps.headIndent = prefixWidth
-                    storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
-                } else if !lineStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    // Non-list line: check if it has a stale headIndent and reset it
-                    if let existingPS = storage.attribute(.paragraphStyle, at: lineRange.location, effectiveRange: nil) as? NSParagraphStyle,
-                       existingPS.headIndent > 0 {
-                        // Check it's not a code block
-                        let isCode = storage.attribute(.codeBlock, at: lineRange.location, effectiveRange: nil) != nil
-                        if !isCode {
-                            let ps = NSMutableParagraphStyle()
-                            ps.baseWritingDirection = .leftToRight
-                            ps.alignment = .left
-                            storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
-                        }
-                    }
-                }
-
+                applyListIndentToRange(storage: storage, lineRange: lineRange)
                 pos = NSMaxRange(lineRange)
             }
             storage.endEditing()
@@ -1803,6 +1862,12 @@ struct RichTextEditor: NSViewRepresentable {
             guard let storage = textView.textStorage else { return }
             let cursor = textView.selectedRange().location
             guard cursor > 0 else { return }
+
+            // Don't process markdown inside code blocks
+            let checkPos = min(cursor - 1, storage.length - 1)
+            if checkPos >= 0, storage.attribute(.codeBlock, at: checkPos, effectiveRange: nil) != nil {
+                return
+            }
 
             let str = storage.string as NSString
             let lineRange = str.lineRange(for: NSRange(location: cursor - 1, length: 0))
@@ -1857,6 +1922,7 @@ struct RichTextEditor: NSViewRepresentable {
         }
 
         private var slashPosition: Int = 0
+        private var fromSlashMenu = false
 
         private func showSlashMenu(textView: NSTextView, at slashPos: Int) {
             slashPosition = slashPos
@@ -1907,14 +1973,18 @@ struct RichTextEditor: NSViewRepresentable {
         }
 
         private func recordUndo(for textView: NSTextView) {
-            guard let storage = textView.textStorage, let um = textView.undoManager else { return }
-            let snapshot = NSAttributedString(attributedString: storage)
-            let sel = textView.selectedRange()
-            um.registerUndo(withTarget: textView) { [weak self] tv in
-                self?.recordUndo(for: tv)
-                tv.textStorage?.setAttributedString(snapshot)
-                tv.setSelectedRange(sel)
-                tv.didChangeText()
+            if let blockTV = textView as? BlockCaretTextView {
+                blockTV.recordUndoSnapshot()
+            } else {
+                guard let storage = textView.textStorage, let um = textView.undoManager else { return }
+                let snapshot = NSAttributedString(attributedString: storage)
+                let sel = textView.selectedRange()
+                um.registerUndo(withTarget: textView) { [weak self] tv in
+                    self?.recordUndo(for: tv)
+                    tv.textStorage?.setAttributedString(snapshot)
+                    tv.setSelectedRange(sel)
+                    tv.didChangeText()
+                }
             }
         }
 
@@ -1933,6 +2003,7 @@ struct RichTextEditor: NSViewRepresentable {
                 }
             }
 
+            fromSlashMenu = true
             switch sender.tag {
             case 1: applyFormat(.heading1, textView: textView)
             case 2: applyFormat(.heading2, textView: textView)
@@ -1943,6 +2014,7 @@ struct RichTextEditor: NSViewRepresentable {
             case 7: applyFormat(.divider, textView: textView)
             default: break
             }
+            fromSlashMenu = false
             textView.didChangeText()
         }
 
@@ -2044,6 +2116,8 @@ struct RichTextEditor: NSViewRepresentable {
                     ps.headIndent = 12
                     ps.firstLineHeadIndent = 12
                     ps.tailIndent = -12
+                    ps.paragraphSpacingBefore = 6
+                    ps.paragraphSpacing = 6
                     storage.addAttribute(.paragraphStyle, value: ps, range: paraRange)
                     storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.78, alpha: 1.0), range: paraRange)
 
@@ -2133,7 +2207,8 @@ struct RichTextEditor: NSViewRepresentable {
             let str = storage.string as NSString
 
             // Caret at beginning of a list line → insert new line with prefix above, push current line down
-            if range.length == 0 && str.length > 0 && range.location < str.length {
+            // (skip when invoked from slash menu — user wants prefix on current line)
+            if !fromSlashMenu && range.length == 0 && str.length > 0 && range.location < str.length {
                 let lineRange = str.lineRange(for: NSRange(location: range.location, length: 0))
                 let lineStr = str.substring(with: lineRange)
                 let isAtLineStart = range.location == lineRange.location
@@ -2147,15 +2222,15 @@ struct RichTextEditor: NSViewRepresentable {
                 }
             }
 
-            // Handle cursor at end of text or empty document — use previous character's line
+            // Handle cursor at end of text or empty document
             let adjustedRange: NSRange
-            if str.length == 0 {
-                // Empty document — just insert prefix
-                storage.beginEditing()
+            if str.length == 0 || (fromSlashMenu && range.location == str.length && range.length == 0) {
+                // Insert prefix at current position
+                let insertPos = min(range.location, str.length)
                 let attrPrefix = NSAttributedString(string: prefix, attributes: [.font: bodyFont, .foregroundColor: textColor])
-                storage.insert(attrPrefix, at: 0)
-                storage.endEditing()
-                textView.setSelectedRange(NSRange(location: prefix.count, length: 0))
+                storage.insert(attrPrefix, at: insertPos)
+                textView.setSelectedRange(NSRange(location: insertPos + prefix.count, length: 0))
+                textView.didChangeText()
                 return
             } else if range.location == str.length && range.length == 0 {
                 adjustedRange = NSRange(location: max(0, range.location - 1), length: 0)
@@ -2217,7 +2292,8 @@ struct RichTextEditor: NSViewRepresentable {
             let str = storage.string as NSString
 
             // Caret at beginning of a list line → insert new checklist line above, push current line down
-            if range.length == 0 && str.length > 0 && range.location < str.length {
+            // (skip when invoked from slash menu — user wants prefix on current line)
+            if !fromSlashMenu && range.length == 0 && str.length > 0 && range.location < str.length {
                 let lineRange = str.lineRange(for: NSRange(location: range.location, length: 0))
                 let lineStr = str.substring(with: lineRange)
                 let isAtLineStart = range.location == lineRange.location
@@ -2231,14 +2307,15 @@ struct RichTextEditor: NSViewRepresentable {
                 }
             }
 
-            // Handle cursor at end of text
+            // Handle cursor at end of text or empty document
             let adjustedRange: NSRange
-            if str.length == 0 {
-                storage.beginEditing()
+            if str.length == 0 || (fromSlashMenu && range.location == str.length && range.length == 0) {
+                // Insert prefix at current position
+                let insertPos = min(range.location, str.length)
                 let attrPrefix = NSAttributedString(string: "☐ ", attributes: [.font: bodyFont, .foregroundColor: textColor])
-                storage.insert(attrPrefix, at: 0)
-                storage.endEditing()
-                textView.setSelectedRange(NSRange(location: 2, length: 0))
+                storage.insert(attrPrefix, at: insertPos)
+                textView.setSelectedRange(NSRange(location: insertPos + 2, length: 0))
+                textView.didChangeText()
                 return
             } else if range.location == str.length && range.length == 0 {
                 adjustedRange = NSRange(location: max(0, range.location - 1), length: 0)
@@ -2304,6 +2381,9 @@ struct RichTextEditor: NSViewRepresentable {
             }
             if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
                 return handleBacktab(textView: textView)
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                return handleEscape(textView: textView)
             }
             return false
         }
@@ -2460,6 +2540,94 @@ struct RichTextEditor: NSViewRepresentable {
             if removed > 0 {
                 textView.didChangeText()
             }
+            return true
+        }
+
+        private func handleEscape(textView: NSTextView) -> Bool {
+            guard let storage = textView.textStorage else { return false }
+            let pos = textView.selectedRange().location
+            let str = storage.string as NSString
+
+            // Check if cursor is inside a code block
+            let checkPos = min(pos, max(0, storage.length - 1))
+            var codeRange = NSRange()
+            let inCodeBlock = checkPos >= 0 && storage.attribute(.codeBlock, at: checkPos, effectiveRange: &codeRange) != nil
+
+            // Check if cursor is on a list line
+            if !inCodeBlock {
+                guard str.length > 0 else { return false }
+                let lineRange = str.lineRange(for: NSRange(location: min(pos, max(0, str.length - 1)), length: 0))
+                let lineStr = str.substring(with: lineRange)
+                let leading = lineStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
+                let afterIndent = String(lineStr.dropFirst(leading.count))
+                let hasList = afterIndent.hasPrefix("• ") || afterIndent.hasPrefix("☐ ") || afterIndent.hasPrefix("☑ ")
+                guard hasList else { return false }
+
+                // Insert a new normal line after the current line
+                recordUndo(for: textView)
+                let insertPos = NSMaxRange(lineRange)
+                let ps = NSMutableParagraphStyle()
+                ps.baseWritingDirection = .leftToRight
+                ps.alignment = .left
+                let newline = NSAttributedString(string: "\n", attributes: [
+                    .font: bodyFont,
+                    .foregroundColor: textColor,
+                    .paragraphStyle: ps
+                ])
+                storage.insert(newline, at: insertPos)
+                textView.setSelectedRange(NSRange(location: insertPos + 1, length: 0))
+                textView.typingAttributes = [
+                    .font: bodyFont,
+                    .foregroundColor: textColor,
+                    .paragraphStyle: ps
+                ]
+                textView.didChangeText()
+                return true
+            }
+
+            recordUndo(for: textView)
+
+            // Find the full extent of the code block (may span multiple paragraphs)
+            var blockEnd = NSMaxRange(codeRange)
+            // Expand to cover contiguous code block paragraphs
+            while blockEnd < str.length {
+                if storage.attribute(.codeBlock, at: blockEnd, effectiveRange: nil) != nil {
+                    let nextPara = str.paragraphRange(for: NSRange(location: blockEnd, length: 0))
+                    blockEnd = NSMaxRange(nextPara)
+                } else {
+                    break
+                }
+            }
+
+            let insertPos = blockEnd
+            let ps = NSMutableParagraphStyle()
+            ps.baseWritingDirection = .leftToRight
+            ps.alignment = .left
+
+            // Insert newline to exit code block
+            let exitStr = NSMutableAttributedString(string: "\n", attributes: [
+                .font: bodyFont,
+                .foregroundColor: textColor,
+                .paragraphStyle: ps
+            ])
+            storage.insert(exitStr, at: insertPos)
+
+            // Remove codeBlock from the inserted newline
+            let insertedRange = NSRange(location: insertPos, length: 1)
+            storage.removeAttribute(.codeBlock, range: insertedRange)
+            storage.removeAttribute(.backgroundColor, range: insertedRange)
+
+            // Place cursor after the newline
+            textView.setSelectedRange(NSRange(location: insertPos + 1, length: 0))
+
+            // Reset typing attributes to body style
+            textView.typingAttributes = [
+                .font: bodyFont,
+                .foregroundColor: textColor,
+                .paragraphStyle: ps
+            ]
+
+            textView.didChangeText()
             return true
         }
     }
