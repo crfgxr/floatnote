@@ -13,7 +13,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.4.5"
+let APP_VERSION = "v1.5.5"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 
@@ -993,6 +993,49 @@ class BlockCaretTextView: NSTextView {
     }
 
     // MARK: - Backspace removes full prefix
+    // MARK: - Paste: strip external formatting, apply FloatNote body style, auto-link URLs
+    override func paste(_ sender: Any?) {
+        guard let pb = NSPasteboard.general.string(forType: .string), !pb.isEmpty else {
+            super.paste(sender)
+            return
+        }
+        guard let storage = textStorage else { return }
+
+        recordUndoSnapshot()
+
+        let bodyFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
+        let ps = NSMutableParagraphStyle()
+        ps.baseWritingDirection = .leftToRight
+        ps.alignment = .left
+        let bodyAttrs: [NSAttributedString.Key: Any] = [
+            .font: bodyFont,
+            .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
+            .paragraphStyle: ps
+        ]
+
+        // Build attributed string with URLs auto-linked
+        let result = NSMutableAttributedString(string: pb, attributes: bodyAttrs)
+        let urlPattern = try? NSRegularExpression(pattern: #"https?://[^\s<>\"\)\]]+"#, options: [])
+        if let matches = urlPattern?.matches(in: pb, range: NSRange(location: 0, length: (pb as NSString).length)) {
+            for match in matches {
+                let urlStr = (pb as NSString).substring(with: match.range)
+                if let url = URL(string: urlStr) {
+                    result.addAttributes([
+                        .link: url,
+                        .foregroundColor: NSColor(calibratedRed: 0.42, green: 0.68, blue: 1.0, alpha: 1.0),
+                        .underlineStyle: NSUnderlineStyle.single.rawValue
+                    ], range: match.range)
+                }
+            }
+        }
+
+        let range = selectedRange()
+        storage.replaceCharacters(in: range, with: result)
+        setSelectedRange(NSRange(location: range.location + result.length, length: 0))
+        typingAttributes = bodyAttrs
+        didChangeText()
+    }
+
     override func deleteBackward(_ sender: Any?) {
         guard let storage = textStorage else { super.deleteBackward(sender); return }
         let pos = selectedRange().location
@@ -1067,8 +1110,9 @@ class BlockCaretTextView: NSTextView {
 
     // MARK: - Arrow key overrides
     override func keyDown(with event: NSEvent) {
-        // Option+Up or Option+Down to move lines
-        if event.modifierFlags.contains(.option) && !event.modifierFlags.contains(.command) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Option+Up or Option+Down to move lines (with children)
+        if flags.contains(.option) && !flags.contains(.command) {
             if event.keyCode == 126 { // Up arrow
                 moveLineUp()
                 return
@@ -1081,66 +1125,61 @@ class BlockCaretTextView: NSTextView {
         updateCaretPosition()
     }
 
+    /// Returns the range covering a line and all its indented children.
+    private func blockRange(for lineRange: NSRange) -> NSRange {
+        guard let str = textStorage?.string as NSString? else { return lineRange }
+        let lineStr = str.substring(with: lineRange)
+        let parentIndent = lineStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" }).count
+
+        var blockEnd = NSMaxRange(lineRange)
+        while blockEnd < str.length {
+            let nextLR = str.lineRange(for: NSRange(location: blockEnd, length: 0))
+            let nextStr = str.substring(with: nextLR)
+            let nextIndent = nextStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" }).count
+            let nextTrimmed = nextStr.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Child if indented deeper and non-empty
+            if nextIndent > parentIndent && !nextTrimmed.isEmpty {
+                blockEnd = NSMaxRange(nextLR)
+            } else {
+                break
+            }
+        }
+        return NSRange(location: lineRange.location, length: blockEnd - lineRange.location)
+    }
+
     private func moveLineUp() {
         guard let storage = textStorage else { return }
         let str = storage.string as NSString
         let sel = selectedRange()
         let lineRange = str.lineRange(for: sel)
+        let block = blockRange(for: lineRange)
 
-        // Can't move up if already at the first line
-        guard lineRange.location > 0 else { return }
+        guard block.location > 0 else { return }
 
-        let prevLineRange = str.lineRange(for: NSRange(location: lineRange.location - 1, length: 0))
+        // Find the line above — get its block too (in case it's also a parent)
+        let prevLineRange = str.lineRange(for: NSRange(location: block.location - 1, length: 0))
+        let prevBlock = blockRange(for: prevLineRange)
 
         recordUndoSnapshot()
 
-        let currentLine = storage.attributedSubstring(from: lineRange)
-        let prevLine = storage.attributedSubstring(from: prevLineRange)
+        let currentBlock = storage.attributedSubstring(from: block)
+        let prevBlockContent = storage.attributedSubstring(from: prevBlock)
 
-        // Ensure both lines end with newline for clean swap
-        let currentStr = currentLine.string
-        let prevStr = prevLine.string
-
-        let combinedRange = NSRange(location: prevLineRange.location, length: prevLineRange.length + lineRange.length)
-        let replacement = NSMutableAttributedString()
-
-        // Current line goes first (moving up)
-        replacement.append(currentLine)
-        if !currentStr.hasSuffix("\n") {
-            replacement.append(NSAttributedString(string: "\n"))
-        }
-
-        // Previous line goes second
-        let prevNoNewline = prevStr.hasSuffix("\n") ? String(prevStr.dropLast()) : prevStr
-        if prevNoNewline.isEmpty {
-            // Previous line was just a newline
-            replacement.append(NSAttributedString(string: "\n", attributes: prevLine.attributes(at: 0, effectiveRange: nil)))
-        } else {
-            let trimmedPrev = NSMutableAttributedString(attributedString: prevLine)
-            if prevStr.hasSuffix("\n") && !currentStr.hasSuffix("\n") {
-                // We added newline to current, so remove trailing newline from prev only if current didn't have one
-            }
-            replacement.append(trimmedPrev)
-        }
-
-        // Handle edge case: ensure combined replacement matches combined range length for clean swap
-        // Simpler approach: just swap the raw lines
+        let combinedRange = NSRange(location: prevBlock.location, length: prevBlock.length + block.length)
         let swapped = NSMutableAttributedString()
-        swapped.append(currentLine)
-        if !currentStr.hasSuffix("\n") && prevStr.hasSuffix("\n") {
-            // Current line is last line (no trailing newline) — add newline to it, remove from prev
+        swapped.append(currentBlock)
+        if !currentBlock.string.hasSuffix("\n") && prevBlockContent.string.hasSuffix("\n") {
             swapped.append(NSAttributedString(string: "\n"))
-            let prevTrimmed = NSMutableAttributedString(attributedString: prevLine)
-            prevTrimmed.deleteCharacters(in: NSRange(location: prevTrimmed.length - 1, length: 1))
-            swapped.append(prevTrimmed)
+            let trimmed = NSMutableAttributedString(attributedString: prevBlockContent)
+            trimmed.deleteCharacters(in: NSRange(location: trimmed.length - 1, length: 1))
+            swapped.append(trimmed)
         } else {
-            swapped.append(prevLine)
+            swapped.append(prevBlockContent)
         }
 
         storage.replaceCharacters(in: combinedRange, with: swapped)
 
-        // Place caret after prefix of the moved line
-        let newLineStart = prevLineRange.location
+        let newLineStart = prevBlock.location
         let (_, movedPrefixLen) = listPrefixLen(at: newLineStart)
         setSelectedRange(NSRange(location: newLineStart + movedPrefixLen, length: 0))
         didChangeText()
@@ -1151,39 +1190,35 @@ class BlockCaretTextView: NSTextView {
         let str = storage.string as NSString
         let sel = selectedRange()
         let lineRange = str.lineRange(for: sel)
+        let block = blockRange(for: lineRange)
 
-        // Can't move down if already at the last line
-        let lineEnd = NSMaxRange(lineRange)
-        guard lineEnd < str.length else { return }
+        let blockEnd = NSMaxRange(block)
+        guard blockEnd < str.length else { return }
 
-        let nextLineRange = str.lineRange(for: NSRange(location: lineEnd, length: 0))
+        // Find the line below — get its block too
+        let nextLineRange = str.lineRange(for: NSRange(location: blockEnd, length: 0))
+        let nextBlock = blockRange(for: nextLineRange)
 
         recordUndoSnapshot()
 
-        let currentLine = storage.attributedSubstring(from: lineRange)
-        let nextLine = storage.attributedSubstring(from: nextLineRange)
+        let currentBlock = storage.attributedSubstring(from: block)
+        let nextBlockContent = storage.attributedSubstring(from: nextBlock)
 
-        let currentStr = currentLine.string
-        let nextStr = nextLine.string
-
-        let combinedRange = NSRange(location: lineRange.location, length: lineRange.length + nextLineRange.length)
-
+        let combinedRange = NSRange(location: block.location, length: block.length + nextBlock.length)
         let swapped = NSMutableAttributedString()
-        swapped.append(nextLine)
-        if !nextStr.hasSuffix("\n") && currentStr.hasSuffix("\n") {
-            // Next line is last line (no trailing newline) — add newline to it, remove from current
+        swapped.append(nextBlockContent)
+        if !nextBlockContent.string.hasSuffix("\n") && currentBlock.string.hasSuffix("\n") {
             swapped.append(NSAttributedString(string: "\n"))
-            let currentTrimmed = NSMutableAttributedString(attributedString: currentLine)
-            currentTrimmed.deleteCharacters(in: NSRange(location: currentTrimmed.length - 1, length: 1))
-            swapped.append(currentTrimmed)
+            let trimmed = NSMutableAttributedString(attributedString: currentBlock)
+            trimmed.deleteCharacters(in: NSRange(location: trimmed.length - 1, length: 1))
+            swapped.append(trimmed)
         } else {
-            swapped.append(currentLine)
+            swapped.append(currentBlock)
         }
 
         storage.replaceCharacters(in: combinedRange, with: swapped)
 
-        // Place caret after prefix of the moved line
-        let newLineStart = lineRange.location + nextLineRange.length
+        let newLineStart = block.location + nextBlock.length
         let (_, movedPrefixLen) = listPrefixLen(at: newLineStart)
         setSelectedRange(NSRange(location: newLineStart + movedPrefixLen, length: 0))
         didChangeText()
@@ -1337,49 +1372,33 @@ class BlockCaretTextView: NSTextView {
                 return
             }
 
-            let sourceLineRange = str.lineRange(for: NSRange(location: min(dragStartLineIndex, max(0, str.length - 1)), length: 0))
+            let singleLineRange = str.lineRange(for: NSRange(location: min(dragStartLineIndex, max(0, str.length - 1)), length: 0))
+            // Get full block (parent + children)
+            let sourceBlockRange = blockRange(for: singleLineRange)
 
             // Snapshot full state for proper undo/redo
             let oldText = NSAttributedString(attributedString: storage)
             let oldSel = selectedRange()
 
-            let sourceLine = storage.attributedSubstring(from: sourceLineRange)
-            let sourceStr = sourceLine.string
-
-            // Use the indentation determined during drag (based on mouse X position)
-            let targetIndent = dragNestIndent
+            let sourceBlock = storage.attributedSubstring(from: sourceBlockRange)
 
             // Calculate insert position relative to after source removal
             var insertPos = dragInsertIndex
-            if insertPos > sourceLineRange.location {
-                insertPos -= sourceLineRange.length
+            if insertPos > sourceBlockRange.location {
+                insertPos -= sourceBlockRange.length
             }
 
-            // Remove source line
-            storage.deleteCharacters(in: sourceLineRange)
+            // Remove source block
+            storage.deleteCharacters(in: sourceBlockRange)
 
             let newStr = storage.string as NSString
             insertPos = min(insertPos, newStr.length)
 
-            // Re-indent the source line to match target context (preserve attributed formatting)
-            let mutable = NSMutableAttributedString(attributedString: sourceLine)
+            // Use the source block as-is (preserving all formatting and indentation)
+            let mutable = NSMutableAttributedString(attributedString: sourceBlock)
             // Remove trailing newline from the mutable copy
             if mutable.string.hasSuffix("\n") {
                 mutable.deleteCharacters(in: NSRange(location: mutable.length - 1, length: 1))
-            }
-            // Adjust leading whitespace only — don't touch the rest of the attributed content
-            let sourceLeading = mutable.string.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
-            let strippedStr = String(mutable.string.dropFirst(sourceLeading.count))
-            let hasPrefix = strippedStr.hasPrefix("• ") || strippedStr.hasPrefix("☐ ") || strippedStr.hasPrefix("☑ ")
-            if hasPrefix && sourceLeading.count != targetIndent.count {
-                // Remove old indent, insert new indent
-                if sourceLeading.count > 0 {
-                    mutable.deleteCharacters(in: NSRange(location: 0, length: sourceLeading.count))
-                }
-                if !targetIndent.isEmpty {
-                    let indentAttr = NSAttributedString(string: targetIndent, attributes: mutable.length > 0 ? mutable.attributes(at: 0, effectiveRange: nil) : [:])
-                    mutable.insert(indentAttr, at: 0)
-                }
             }
 
             // Insert
@@ -1434,6 +1453,7 @@ class BlockCaretTextView: NSTextView {
     func toggleCheckbox(at charIndex: Int) {
         guard let storage = textStorage else { return }
         let str = storage.string as NSString
+        guard charIndex >= 0 && charIndex < str.length else { return }
         let char = str.substring(with: NSRange(location: charIndex, length: 1))
         let lineRange = str.lineRange(for: NSRange(location: charIndex, length: 0))
 
@@ -1725,14 +1745,31 @@ struct RichTextEditor: NSViewRepresentable {
             let cursor = textView.selectedRange().location
             let lineRange = str.lineRange(for: NSRange(location: min(cursor, max(0, str.length - 1)), length: 0))
             applyListIndentToRange(storage: storage, lineRange: lineRange)
+
+            // Re-check previous line (may have gained/lost parent status)
+            if lineRange.location > 0 {
+                let prevLineRange = str.lineRange(for: NSRange(location: lineRange.location - 1, length: 0))
+                applyListIndentToRange(storage: storage, lineRange: prevLineRange)
+            }
+
+            // Re-check next line (current line may now be its parent)
+            let lineEnd = NSMaxRange(lineRange)
+            if lineEnd < str.length {
+                let nextLineRange = str.lineRange(for: NSRange(location: lineEnd, length: 0))
+                applyListIndentToRange(storage: storage, lineRange: nextLineRange)
+            }
         }
 
-        /// Apply hanging indent to a specific line range.
+        /// Returns the indent level (number of leading whitespace chars) for a line.
+        private func indentLevel(of lineStr: String) -> Int {
+            lineStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" }).count
+        }
+
+        /// Apply hanging indent and parent spacing to a specific line range.
         private func applyListIndentToRange(storage: NSTextStorage, lineRange: NSRange) {
             let str = storage.string as NSString
             let lineStr = str.substring(with: lineRange)
 
-            // Count leading whitespace (regular spaces and non-breaking spaces)
             let leadingWS = lineStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
             let afterIndent = String(lineStr.dropFirst(leadingWS.count))
 
@@ -1750,22 +1787,89 @@ struct RichTextEditor: NSViewRepresentable {
                 ps.baseWritingDirection = .leftToRight
                 ps.alignment = .left
                 ps.headIndent = prefixWidth
+
+                // Check if next line is indented deeper → this is a "parent" item
+                let lineEnd = NSMaxRange(lineRange)
+                if lineEnd < str.length {
+                    let nextLineRange = str.lineRange(for: NSRange(location: lineEnd, length: 0))
+                    let nextLineStr = str.substring(with: nextLineRange)
+                    let currentIndent = indentLevel(of: lineStr)
+                    let nextIndent = indentLevel(of: nextLineStr)
+                    let nextHasPrefix = nextLineStr.dropFirst(nextIndent).hasPrefix("• ") ||
+                                        nextLineStr.dropFirst(nextIndent).hasPrefix("☐ ") ||
+                                        nextLineStr.dropFirst(nextIndent).hasPrefix("☑ ")
+                    if nextHasPrefix && nextIndent > currentIndent {
+                        ps.paragraphSpacingBefore = 8
+                    }
+                }
+
                 storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
             }
         }
 
-        /// Apply hanging indent to ALL list lines (used on initial content load).
+        /// Apply hanging indent and parent spacing to ALL list lines.
         func applyListIndentToAllLines(textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
             let str = storage.string as NSString
             guard str.length > 0 else { return }
 
-            storage.beginEditing()
+            // Collect all line ranges first
+            var lines: [(range: NSRange, str: String)] = []
             var pos = 0
             while pos < str.length {
-                let lineRange = str.lineRange(for: NSRange(location: pos, length: 0))
-                applyListIndentToRange(storage: storage, lineRange: lineRange)
-                pos = NSMaxRange(lineRange)
+                let lr = str.lineRange(for: NSRange(location: pos, length: 0))
+                lines.append((lr, str.substring(with: lr)))
+                pos = NSMaxRange(lr)
+            }
+
+            storage.beginEditing()
+            for i in 0..<lines.count {
+                let lineRange = lines[i].range
+                let lineStr = lines[i].str
+
+                let leadingWS = lineStr.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
+                let afterIndent = String(lineStr.dropFirst(leadingWS.count))
+
+                var prefixStr: String? = nil
+                for pfx in ["• ", "☐ ", "☑ "] {
+                    if afterIndent.hasPrefix(pfx) {
+                        prefixStr = String(leadingWS) + pfx
+                        break
+                    }
+                }
+
+                if let prefix = prefixStr {
+                    let prefixWidth = (prefix as NSString).size(withAttributes: [.font: bodyFont]).width
+                    let ps = NSMutableParagraphStyle()
+                    ps.baseWritingDirection = .leftToRight
+                    ps.alignment = .left
+                    ps.headIndent = prefixWidth
+
+                    let currentIndent = indentLevel(of: lineStr)
+
+                    // Add spacing before parent items that have indented children
+                    if i + 1 < lines.count {
+                        let nextStr = lines[i + 1].str
+                        let nextIndent = indentLevel(of: nextStr)
+                        let nextHasPrefix = nextStr.dropFirst(nextIndent).hasPrefix("• ") ||
+                                            nextStr.dropFirst(nextIndent).hasPrefix("☐ ") ||
+                                            nextStr.dropFirst(nextIndent).hasPrefix("☑ ")
+                        if nextHasPrefix && nextIndent > currentIndent {
+                            // This is a parent — add spacing only if not the first line
+                            // and previous line is not an indented child of us
+                            if i > 0 {
+                                let prevStr = lines[i - 1].str
+                                let prevIndent = indentLevel(of: prevStr)
+                                // Add gap if previous line is at same or lower indent (sibling/ancestor, not child)
+                                if prevIndent <= currentIndent {
+                                    ps.paragraphSpacingBefore = 8
+                                }
+                            }
+                        }
+                    }
+
+                    storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
+                }
             }
             storage.endEditing()
         }
@@ -1899,8 +2003,8 @@ struct RichTextEditor: NSViewRepresentable {
 
             recordUndo(for: textView)
 
-            // Remove the "/" character
-            if slashPosition < storage.length {
+            // Remove the "/" character (validate position and content)
+            if slashPosition >= 0 && slashPosition < storage.length {
                 let charAtPos = (storage.string as NSString).substring(with: NSRange(location: slashPosition, length: 1))
                 if charAtPos == "/" {
                     storage.replaceCharacters(in: NSRange(location: slashPosition, length: 1), with: "")
@@ -2273,8 +2377,8 @@ struct RichTextEditor: NSViewRepresentable {
             if let prefix = detectedPrefix {
                 let fullPrefix = leadingSpaces + prefix
 
-                // If cursor is at or before the prefix, just insert a plain newline (push line down)
-                if range.location <= lineRange.location + fullPrefix.count {
+                // If cursor is before the content (inside or before prefix), plain newline
+                if range.location < lineRange.location + fullPrefix.count {
                     return false  // let NSTextView handle the newline normally
                 }
 
