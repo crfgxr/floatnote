@@ -611,12 +611,13 @@ struct EditorView: View {
             Divider()
             if vm.isRecording && vm.activeTabId == vm.recordingTabId {
                 RecordingInProgressView(startTime: vm.recordingStartTime ?? Date())
+                Divider()
             } else if let path = vm.currentRecordingPath {
                 RecordingPlayerView(fileURL: URL(fileURLWithPath: path))
-            } else {
-                RichTextEditor()
-                    .environmentObject(vm)
+                Divider()
             }
+            RichTextEditor()
+                .environmentObject(vm)
             Divider()
             StatusBar()
         }
@@ -1160,28 +1161,27 @@ struct RecordingInProgressView: View {
     var body: some View {
         TimelineView(.periodic(from: startTime, by: 1.0)) { context in
             let elapsed = context.date.timeIntervalSince(startTime)
-            VStack {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(.red)
+                    .frame(width: 8, height: 8)
+                Text("Recording in progress")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Text(timeString(elapsed))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
                 Spacer()
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(.red)
-                        .frame(width: 8, height: 8)
-                    Text("Recording in progress")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                    Text(timeString(elapsed))
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
-                .padding(.bottom, 12)
                 Button(action: { Task { await vm.stopRecording() } }) {
                     Image(systemName: "stop.circle.fill")
-                        .font(.system(size: 28))
+                        .font(.system(size: 14))
                         .foregroundColor(.red)
                 }
                 .buttonStyle(.plain)
-                Spacer()
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.bar)
         }
     }
 
@@ -1204,45 +1204,46 @@ struct RecordingPlayerView: View {
     @State private var fileExists = false
 
     var body: some View {
-        VStack {
-            Spacer()
-            if !fileExists {
-                Text("Recording file not found")
-                    .foregroundColor(.secondary)
-            } else {
-                HStack(spacing: 12) {
-                    Button { togglePlay() } label: {
-                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 14))
-                            .foregroundColor(.primary)
-                    }
-                    .buttonStyle(.plain)
-
-                    Button { stopPlay() } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 14))
-                            .foregroundColor(.primary)
-                    }
-                    .buttonStyle(.plain)
-
-                    Slider(value: Binding(get: { currentTime }, set: { seek(to: $0) }),
-                           in: 0...max(duration, 1))
-
-                    Text("\(timeString(currentTime)) / \(timeString(duration))")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .frame(minWidth: 80, alignment: .trailing)
-
-                    Button("Open Folder") {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: RecordingManager.recordingsDir))
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundColor(.accentColor)
+        if !fileExists {
+            Text("Recording file not found")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .padding(.vertical, 6)
+        } else {
+            HStack(spacing: 8) {
+                Button { togglePlay() } label: {
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.primary)
                 }
-                .padding(.horizontal, 20)
+                .buttonStyle(.plain)
+
+                Button { stopPlay() } label: {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.primary)
+                }
+                .buttonStyle(.plain)
+
+                Slider(value: Binding(get: { currentTime }, set: { seek(to: $0) }),
+                       in: 0...max(duration, 1))
+                    .controlSize(.small)
+
+                Text("\(timeString(currentTime)) / \(timeString(duration))")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .frame(minWidth: 70, alignment: .trailing)
+
+                Button("Open Folder") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: RecordingManager.recordingsDir))
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10))
+                .foregroundColor(.accentColor)
             }
-            Spacer()
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.bar)
         }
         .onAppear { setupPlayer() }
         .onDisappear { cleanup() }
