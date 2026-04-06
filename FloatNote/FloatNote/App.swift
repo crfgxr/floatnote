@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import AVFoundation
+import ScreenCaptureKit
 
 func dbg(_ msg: String) {
     let path = NSHomeDirectory() + "/.floatnote-debug.log"
@@ -81,6 +83,7 @@ struct TabData: Codable {
     var title: String
     var noteGuid: String?  // legacy field, ignored
     var html: String
+    var recordingPath: String?
 }
 
 class NoteTab: Identifiable, ObservableObject {
@@ -88,6 +91,7 @@ class NoteTab: Identifiable, ObservableObject {
     @Published var title: String
     var html: String = ""
     var lastSavedHTML: String = ""
+    var recordingPath: String? = nil
 
     init(id: UUID = UUID(), title: String) {
         self.id = id
@@ -95,12 +99,13 @@ class NoteTab: Identifiable, ObservableObject {
     }
 
     func toData() -> TabData {
-        TabData(id: id.uuidString, title: title, html: html)
+        TabData(id: id.uuidString, title: title, html: html, recordingPath: recordingPath)
     }
 
     static func from(_ data: TabData) -> NoteTab {
         let tab = NoteTab(id: UUID(uuidString: data.id) ?? UUID(), title: data.title)
         tab.html = data.html
+        tab.recordingPath = data.recordingPath
         return tab
     }
 }
@@ -134,13 +139,6 @@ class EditorViewModel: ObservableObject {
     }
 
     private func loadOrCreateNote() {
-        // Migrate old tabs file path if needed
-        let oldTabsPath = NSHomeDirectory() + "/.evernote-editor-tabs.json"
-        if !FileManager.default.fileExists(atPath: LOCAL_TABS_PATH),
-           FileManager.default.fileExists(atPath: oldTabsPath) {
-            try? FileManager.default.moveItem(atPath: oldTabsPath, toPath: LOCAL_TABS_PATH)
-        }
-
         loadTabsLocal()
 
         if tabs.isEmpty {
