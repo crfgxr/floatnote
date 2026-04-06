@@ -345,6 +345,195 @@ class EditorViewModel: ObservableObject {
     }
 }
 
+// MARK: - Recording Manager
+
+class RecordingManager: NSObject, ObservableObject {
+    @Published var isRecording = false
+    @Published var permissionDenied = false
+
+    private let writeQueue = DispatchQueue(label: "com.floatnote.audiowrite", qos: .userInteractive)
+    private var scStream: SCStream?
+    private var sysWriter: AVAssetWriter?
+    private var sysAudioInput: AVAssetWriterInput?
+    private var sysWriterStarted = false
+    private var micRecorder: AVAudioRecorder?
+    private var systemTempURL: URL?
+    private var micTempURL: URL?
+
+    static let recordingsDir = NSHomeDirectory() + "/.floatnote-recordings"
+
+    // MARK: Permissions
+
+    func checkAndRequestPermissions() async -> Bool {
+        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        if micStatus == .denied || micStatus == .restricted {
+            DispatchQueue.main.async { self.permissionDenied = true }
+            return false
+        }
+        if micStatus == .notDetermined {
+            let granted = await AVCaptureDevice.requestAccess(for: .audio)
+            if !granted {
+                DispatchQueue.main.async { self.permissionDenied = true }
+                return false
+            }
+        }
+        do {
+            _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        } catch {
+            DispatchQueue.main.async { self.permissionDenied = true }
+            return false
+        }
+        DispatchQueue.main.async { self.permissionDenied = false }
+        return true
+    }
+
+    // MARK: Start
+
+    func start() async {
+        try? FileManager.default.createDirectory(atPath: Self.recordingsDir, withIntermediateDirectories: true)
+        let uuid = UUID().uuidString
+        systemTempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fn_sys_\(uuid).m4a")
+        micTempURL    = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fn_mic_\(uuid).m4a")
+        await startSystemCapture()
+        startMicCapture()
+        DispatchQueue.main.async { self.isRecording = true }
+    }
+
+    private func startSystemCapture() async {
+        guard let sysURL = systemTempURL,
+              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false),
+              let display = content.displays.first else { return }
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.sampleRate = 44100
+        config.channelCount = 2
+        config.excludesCurrentProcessAudio = false
+
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100.0,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: 128000
+        ]
+        guard let writer = try? AVAssetWriter(outputURL: sysURL, fileType: .m4a) else { return }
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        input.expectsMediaDataInRealTime = true
+        writer.add(input)
+        writer.startWriting()
+        sysWriter = writer
+        sysAudioInput = input
+        sysWriterStarted = false
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try? stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: writeQueue)
+        try? await stream.startCapture()
+        scStream = stream
+    }
+
+    private func startMicCapture() {
+        guard let micURL = micTempURL else { return }
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100.0,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 64000
+        ]
+        micRecorder = try? AVAudioRecorder(url: micURL, settings: settings)
+        micRecorder?.record()
+    }
+
+    // MARK: Stop
+
+    func stop() async -> URL? {
+        DispatchQueue.main.async { self.isRecording = false }
+
+        micRecorder?.stop()
+        micRecorder = nil
+
+        try? await scStream?.stopCapture()
+        scStream = nil
+
+        writeQueue.sync { }  // drain any in-flight appends
+
+        sysAudioInput?.markAsFinished()
+        await sysWriter?.finishWriting()
+        sysWriter = nil
+        sysAudioInput = nil
+
+        let outputURL = makeOutputURL()
+        guard let sysURL = systemTempURL, let micURL = micTempURL else { return nil }
+        let merged = await mergeAudio(systemURL: sysURL, micURL: micURL, to: outputURL)
+
+        try? FileManager.default.removeItem(at: sysURL)
+        try? FileManager.default.removeItem(at: micURL)
+        systemTempURL = nil
+        micTempURL = nil
+
+        return merged ? outputURL : nil
+    }
+
+    // MARK: Merge
+
+    private func mergeAudio(systemURL: URL, micURL: URL, to outputURL: URL) async -> Bool {
+        let composition = AVMutableComposition()
+
+        let sysAsset = AVAsset(url: systemURL)
+        if let sysTrack = try? await sysAsset.loadTracks(withMediaType: .audio).first,
+           let compTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid),
+           let dur = try? await sysAsset.load(.duration) {
+            try? compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: sysTrack, at: .zero)
+        }
+
+        let micAsset = AVAsset(url: micURL)
+        if let micTrack = try? await micAsset.loadTracks(withMediaType: .audio).first,
+           let compTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid),
+           let dur = try? await micAsset.load(.duration) {
+            try? compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: micTrack, at: .zero)
+        }
+
+        guard let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else { return false }
+        export.outputURL = outputURL
+        export.outputFileType = .m4a
+        await export.export()
+        return export.status == .completed
+    }
+
+    // MARK: Filename
+
+    private func makeOutputURL() -> URL {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "dd.MM-HH.mm"
+        let base = formatter.string(from: Date())
+        let dir = URL(fileURLWithPath: Self.recordingsDir)
+        var url = dir.appendingPathComponent("\(base).m4a")
+        var n = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = dir.appendingPathComponent("\(base)-\(n).m4a")
+            n += 1
+        }
+        return url
+    }
+}
+
+extension RecordingManager: SCStreamOutput, SCStreamDelegate {
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio,
+              let input = sysAudioInput, input.isReadyForMoreMediaData,
+              let writer = sysWriter else { return }
+        if !sysWriterStarted {
+            writer.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
+            sysWriterStarted = true
+        }
+        input.append(sampleBuffer)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { self.isRecording = false }
+    }
+}
+
 // MARK: - Editor View
 
 struct EditorView: View {
