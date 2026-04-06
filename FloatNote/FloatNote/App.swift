@@ -154,6 +154,13 @@ class EditorViewModel: ObservableObject {
     }
 
     private func loadOrCreateNote() {
+        // Migrate old tabs file path if needed
+        let oldTabsPath = NSHomeDirectory() + "/.evernote-editor-tabs.json"
+        if !FileManager.default.fileExists(atPath: LOCAL_TABS_PATH),
+           FileManager.default.fileExists(atPath: oldTabsPath) {
+            try? FileManager.default.moveItem(atPath: oldTabsPath, toPath: LOCAL_TABS_PATH)
+        }
+
         loadTabsLocal()
 
         if tabs.isEmpty {
@@ -169,6 +176,7 @@ class EditorViewModel: ObservableObject {
         activeTabId = firstTab.id
         currentHTML = firstTab.html
         lastSavedHTML = firstTab.lastSavedHTML
+        currentRecordingPath = firstTab.recordingPath
 
         if !firstTab.html.isEmpty, let attrStr = htmlToAttributedString(firstTab.html) {
             attributedText = NSMutableAttributedString(attributedString: attrStr)
@@ -252,6 +260,7 @@ class EditorViewModel: ObservableObject {
 
     func deleteTab(_ id: UUID) {
         guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        if id == recordingTabId && isRecording { return }  // block deleting active recording tab
 
         // Switch away if deleting the active tab
         if activeTabId == id {
@@ -1183,6 +1192,7 @@ struct RecordingPlayerView: View {
     @State private var currentTime: Double = 0
     @State private var duration: Double = 1
     @State private var timeObserver: Any?
+    @State private var endObserver: Any?
     @State private var fileExists = false
 
     var body: some View {
@@ -1245,7 +1255,7 @@ struct RecordingPlayerView: View {
         timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { t in
             currentTime = t.seconds
         }
-        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { _ in
+        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { _ in
             isPlaying = false
             currentTime = 0
             p.seek(to: .zero)
@@ -1254,6 +1264,7 @@ struct RecordingPlayerView: View {
 
     private func cleanup() {
         if let obs = timeObserver { player?.removeTimeObserver(obs) }
+        if let obs = endObserver { NotificationCenter.default.removeObserver(obs) }
         player?.pause()
         player = nil
     }
