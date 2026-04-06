@@ -1155,6 +1155,7 @@ struct FormatToolbar: View {
 
 struct RecordingInProgressView: View {
     let startTime: Date
+    @EnvironmentObject var vm: EditorViewModel
 
     var body: some View {
         TimelineView(.periodic(from: startTime, by: 1.0)) { context in
@@ -1172,6 +1173,13 @@ struct RecordingInProgressView: View {
                         .font(.system(size: 13, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
+                .padding(.bottom, 12)
+                Button(action: { Task { await vm.stopRecording() } }) {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
                 Spacer()
             }
         }
