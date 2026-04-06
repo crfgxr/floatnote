@@ -441,12 +441,7 @@ class RecordingManager: NSObject, ObservableObject {
                 return false
             }
         }
-        do {
-            _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        } catch {
-            DispatchQueue.main.async { self.permissionDenied = true }
-            return false
-        }
+        // SCStream handles screen capture permission prompt automatically on start
         DispatchQueue.main.async { self.permissionDenied = false }
         return true
     }
