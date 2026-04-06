@@ -1136,6 +1136,147 @@ struct FormatToolbar: View {
     }
 }
 
+// MARK: - Recording In Progress View
+
+struct RecordingInProgressView: View {
+    let startTime: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: startTime, by: 1.0)) { context in
+            let elapsed = context.date.timeIntervalSince(startTime)
+            VStack {
+                Spacer()
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(.red)
+                        .frame(width: 8, height: 8)
+                    Text("Recording in progress")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                    Text(timeString(elapsed))
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private func timeString(_ s: TimeInterval) -> String {
+        let t = Int(max(0, s))
+        return String(format: "%d:%02d", t / 60, t % 60)
+    }
+}
+
+// MARK: - Recording Player View
+
+struct RecordingPlayerView: View {
+    let fileURL: URL
+    @State private var player: AVPlayer?
+    @State private var isPlaying = false
+    @State private var currentTime: Double = 0
+    @State private var duration: Double = 1
+    @State private var timeObserver: Any?
+    @State private var fileExists = false
+
+    var body: some View {
+        VStack {
+            Spacer()
+            if !fileExists {
+                Text("Recording file not found")
+                    .foregroundColor(.secondary)
+            } else {
+                HStack(spacing: 12) {
+                    Button { togglePlay() } label: {
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 14))
+                            .foregroundColor(.primary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button { stopPlay() } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 14))
+                            .foregroundColor(.primary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Slider(value: Binding(get: { currentTime }, set: { seek(to: $0) }),
+                           in: 0...max(duration, 1))
+
+                    Text("\(timeString(currentTime)) / \(timeString(duration))")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(minWidth: 80, alignment: .trailing)
+
+                    Button("Open Folder") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: RecordingManager.recordingsDir))
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundColor(.accentColor)
+                }
+                .padding(.horizontal, 20)
+            }
+            Spacer()
+        }
+        .onAppear { setupPlayer() }
+        .onDisappear { cleanup() }
+    }
+
+    private func setupPlayer() {
+        fileExists = FileManager.default.fileExists(atPath: fileURL.path)
+        guard fileExists else { return }
+        let item = AVPlayerItem(url: fileURL)
+        let p = AVPlayer(playerItem: item)
+        player = p
+        Task {
+            if let dur = try? await item.asset.load(.duration), dur.isNumeric {
+                duration = max(dur.seconds, 1)
+            }
+        }
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { t in
+            currentTime = t.seconds
+        }
+        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { _ in
+            isPlaying = false
+            currentTime = 0
+            p.seek(to: .zero)
+        }
+    }
+
+    private func cleanup() {
+        if let obs = timeObserver { player?.removeTimeObserver(obs) }
+        player?.pause()
+        player = nil
+    }
+
+    private func togglePlay() {
+        guard let p = player else { return }
+        isPlaying ? p.pause() : p.play()
+        isPlaying.toggle()
+    }
+
+    private func stopPlay() {
+        player?.pause()
+        player?.seek(to: .zero)
+        isPlaying = false
+        currentTime = 0
+    }
+
+    private func seek(to seconds: Double) {
+        player?.seek(to: CMTime(seconds: seconds, preferredTimescale: 600))
+        currentTime = seconds
+    }
+
+    private func timeString(_ s: Double) -> String {
+        guard s.isFinite && s >= 0 else { return "0:00" }
+        let t = Int(s)
+        return String(format: "%d:%02d", t / 60, t % 60)
+    }
+}
+
 // MARK: - Block Caret NSTextView
 
 class BlockCaretTextView: NSTextView {
