@@ -50,6 +50,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let vm else { return .terminateNow }
+        if vm.isRecording {
+            Task {
+                await vm.stopRecording()
+                vm.saveLocalSync()
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateCancel
+        }
         vm.saveLocalSync()
         return .terminateNow
     }
@@ -124,6 +132,13 @@ class EditorViewModel: ObservableObject {
     @Published var activeTabId: UUID?
     @Published var editingTabId: UUID?
     @Published var draggingTabId: UUID?
+    @Published var isRecording = false
+    @Published var recordPermissionDenied = false
+    @Published var recordingTabId: UUID?
+    @Published var recordingStartTime: Date?
+    @Published var currentRecordingPath: String?
+
+    let recordingManager = RecordingManager()
 
     var activeTab: NoteTab? { tabs.first { $0.id == activeTabId } }
     var attributedText = NSMutableAttributedString()
@@ -197,6 +212,7 @@ class EditorViewModel: ObservableObject {
         saveTabsLocal()
 
         activeTabId = id
+        currentRecordingPath = newTab.recordingPath
         currentHTML = newTab.html
         lastSavedHTML = newTab.lastSavedHTML
 
@@ -226,6 +242,7 @@ class EditorViewModel: ObservableObject {
         tabs.append(tab)
         activeTabId = tab.id
         currentHTML = ""
+        currentRecordingPath = nil
         lastSavedHTML = ""
         charCount = 0
         onContentLoaded?(NSAttributedString(string: ""))
@@ -305,6 +322,44 @@ class EditorViewModel: ObservableObject {
         if let window = NSApp.windows.first(where: { $0.isKeyWindow }) ?? NSApp.windows.first {
             window.level = isPinned ? .floating : .normal
         }
+    }
+
+    func startRecording() async {
+        let ok = await recordingManager.checkAndRequestPermissions()
+        if !ok { recordPermissionDenied = true; return }
+        recordPermissionDenied = false
+
+        if let current = activeTab { current.html = currentHTML }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "dd.MM - HH:mm"
+        let tab = NoteTab(title: formatter.string(from: Date()))
+        tabs.append(tab)
+        recordingTabId = tab.id
+        activeTabId = tab.id
+        currentHTML = ""
+        currentRecordingPath = nil
+        isRecording = true
+        recordingStartTime = Date()
+        saveTabsLocal()
+
+        await recordingManager.start()
+    }
+
+    func stopRecording() async {
+        guard let url = await recordingManager.stop() else {
+            isRecording = false
+            return
+        }
+        isRecording = false
+        recordingStartTime = nil
+        currentRecordingPath = url.path
+
+        if let tabId = recordingTabId, let tab = tabs.first(where: { $0.id == tabId }) {
+            tab.recordingPath = url.path
+        }
+        recordingTabId = nil
+        saveTabsLocal()
     }
 
     private func saveLocal(html: String) {
