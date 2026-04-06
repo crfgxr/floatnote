@@ -600,8 +600,14 @@ struct EditorView: View {
             Divider()
             TabBar()
             Divider()
-            RichTextEditor()
-                .environmentObject(vm)
+            if vm.isRecording && vm.activeTabId == vm.recordingTabId {
+                RecordingInProgressView(startTime: vm.recordingStartTime ?? Date())
+            } else if let path = vm.currentRecordingPath {
+                RecordingPlayerView(fileURL: URL(fileURLWithPath: path))
+            } else {
+                RichTextEditor()
+                    .environmentObject(vm)
+            }
             Divider()
             StatusBar()
         }
