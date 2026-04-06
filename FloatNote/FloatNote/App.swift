@@ -1006,6 +1006,37 @@ struct FormatToolbar: View {
                 .onHover { hoveredButton = $0 ? "mic" : nil }
                 .help(vm.isDictating ? "Stop Dictation" : "Start Dictation")
             }
+
+            thinDivider()
+
+            Button(action: {
+                if vm.recordPermissionDenied {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+                } else if vm.isRecording {
+                    Task { await vm.stopRecording() }
+                } else {
+                    Task { await vm.startRecording() }
+                }
+            }) {
+                Image(systemName: vm.isRecording ? "stop.circle.fill" : "record.circle")
+                    .font(.system(size: 11))
+                    .frame(maxWidth: .infinity, minHeight: 22)
+                    .foregroundColor(
+                        vm.recordPermissionDenied ? .secondary.opacity(0.4) :
+                        vm.isRecording ? .red : .secondary
+                    )
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(hoveredButton == "rec" ? Color.primary.opacity(0.08) : Color.clear)
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { hoveredButton = $0 ? "rec" : nil }
+            .opacity(vm.recordPermissionDenied ? 0.5 : 1.0)
+            .help(
+                vm.recordPermissionDenied ? "Permission required — click to open Settings" :
+                vm.isRecording ? "Stop Recording" : "Start Recording"
+            )
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 3)
