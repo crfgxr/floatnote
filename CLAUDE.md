@@ -8,6 +8,7 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 ## Project Layout
 - `FloatNote/FloatNote/App.swift` - SwiftUI app, views, ViewModel, editor
 - `FloatNote/Package.swift` - SPM manifest (macOS 14+)
+- `mcp-server.js` - MCP server exposing notes to Claude
 - `build.sh` - Build + deploy script
 
 ## Versioning
@@ -17,7 +18,6 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 ## Key Details
 - Fully local-only app (no cloud sync)
 - Data stored at `~/.floatnote-local.html` and `~/.floatnote-tabs.json`
-- Migrates old `.evernote-editor-tabs.json` automatically on first run
 
 ## Editor Features
 - **Toolbar**: Minimal plain-style buttons with hover highlights, flexible layout (all buttons visible at any width)
@@ -32,3 +32,6 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 - **Move lines**: Option+Up/Down swaps lines, preserving caret position
 - **Drag-to-reorder**: Click and drag list prefixes to reorder; blue insertion line shows drop target; dropped lines match target indentation
 - **Dictation auto-restart**: When mic is enabled, dictation auto-restarts after system timeout or when app regains focus
+- **Audio recording**: Record system audio (via ScreenCaptureKit) + microphone per tab, PCM-level merge, stored as .m4a in ~/.floatnote-recordings/
+- **Transcription**: Deepgram-powered transcription with multi-language support (English, Turkish)
+- **Recording playback**: In-app audio player with seek, play/pause, stop; recordings linked to tabs

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVFoundation
+import AudioToolbox
 import ScreenCaptureKit
 
 func dbg(_ msg: String) {
@@ -15,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.6.0"
+let APP_VERSION = "v1.10.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 
@@ -35,7 +36,12 @@ struct FloatNoteApp: App {
         .defaultSize(width: 800, height: 600)
         .commands {
             CommandGroup(replacing: .newItem) { } // Disable Cmd+N / new window
-            CommandGroup(replacing: .saveItem) { }
+            CommandGroup(replacing: .saveItem) {
+                Button("Export Notes…") { vm.exportNotes() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                Button("Import Notes…") { vm.importNotes() }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
+            }
         }
     }
 }
@@ -142,12 +148,17 @@ class EditorViewModel: ObservableObject {
     @Published var editingTabId: UUID?
     @Published var draggingTabId: UUID?
     @Published var isRecording = false
+    @Published var isSavingRecording = false
     @Published var recordPermissionDenied = false
     @Published var recordingTabId: UUID?
     @Published var recordingStartTime: Date?
     @Published var currentRecordingPath: String?
+    @Published var selectedLanguage: TranscriptLanguage = .auto
+    @Published var isTranscribing = false
+    @Published var isSummarizing = false
 
     let recordingManager = RecordingManager()
+    let deepgramClient = DeepgramClient()
 
     var activeTab: NoteTab? { tabs.first { $0.id == activeTabId } }
     var attributedText = NSMutableAttributedString()
@@ -160,6 +171,7 @@ class EditorViewModel: ObservableObject {
     var lastTabsModDate: Date?
     private var deletedTabIds: Set<String> = []
     private var isSavingInternally = false
+    private var suppressSaveAfterReload = false
 
     init() {
         loadOrCreateNote()
@@ -250,6 +262,8 @@ class EditorViewModel: ObservableObject {
                 if diskTab.html != currentHTML && !diskTab.html.isEmpty {
                     currentHTML = diskTab.html
                     existing.html = diskTab.html
+                    lastSavedHTML = diskTab.html
+                    suppressSaveAfterReload = true
                     if let attrStr = htmlToAttributedString(diskTab.html) {
                         isLoadingContent = true
                         attributedText = NSMutableAttributedString(attributedString: attrStr)
@@ -360,6 +374,11 @@ class EditorViewModel: ObservableObject {
         if id == recordingTabId && isRecording { return }
         deletedTabIds.insert(id.uuidString.uppercased())
 
+        // Delete associated recording file from disk
+        if let recPath = tabs[index].recordingPath {
+            try? FileManager.default.removeItem(atPath: recPath)
+        }
+
         // Switch away if deleting the active tab
         if activeTabId == id {
             let newIndex = index > 0 ? index - 1 : 1
@@ -393,6 +412,10 @@ class EditorViewModel: ObservableObject {
 
     func textDidChange(html: String, length: Int) {
         guard !isLoadingContent else { return }
+        if suppressSaveAfterReload {
+            suppressSaveAfterReload = false
+            return
+        }
         charCount = length
         currentHTML = html
         activeTab?.html = html
@@ -432,40 +455,113 @@ class EditorViewModel: ObservableObject {
     }
 
     func startRecording() async {
-        let ok = await recordingManager.checkAndRequestPermissions()
-        if !ok { recordPermissionDenied = true; return }
-        recordPermissionDenied = false
-
-        if let current = activeTab { current.html = currentHTML }
-
+        // Create a new tab for the recording
         let formatter = DateFormatter()
-        formatter.dateFormat = "dd.MM - HH:mm"
-        let tab = NoteTab(title: formatter.string(from: Date()))
-        tabs.append(tab)
+        formatter.dateFormat = "dd.MM HH:mm"
+        let title = "Recording \(formatter.string(from: Date()))"
+        addTab()
+        activeTab?.title = title
+
+        guard let tab = activeTab else { return }
+
         recordingTabId = tab.id
-        activeTabId = tab.id
-        currentHTML = ""
-        currentRecordingPath = nil
         isRecording = true
         recordingStartTime = Date()
         saveTabsLocal()
+
+        // Check permissions and start recording
+        let ok = await recordingManager.checkAndRequestPermissions()
+        if !ok {
+            recordPermissionDenied = true
+            isRecording = false
+            recordingStartTime = nil
+            recordingTabId = nil
+            return
+        }
+        recordPermissionDenied = false
 
         await recordingManager.start()
     }
 
     func stopRecording() async {
-        guard let url = await recordingManager.stop() else {
-            isRecording = false
-            return
-        }
         isRecording = false
         recordingStartTime = nil
-        currentRecordingPath = url.path
+        isSavingRecording = true
 
+        // stop() now returns quickly (mic file only, system audio cleanup is background)
+        guard let url = await recordingManager.stop() else {
+            isSavingRecording = false
+            recordingTabId = nil
+            return
+        }
+        isSavingRecording = false
+        currentRecordingPath = url.path
         if let tabId = recordingTabId, let tab = tabs.first(where: { $0.id == tabId }) {
             tab.recordingPath = url.path
         }
         recordingTabId = nil
+        saveTabsLocal()
+    }
+
+    func transcribeRecording() async {
+        dbg("transcribe: CALLED, currentPath=\(currentRecordingPath ?? "nil") tabPath=\(activeTab?.recordingPath ?? "nil")")
+        let path = currentRecordingPath ?? activeTab?.recordingPath
+        guard let path, let client = deepgramClient else {
+            dbg("transcribe: guard failed — path=\(path ?? "nil") client=\(deepgramClient != nil)")
+            return
+        }
+        let fileURL = URL(fileURLWithPath: path)
+        isTranscribing = true
+        status = "Transcribing…"
+        guard let result = await client.transcribe(fileURL: fileURL, language: selectedLanguage, includeSummary: false) else {
+            isTranscribing = false
+            status = "Transcription failed"
+            return
+        }
+        isTranscribing = false
+        status = "Transcription done"
+        insertTextIntoEditor(result.transcript)
+    }
+
+    func summarizeRecording() async {
+        let path = currentRecordingPath ?? activeTab?.recordingPath
+        guard let path, let client = deepgramClient else { return }
+        let fileURL = URL(fileURLWithPath: path)
+        isSummarizing = true
+        guard let result = await client.transcribe(fileURL: fileURL, language: .english, includeSummary: true) else {
+            isSummarizing = false
+            return
+        }
+        isSummarizing = false
+        if let summary = result.summary {
+            insertTextIntoEditor("Summary:\n\(summary)")
+        }
+    }
+
+    private func insertTextIntoEditor(_ text: String) {
+        let newHtml = text.components(separatedBy: "\n").map { line in
+            let escaped = line.replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+            return "<p>\(escaped.isEmpty ? "<br>" : escaped)</p>"
+        }.joined()
+
+        let existing = currentHTML.trimmingCharacters(in: .whitespacesAndNewlines)
+        let html: String
+        if existing.isEmpty {
+            html = newHtml
+        } else {
+            html = existing + "<hr>" + newHtml
+        }
+
+        currentHTML = html
+        activeTab?.html = html
+        if let attrStr = htmlToAttributedString(html) {
+            attributedText = NSMutableAttributedString(attributedString: attrStr)
+            charCount = attributedText.length
+            onContentLoaded?(attributedText)
+        }
+        saveLocal(html: html)
         saveTabsLocal()
     }
 
@@ -481,6 +577,64 @@ class EditorViewModel: ObservableObject {
 
     private func loadLocal() -> String? {
         try? String(contentsOfFile: LOCAL_SAVE_PATH, encoding: .utf8)
+    }
+
+    // MARK: - Import / Export
+
+    func exportNotes() {
+        // Commit current editor state before exporting
+        if let current = activeTab {
+            current.html = currentHTML
+            current.lastSavedHTML = lastSavedHTML
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Notes"
+        panel.nameFieldStringValue = "floatnote-export.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let data = tabs.map { $0.toData() }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let json = try encoder.encode(data)
+            try json.write(to: url)
+            status = "Exported \(tabs.count) note(s)"
+        } catch {
+            status = "Export failed"
+        }
+    }
+
+    func importNotes() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Notes"
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            let data = try Data(contentsOf: url)
+            let imported = try JSONDecoder().decode([TabData].self, from: data)
+            guard !imported.isEmpty else { status = "No notes in file"; return }
+
+            // Assign new IDs to avoid collisions with existing tabs
+            for td in imported {
+                let tab = NoteTab(title: td.title)
+                tab.html = td.html
+                tab.recordingPath = td.recordingPath
+                tabs.append(tab)
+            }
+
+            // Switch to the first imported tab
+            let firstImportedIndex = tabs.count - imported.count
+            switchTab(tabs[firstImportedIndex].id)
+
+            saveTabsLocal()
+            status = "Imported \(imported.count) note(s)"
+        } catch {
+            status = "Import failed – invalid file"
+        }
     }
 
     func htmlToAttributedString(_ html: String) -> NSAttributedString? {
@@ -507,19 +661,141 @@ class EditorViewModel: ObservableObject {
     }
 }
 
-// MARK: - Recording Manager
+// MARK: - Deepgram Client
+
+enum TranscriptLanguage: String, CaseIterable {
+    case auto = "auto"
+    case english = "en"
+    case turkish = "tr"
+
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .english: return "English"
+        case .turkish: return "Turkish"
+        }
+    }
+}
+
+struct DeepgramResult {
+    var transcript: String   // diarized speaker-formatted text
+    var summary: String?     // summarize=v2 result (English only)
+}
+
+class DeepgramClient {
+    private let apiKey: String
+
+    init?() {
+        let keyPath = NSHomeDirectory() + "/.floatnote-deepgram.key"
+        guard let key = try? String(contentsOfFile: keyPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              !key.isEmpty else { return nil }
+        self.apiKey = key
+    }
+
+    func transcribe(fileURL: URL, language: TranscriptLanguage, includeSummary: Bool) async -> DeepgramResult? {
+        guard let audioData = try? Data(contentsOf: fileURL) else { return nil }
+
+        var params = "model=nova-3&diarize=true&smart_format=true&punctuate=true&utterances=true"
+        if language == .auto {
+            params += "&language=multi"
+        } else {
+            params += "&language=\(language.rawValue)"
+        }
+        if includeSummary {
+            params += "&summarize=v2"
+        }
+
+        guard let url = URL(string: "https://api.deepgram.com/v1/listen?\(params)") else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("audio/m4a", forHTTPHeaderField: "Content-Type")
+        request.httpBody = audioData
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let httpResp = response as? HTTPURLResponse else {
+            dbg("deepgram: request failed")
+            return nil
+        }
+        guard httpResp.statusCode == 200 else {
+            dbg("deepgram: HTTP \(httpResp.statusCode) — \(String(data: data, encoding: .utf8) ?? "")")
+            return nil
+        }
+
+        return parseResponse(data)
+    }
+
+    private func parseResponse(_ data: Data) -> DeepgramResult? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let results = json["results"] as? [String: Any] else { return nil }
+
+        // Build diarized transcript from utterances (preferred) or channel words
+        var transcript = ""
+
+        if let utterances = results["utterances"] as? [[String: Any]] {
+            // Utterances give us speaker-labeled segments
+            for utt in utterances {
+                let speaker = utt["speaker"] as? Int ?? 0
+                let text = utt["transcript"] as? String ?? ""
+                transcript += "Speaker \(speaker): \(text)\n\n"
+            }
+        } else if let channels = results["channels"] as? [[String: Any]],
+                  let firstChannel = channels.first,
+                  let alternatives = firstChannel["alternatives"] as? [[String: Any]],
+                  let firstAlt = alternatives.first {
+            // Fallback: build from words with speaker labels
+            if let words = firstAlt["words"] as? [[String: Any]] {
+                var currentSpeaker = -1
+                var currentLine = ""
+                for word in words {
+                    let speaker = word["speaker"] as? Int ?? 0
+                    let w = word["punctuated_word"] as? String ?? word["word"] as? String ?? ""
+                    if speaker != currentSpeaker {
+                        if !currentLine.isEmpty {
+                            transcript += "Speaker \(currentSpeaker): \(currentLine.trimmingCharacters(in: .whitespaces))\n\n"
+                        }
+                        currentSpeaker = speaker
+                        currentLine = w
+                    } else {
+                        currentLine += " \(w)"
+                    }
+                }
+                if !currentLine.isEmpty {
+                    transcript += "Speaker \(currentSpeaker): \(currentLine.trimmingCharacters(in: .whitespaces))\n\n"
+                }
+            } else {
+                transcript = firstAlt["transcript"] as? String ?? ""
+            }
+        }
+
+        // Extract summary if present
+        var summary: String? = nil
+        if let summaryObj = results["summary"] as? [String: Any],
+           let shortSummary = summaryObj["short"] as? String {
+            summary = shortSummary
+        }
+
+        return DeepgramResult(transcript: transcript.trimmingCharacters(in: .whitespacesAndNewlines), summary: summary)
+    }
+}
+
+// MARK: - Recording Manager (Core Audio Taps + AVAudioRecorder)
 
 class RecordingManager: NSObject, ObservableObject {
     @Published var isRecording = false
     @Published var permissionDenied = false
 
-    private let writeQueue = DispatchQueue(label: "com.floatnote.audiowrite", qos: .userInteractive)
+    // Background cleanup task from previous stop
+    private var cleanupTask: Task<Void, Never>?
+
+    // System audio capture (ScreenCaptureKit)
     private var scStream: SCStream?
-    private var sysWriter: AVAssetWriter?
-    private var sysAudioInput: AVAssetWriterInput?
-    private var sysWriterStarted = false
-    private var micRecorder: AVAudioRecorder?
+    private var scDelegate: SystemAudioDelegate?
     private var systemTempURL: URL?
+
+    // Mic
+    private var micRecorder: AVAudioRecorder?
     private var micTempURL: URL?
 
     static let recordingsDir = NSHomeDirectory() + "/.floatnote-recordings"
@@ -539,7 +815,6 @@ class RecordingManager: NSObject, ObservableObject {
                 return false
             }
         }
-        // SCStream handles screen capture permission prompt automatically on start
         DispatchQueue.main.async { self.permissionDenied = false }
         return true
     }
@@ -549,112 +824,245 @@ class RecordingManager: NSObject, ObservableObject {
     func start() async {
         try? FileManager.default.createDirectory(atPath: Self.recordingsDir, withIntermediateDirectories: true)
         let uuid = UUID().uuidString
-        systemTempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fn_sys_\(uuid).m4a")
+        systemTempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fn_sys_\(uuid).caf")
         micTempURL    = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fn_mic_\(uuid).m4a")
-        await startSystemCapture()
+
+        // Start mic first — this is instant and shows the mic icon
         startMicCapture()
         DispatchQueue.main.async { self.isRecording = true }
+
+        // Wait for any previous background cleanup, then start system audio
+        if let task = cleanupTask {
+            dbg("start: waiting for previous cleanup...")
+            await task.value
+            cleanupTask = nil
+            dbg("start: previous cleanup done")
+        }
+        await startSystemCapture()
     }
 
     private func startSystemCapture() async {
-        guard let sysURL = systemTempURL,
-              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false),
-              let display = content.displays.first else { return }
+        dbg("systemCapture: starting with ScreenCaptureKit...")
+        guard let sysURL = systemTempURL else { dbg("systemCapture: systemTempURL is nil"); return }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.sampleRate = 44100
-        config.channelCount = 2
-        config.excludesCurrentProcessAudio = false
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let display = content.displays.first else { dbg("systemCapture: no display found"); return }
 
-        let audioSettings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 44100.0,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 128000
-        ]
-        guard let writer = try? AVAssetWriter(outputURL: sysURL, fileType: .m4a) else { return }
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        input.expectsMediaDataInRealTime = true
-        writer.add(input)
-        writer.startWriting()
-        sysWriter = writer
-        sysAudioInput = input
-        sysWriterStarted = false
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try? stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: writeQueue)
-        try? await stream.startCapture()
-        scStream = stream
+            let config = SCStreamConfiguration()
+            config.capturesAudio = true
+            config.excludesCurrentProcessAudio = true
+            config.channelCount = 2
+            config.sampleRate = 48000
+            // Minimal video capture (OBS pattern: need both screen+audio outputs)
+            config.width = 2
+            config.height = 2
+            config.minimumFrameInterval = CMTime(value: 10, timescale: 1)
+
+            let delegate = SystemAudioDelegate(outputURL: sysURL)
+            scDelegate = delegate
+
+            let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+            // OBS pattern: add both screen and audio outputs
+            try stream.addStreamOutput(delegate, type: .screen, sampleHandlerQueue: .global(qos: .utility))
+            try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
+            try await stream.startCapture()
+            scStream = stream
+            dbg("systemCapture: ScreenCaptureKit stream started")
+        } catch {
+            dbg("systemCapture: failed: \(error)")
+        }
     }
 
     private func startMicCapture() {
-        guard let micURL = micTempURL else { return }
+        guard let micURL = micTempURL else {
+            dbg("startMicCapture: micTempURL is nil")
+            return
+        }
+        // Clean up any leftover recorder from a previous session
+        if micRecorder != nil {
+            micRecorder?.stop()
+            micRecorder = nil
+        }
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 44100.0,
             AVNumberOfChannelsKey: 1,
             AVEncoderBitRateKey: 64000
         ]
-        micRecorder = try? AVAudioRecorder(url: micURL, settings: settings)
-        micRecorder?.record()
+        do {
+            let recorder = try AVAudioRecorder(url: micURL, settings: settings)
+            recorder.prepareToRecord()
+            let started = recorder.record()
+            dbg("startMicCapture: created recorder, record()=\(started)")
+            micRecorder = recorder
+        } catch {
+            dbg("startMicCapture: failed to create recorder: \(error)")
+        }
     }
 
     // MARK: Stop
 
+    /// Quickly stops mic recording and returns the mic file immediately.
+    /// Stops recording, merges system+mic audio, returns merged file URL.
     func stop() async -> URL? {
         DispatchQueue.main.async { self.isRecording = false }
 
+        // 1. Stop mic
         micRecorder?.stop()
         micRecorder = nil
 
-        try? await scStream?.stopCapture()
+        // 2. Stop system audio capture
+        let stream = scStream
+        let delegate = scDelegate
+        let sysURL = systemTempURL
         scStream = nil
+        scDelegate = nil
 
-        writeQueue.sync { }  // drain any in-flight appends
-
-        sysAudioInput?.markAsFinished()
-        await sysWriter?.finishWriting()
-        sysWriter = nil
-        sysAudioInput = nil
+        if let stream {
+            try? await stream.stopCapture()
+            dbg("stop: SCStream stopped")
+        }
+        delegate?.closeFile()
 
         let outputURL = makeOutputURL()
-        guard let sysURL = systemTempURL, let micURL = micTempURL else { return nil }
-        let merged = await mergeAudio(systemURL: sysURL, micURL: micURL, to: outputURL)
-
-        try? FileManager.default.removeItem(at: sysURL)
-        try? FileManager.default.removeItem(at: micURL)
+        guard let micURL = micTempURL else {
+            dbg("stop: micTempURL is nil")
+            return nil
+        }
         systemTempURL = nil
         micTempURL = nil
 
-        return merged ? outputURL : nil
+        // 3. Merge system + mic audio (synchronous — fast PCM mix)
+        var merged = false
+        if let sysURL, FileManager.default.fileExists(atPath: sysURL.path) {
+            merged = await mergeAudio(systemURL: sysURL, micURL: micURL, to: outputURL)
+            if merged {
+                dbg("stop: merge succeeded -> \(outputURL.path)")
+            }
+            try? FileManager.default.removeItem(at: sysURL)
+        }
+
+        // 4. Fallback: use mic-only file if merge failed
+        if !merged {
+            do {
+                try FileManager.default.copyItem(at: micURL, to: outputURL)
+                dbg("stop: mic-only fallback -> \(outputURL.path)")
+            } catch {
+                dbg("stop: mic copy failed: \(error)")
+                try? FileManager.default.removeItem(at: micURL)
+                return nil
+            }
+        }
+        try? FileManager.default.removeItem(at: micURL)
+
+        dbg("stop: returning url=\(outputURL.path) merged=\(merged)")
+        return outputURL
+    }
+
+    private func cleanupSystemAudio() {
+        if let stream = scStream {
+            Task { try? await stream.stopCapture() }
+        }
+        scDelegate?.closeFile()
+        scStream = nil
+        scDelegate = nil
+        if let sysURL = systemTempURL { try? FileManager.default.removeItem(at: sysURL) }
+        if let micURL = micTempURL { try? FileManager.default.removeItem(at: micURL) }
+        systemTempURL = nil
+        micTempURL = nil
     }
 
     // MARK: Merge
 
     private func mergeAudio(systemURL: URL, micURL: URL, to outputURL: URL) async -> Bool {
-        let composition = AVMutableComposition()
+        dbg("merge: PCM-level mix starting...")
+        do {
+            // Read both files — AVAudioFile decodes to Float32 PCM automatically
+            let sysFile = try AVAudioFile(forReading: systemURL)
+            let micFile = try AVAudioFile(forReading: micURL)
+            let sysFmt = sysFile.processingFormat
+            let micFmt = micFile.processingFormat
+            dbg("merge: sys=\(sysFmt.sampleRate)Hz \(sysFmt.channelCount)ch, mic=\(micFmt.sampleRate)Hz \(micFmt.channelCount)ch")
 
-        let sysAsset = AVAsset(url: systemURL)
-        if let sysTrack = try? await sysAsset.loadTracks(withMediaType: .audio).first,
-           let compTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid),
-           let dur = try? await sysAsset.load(.duration) {
-            try? compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: sysTrack, at: .zero)
+            let sysFrames = AVAudioFrameCount(sysFile.length)
+            let micFrames = AVAudioFrameCount(micFile.length)
+
+            // Read system audio
+            guard let sysBuf = AVAudioPCMBuffer(pcmFormat: sysFmt, frameCapacity: sysFrames) else { return false }
+            try sysFile.read(into: sysBuf)
+
+            // Read mic audio
+            guard let micBuf = AVAudioPCMBuffer(pcmFormat: micFmt, frameCapacity: micFrames) else { return false }
+            try micFile.read(into: micBuf)
+
+            // Output format matches system audio (48kHz stereo Float32)
+            let outFormat = sysFmt
+            // Calculate mic frame count at output sample rate
+            let micFramesResampled = AVAudioFrameCount(Double(micFrames) * outFormat.sampleRate / micFmt.sampleRate)
+            let maxFrames = max(sysFrames, micFramesResampled)
+
+            // Resample mic if needed using AVAudioConverter
+            let micResampled: AVAudioPCMBuffer
+            if micFmt.sampleRate != outFormat.sampleRate || micFmt.channelCount != outFormat.channelCount {
+                guard let converter = AVAudioConverter(from: micFmt, to: outFormat) else {
+                    dbg("merge: failed to create converter"); return false
+                }
+                guard let buf = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: micFramesResampled + 1024) else { return false }
+                var error: NSError?
+                var allRead = false
+                converter.convert(to: buf, error: &error) { _, outStatus in
+                    if allRead {
+                        outStatus.pointee = .endOfStream
+                        return nil
+                    }
+                    outStatus.pointee = .haveData
+                    allRead = true
+                    return micBuf
+                }
+                if let error { dbg("merge: converter error: \(error)") }
+                micResampled = buf
+                dbg("merge: mic resampled to \(buf.frameLength) frames")
+            } else {
+                micResampled = micBuf
+            }
+
+            // Mix into output buffer
+            guard let outBuf = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: maxFrames) else { return false }
+            outBuf.frameLength = maxFrames
+
+            let sysData = sysBuf.floatChannelData!
+            let micData = micResampled.floatChannelData!
+            let outData = outBuf.floatChannelData!
+            let sysLen = Int(sysBuf.frameLength)
+            let micLen = Int(micResampled.frameLength)
+
+            for ch in 0..<Int(outFormat.channelCount) {
+                let sysCh = ch < Int(sysFmt.channelCount) ? ch : 0
+                let micCh = ch < Int(micResampled.format.channelCount) ? ch : 0
+                for i in 0..<Int(maxFrames) {
+                    let s: Float = i < sysLen ? sysData[sysCh][i] : 0
+                    let m: Float = i < micLen ? micData[micCh][i] : 0
+                    outData[ch][i] = s + m
+                }
+            }
+
+            // Write as M4A
+            let outFile = try AVAudioFile(forWriting: outputURL, settings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: outFormat.sampleRate,
+                AVNumberOfChannelsKey: outFormat.channelCount,
+                AVEncoderBitRateKey: 256000
+            ], commonFormat: .pcmFormatFloat32, interleaved: false)
+            try outFile.write(from: outBuf)
+            dbg("merge: PCM mix succeeded, \(maxFrames) frames written")
+            return true
+        } catch {
+            dbg("merge: PCM mix FAILED: \(error)")
+            return false
         }
-
-        let micAsset = AVAsset(url: micURL)
-        if let micTrack = try? await micAsset.loadTracks(withMediaType: .audio).first,
-           let compTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid),
-           let dur = try? await micAsset.load(.duration) {
-            try? compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: micTrack, at: .zero)
-        }
-
-        guard let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else { return false }
-        export.outputURL = outputURL
-        export.outputFileType = .m4a
-        await export.export()
-        return export.status == .completed
     }
 
     // MARK: Filename
@@ -674,20 +1082,63 @@ class RecordingManager: NSObject, ObservableObject {
     }
 }
 
-extension RecordingManager: SCStreamOutput, SCStreamDelegate {
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio,
-              let input = sysAudioInput, input.isReadyForMoreMediaData,
-              let writer = sysWriter else { return }
-        if !sysWriterStarted {
-            writer.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
-            sysWriterStarted = true
-        }
-        input.append(sampleBuffer)
+// MARK: - ScreenCaptureKit Audio Delegate
+
+class SystemAudioDelegate: NSObject, SCStreamOutput {
+    private var audioFile: AVAudioFile?
+    private var cachedFormat: AVAudioFormat?
+    private let outputURL: URL
+    private var callbackCount = 0
+
+    init(outputURL: URL) {
+        self.outputURL = outputURL
+        super.init()
     }
 
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        DispatchQueue.main.async { self.isRecording = false }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        // Only process audio buffers
+        guard type == .audio, sampleBuffer.isValid, sampleBuffer.numSamples > 0 else { return }
+
+        guard let formatDesc = sampleBuffer.formatDescription,
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return }
+
+        let format: AVAudioFormat
+        if let cached = cachedFormat {
+            format = cached
+        } else {
+            guard let f = AVAudioFormat(streamDescription: asbdPtr) else { return }
+            cachedFormat = f
+            format = f
+        }
+
+        // Lazy-init audio file on first callback
+        if audioFile == nil {
+            audioFile = try? AVAudioFile(forWriting: outputURL, settings: format.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            if audioFile != nil {
+                dbg("scDelegate: audio file created, \(format.sampleRate)Hz \(format.channelCount)ch")
+            } else {
+                dbg("scDelegate: failed to create audio file")
+                return
+            }
+        }
+
+        // Convert CMSampleBuffer to AVAudioPCMBuffer
+        let frameCount = AVAudioFrameCount(sampleBuffer.numSamples)
+        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
+        pcmBuffer.frameLength = frameCount
+
+        let abl = pcmBuffer.mutableAudioBufferList
+        let copyErr = CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: Int32(frameCount), into: abl)
+        guard copyErr == noErr else { return }
+
+        callbackCount += 1
+
+        try? audioFile?.write(from: pcmBuffer)
+    }
+
+    func closeFile() {
+        dbg("scDelegate: closed, total cb=\(callbackCount)")
+        audioFile = nil
     }
 }
 
@@ -705,8 +1156,26 @@ struct EditorView: View {
             if vm.isRecording && vm.activeTabId == vm.recordingTabId {
                 RecordingInProgressView(startTime: vm.recordingStartTime ?? Date())
                 Divider()
-            } else if let path = vm.currentRecordingPath {
+            } else if vm.isSavingRecording {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Saving recording…")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.bar)
+                .task {
+                    // Auto-dismiss after 10s if background stop hangs
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    vm.isSavingRecording = false
+                }
+                Divider()
+            } else if let path = vm.activeTab?.recordingPath {
                 RecordingPlayerView(fileURL: URL(fileURLWithPath: path))
+                    .id(path)  // Force recreation when tab/path changes
                 Divider()
             }
             RichTextEditor()
@@ -902,10 +1371,16 @@ struct TabItemView: View {
                     }
                     .onAppear { isFieldFocused = true }
             } else {
-                Text(tab.title)
-                    .font(.system(size: 11, weight: isActive ? .semibold : .regular))
-                    .foregroundColor(isActive ? .primary : .secondary)
-                    .lineLimit(1)
+                HStack(spacing: 3) {
+                    if tab.recordingPath != nil {
+                        Text("\u{1F3A4}")
+                            .font(.system(size: 9))
+                    }
+                    Text(tab.title)
+                        .font(.system(size: 11, weight: isActive ? .semibold : .regular))
+                        .foregroundColor(isActive ? .primary : .secondary)
+                        .lineLimit(1)
+                }
             }
         }
         .padding(.horizontal, 10)
@@ -1252,30 +1727,30 @@ struct RecordingInProgressView: View {
     @EnvironmentObject var vm: EditorViewModel
 
     var body: some View {
-        TimelineView(.periodic(from: startTime, by: 1.0)) { context in
-            let elapsed = context.date.timeIntervalSince(startTime)
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(.red)
-                    .frame(width: 8, height: 8)
-                Text("Recording in progress")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+        HStack(spacing: 8) {
+            Circle()
+                .fill(.red)
+                .frame(width: 8, height: 8)
+            Text("Recording in progress")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            TimelineView(.periodic(from: startTime, by: 1.0)) { context in
+                let elapsed = context.date.timeIntervalSince(startTime)
                 Text(timeString(elapsed))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
-                Spacer()
-                Button(action: { Task { await vm.stopRecording() } }) {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.system(size: 14))
-                        .foregroundColor(.red)
-                }
-                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.bar)
+            Spacer()
+            Button(action: { Task { await vm.stopRecording() } }) {
+                Image(systemName: "stop.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.red)
+            }
+            .buttonStyle(.plain)
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.bar)
     }
 
     private func timeString(_ s: TimeInterval) -> String {
@@ -1288,6 +1763,7 @@ struct RecordingInProgressView: View {
 
 struct RecordingPlayerView: View {
     let fileURL: URL
+    @EnvironmentObject var vm: EditorViewModel
     @State private var player: AVPlayer?
     @State private var isPlaying = false
     @State private var currentTime: Double = 0
@@ -1304,39 +1780,100 @@ struct RecordingPlayerView: View {
                 .foregroundColor(.secondary)
                 .padding(.vertical, 6)
         } else {
-            HStack(spacing: 8) {
-                Button { togglePlay() } label: {
-                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(.primary)
+            VStack(spacing: 0) {
+                // Player controls row
+                HStack(spacing: 8) {
+                    Button { togglePlay() } label: {
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 11))
+                            .foregroundColor(.primary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button { stopPlay() } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 11))
+                            .foregroundColor(.primary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Slider(value: Binding(get: { currentTime }, set: { seek(to: $0) }),
+                           in: 0...max(duration, 1))
+                        .controlSize(.small)
+
+                    Text("\(timeString(currentTime)) / \(timeString(duration))")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(minWidth: 70, alignment: .trailing)
+
+                    Button("Open Folder") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: RecordingManager.recordingsDir))
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10))
+                    .foregroundColor(.accentColor)
                 }
-                .buttonStyle(.plain)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
 
-                Button { stopPlay() } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(.primary)
+                // Deepgram transcription row
+                if vm.deepgramClient != nil {
+                    Divider()
+                    HStack(spacing: 8) {
+                        Picker("", selection: $vm.selectedLanguage) {
+                            ForEach(TranscriptLanguage.allCases, id: \.self) { lang in
+                                Text(lang.label).tag(lang)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 80)
+                        .controlSize(.small)
+
+                        Button {
+                            dbg("TRANSCRIPT BUTTON TAPPED")
+                            Task { await vm.transcribeRecording() }
+                        } label: {
+                            HStack(spacing: 4) {
+                                if vm.isTranscribing {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .scaleEffect(0.6)
+                                }
+                                Text(vm.isTranscribing ? "Transcribing..." : "Transcript")
+                            }
+                            .font(.system(size: 10, weight: .medium))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(vm.isTranscribing ? .secondary : .accentColor)
+                        .disabled(vm.isTranscribing || vm.isSummarizing)
+
+                        Button {
+                            Task { await vm.summarizeRecording() }
+                        } label: {
+                            HStack(spacing: 4) {
+                                if vm.isSummarizing {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .scaleEffect(0.6)
+                                }
+                                Text(vm.isSummarizing ? "Summarizing..." : "Summary")
+                            }
+                            .font(.system(size: 10, weight: .medium))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(vm.isSummarizing ? .secondary : .accentColor)
+                        .disabled(vm.isTranscribing || vm.isSummarizing || vm.selectedLanguage == .turkish)
+                        .help(vm.selectedLanguage == .turkish ? "Summary is available for English only" : "Get AI summary")
+
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
                 }
-                .buttonStyle(.plain)
-
-                Slider(value: Binding(get: { currentTime }, set: { seek(to: $0) }),
-                       in: 0...max(duration, 1))
-                    .controlSize(.small)
-
-                Text("\(timeString(currentTime)) / \(timeString(duration))")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .frame(minWidth: 70, alignment: .trailing)
-
-                Button("Open Folder") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: RecordingManager.recordingsDir))
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 10))
-                .foregroundColor(.accentColor)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
             .background(.bar)
         }
         }
