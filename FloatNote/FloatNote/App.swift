@@ -261,9 +261,18 @@ class EditorViewModel: ObservableObject {
             let memoryIds = Set(tabs.map { $0.id })
             for dt in diskTabs {
                 guard let diskId = UUID(uuidString: dt.id),
-                      !memoryIds.contains(diskId),
                       !deletedTabIds.contains(dt.id.uppercased()) else { continue }
-                tabs.append(NoteTab.from(dt))
+                if !memoryIds.contains(diskId) {
+                    // New tab from external source
+                    tabs.append(NoteTab.from(dt))
+                } else if diskId != activeTabId,
+                          let tab = tabs.first(where: { $0.id == diskId }),
+                          tab.html != dt.html {
+                    // External edit to non-active tab — adopt disk version
+                    tab.html = dt.html
+                    tab.title = dt.title
+                    tab.recordingPath = dt.recordingPath
+                }
             }
         }
         let data = tabs.map { $0.toData() }
