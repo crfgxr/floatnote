@@ -21,7 +21,11 @@ function readTabs() {
 }
 
 function writeTabs(tabs) {
-  fs.writeFileSync(TABS_PATH, JSON.stringify(tabs), "utf8");
+  const data = JSON.stringify(tabs);
+  // Write to a temp file first, then rename (atomic write)
+  const tmpPath = TABS_PATH + ".tmp";
+  fs.writeFileSync(tmpPath, data, "utf8");
+  fs.renameSync(tmpPath, TABS_PATH);
 }
 
 function stripHTML(html) {
