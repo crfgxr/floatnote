@@ -43,9 +43,11 @@ function stripHTML(html) {
 
 // --- MCP Server ---
 
+const MCP_VERSION = "1.1.0";
+
 const server = new McpServer({
   name: "floatnote",
-  version: "1.1.0",
+  version: MCP_VERSION,
 });
 
 /*
@@ -63,10 +65,10 @@ const server = new McpServer({
 server.tool("list_notes", "List all FloatNote tabs with their IDs and titles. Each tab has: id (UUID), title, html (content), recordingPath (optional .m4a path for audio recordings).", {}, async () => {
   const tabs = readTabs();
   if (tabs.length === 0) {
-    return { content: [{ type: "text", text: "No notes found." }] };
+    return { content: [{ type: "text", text: `FloatNote MCP v${MCP_VERSION} — No notes found.` }] };
   }
   const list = tabs.map((t, i) => `${i + 1}. [${t.id}] ${t.title}`).join("\n");
-  return { content: [{ type: "text", text: list }] };
+  return { content: [{ type: "text", text: `FloatNote MCP v${MCP_VERSION}\n\n${list}` }] };
 });
 
 server.tool(
