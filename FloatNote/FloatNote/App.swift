@@ -242,10 +242,23 @@ class EditorViewModel: ObservableObject {
         // Remove tabs deleted from disk (except active)
         tabs.removeAll { !diskIds.contains($0.id) && $0.id != currentActiveId }
 
-        // Refresh non-active tab content from disk
+        // Refresh tab content from disk
         for diskTab in newTabs {
-            if diskTab.id != currentActiveId,
-               let existing = tabs.first(where: { $0.id == diskTab.id }) {
+            guard let existing = tabs.first(where: { $0.id == diskTab.id }) else { continue }
+            if diskTab.id == currentActiveId {
+                // Active tab: reload editor if content changed externally
+                if diskTab.html != currentHTML && !diskTab.html.isEmpty {
+                    currentHTML = diskTab.html
+                    existing.html = diskTab.html
+                    if let attrStr = htmlToAttributedString(diskTab.html) {
+                        isLoadingContent = true
+                        attributedText = NSMutableAttributedString(attributedString: attrStr)
+                        charCount = attributedText.length
+                        onContentLoaded?(attributedText)
+                        DispatchQueue.main.async { self.isLoadingContent = false }
+                    }
+                }
+            } else {
                 existing.html = diskTab.html
                 existing.title = diskTab.title
                 existing.recordingPath = diskTab.recordingPath
