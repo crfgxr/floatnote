@@ -42,10 +42,19 @@ struct FloatNoteApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var vm: EditorViewModel?
+    private var fileWatchTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
         dbg("APP LAUNCHED")
+
+        // Poll tabs file for external changes (e.g. from MCP server)
+        fileWatchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let vm = self?.vm else { return }
+            MainActor.assumeIsolated {
+                vm.checkExternalTabChanges()
+            }
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -148,18 +157,11 @@ class EditorViewModel: ObservableObject {
 
     private var lastSavedHTML: String = ""
     private var currentHTML: String = ""
-    private var fileWatcher: DispatchSourceFileSystemObject?
-    private var fileWatcherFd: Int32 = -1
+    var lastTabsModDate: Date?
     private var isSavingInternally = false
 
     init() {
         loadOrCreateNote()
-        startFileWatcher()
-    }
-
-    deinit {
-        fileWatcher?.cancel()
-        if fileWatcherFd >= 0 { close(fileWatcherFd) }
     }
 
     private func loadOrCreateNote() {
@@ -193,6 +195,7 @@ class EditorViewModel: ObservableObject {
             onContentLoaded?(attributedText)
         }
         status = currentHTML.isEmpty ? "Ready" : "Loaded"
+        lastTabsModDate = tabsFileModDate()
     }
 
     private func loadTabsLocal() {
@@ -201,20 +204,17 @@ class EditorViewModel: ObservableObject {
         tabs = tabsData.map { NoteTab.from($0) }
     }
 
-    private func startFileWatcher() {
-        fileWatcherFd = open(LOCAL_TABS_PATH, O_EVTONLY)
-        guard fileWatcherFd >= 0 else { return }
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileWatcherFd,
-            eventMask: .write,
-            queue: DispatchQueue.main
-        )
-        source.setEventHandler { [weak self] in
-            self?.reloadTabsFromDisk()
+    func checkExternalTabChanges() {
+        if isSavingInternally { return }
+        let current = tabsFileModDate()
+        if let current, current != lastTabsModDate {
+            lastTabsModDate = current
+            reloadTabsFromDisk()
         }
-        source.resume()
-        fileWatcher = source
+    }
+
+    private func tabsFileModDate() -> Date? {
+        try? FileManager.default.attributesOfItem(atPath: LOCAL_TABS_PATH)[.modificationDate] as? Date
     }
 
     private func reloadTabsFromDisk() {
@@ -254,10 +254,19 @@ class EditorViewModel: ObservableObject {
 
     func saveTabsLocal() {
         isSavingInternally = true
+        // Merge externally-added tabs (e.g. from MCP) before saving
+        if let diskData = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_TABS_PATH)),
+           let diskTabs = try? JSONDecoder().decode([TabData].self, from: diskData) {
+            let memoryIds = Set(tabs.map { $0.id.uuidString })
+            for dt in diskTabs where !memoryIds.contains(dt.id) {
+                tabs.append(NoteTab.from(dt))
+            }
+        }
         let data = tabs.map { $0.toData() }
         if let json = try? JSONEncoder().encode(data) {
             try? json.write(to: URL(fileURLWithPath: LOCAL_TABS_PATH))
         }
+        lastTabsModDate = tabsFileModDate()
         DispatchQueue.main.async { self.isSavingInternally = false }
     }
 
@@ -1261,6 +1270,7 @@ struct RecordingPlayerView: View {
     @State private var fileExists = false
 
     var body: some View {
+        Group {
         if !fileExists {
             Text("Recording file not found")
                 .font(.system(size: 11))
@@ -1301,6 +1311,7 @@ struct RecordingPlayerView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(.bar)
+        }
         }
         .onAppear { setupPlayer() }
         .onDisappear { cleanup() }
