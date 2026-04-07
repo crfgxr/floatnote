@@ -258,8 +258,11 @@ class EditorViewModel: ObservableObject {
         // Merge externally-added tabs (e.g. from MCP) before saving
         if let diskData = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_TABS_PATH)),
            let diskTabs = try? JSONDecoder().decode([TabData].self, from: diskData) {
-            let memoryIds = Set(tabs.map { $0.id.uuidString })
-            for dt in diskTabs where !memoryIds.contains(dt.id) && !deletedTabIds.contains(dt.id) {
+            let memoryIds = Set(tabs.map { $0.id })
+            for dt in diskTabs {
+                guard let diskId = UUID(uuidString: dt.id),
+                      !memoryIds.contains(diskId),
+                      !deletedTabIds.contains(dt.id.uppercased()) else { continue }
                 tabs.append(NoteTab.from(dt))
             }
         }
@@ -333,7 +336,7 @@ class EditorViewModel: ObservableObject {
     func deleteTab(_ id: UUID) {
         guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         if id == recordingTabId && isRecording { return }
-        deletedTabIds.insert(id.uuidString)
+        deletedTabIds.insert(id.uuidString.uppercased())
 
         // Switch away if deleting the active tab
         if activeTabId == id {
