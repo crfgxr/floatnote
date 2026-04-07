@@ -148,9 +148,18 @@ class EditorViewModel: ObservableObject {
 
     private var lastSavedHTML: String = ""
     private var currentHTML: String = ""
+    private var fileWatcher: DispatchSourceFileSystemObject?
+    private var fileWatcherFd: Int32 = -1
+    private var isSavingInternally = false
 
     init() {
         loadOrCreateNote()
+        startFileWatcher()
+    }
+
+    deinit {
+        fileWatcher?.cancel()
+        if fileWatcherFd >= 0 { close(fileWatcherFd) }
     }
 
     private func loadOrCreateNote() {
@@ -192,11 +201,64 @@ class EditorViewModel: ObservableObject {
         tabs = tabsData.map { NoteTab.from($0) }
     }
 
+    private func startFileWatcher() {
+        fileWatcherFd = open(LOCAL_TABS_PATH, O_EVTONLY)
+        guard fileWatcherFd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileWatcherFd,
+            eventMask: .write,
+            queue: DispatchQueue.main
+        )
+        source.setEventHandler { [weak self] in
+            self?.reloadTabsFromDisk()
+        }
+        source.resume()
+        fileWatcher = source
+    }
+
+    private func reloadTabsFromDisk() {
+        guard !isSavingInternally else { return }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_TABS_PATH)),
+              let tabsData = try? JSONDecoder().decode([TabData].self, from: data) else { return }
+
+        // Cancel any pending save to avoid overwriting external changes
+        saveTimer?.invalidate()
+        saveTimer = nil
+
+        let newTabs = tabsData.map { NoteTab.from($0) }
+        let currentActiveId = activeTabId
+
+        // Merge: keep active tab's in-memory HTML if user is editing,
+        // but add any new tabs from disk (e.g. MCP-created)
+        let existingIds = Set(tabs.map { $0.id })
+        let diskIds = Set(newTabs.map { $0.id })
+
+        // Add new tabs that appeared on disk
+        for newTab in newTabs where !existingIds.contains(newTab.id) {
+            tabs.append(newTab)
+        }
+        // Remove tabs deleted from disk (except active)
+        tabs.removeAll { !diskIds.contains($0.id) && $0.id != currentActiveId }
+
+        // Refresh non-active tab content from disk
+        for diskTab in newTabs {
+            if diskTab.id != currentActiveId,
+               let existing = tabs.first(where: { $0.id == diskTab.id }) {
+                existing.html = diskTab.html
+                existing.title = diskTab.title
+                existing.recordingPath = diskTab.recordingPath
+            }
+        }
+    }
+
     func saveTabsLocal() {
+        isSavingInternally = true
         let data = tabs.map { $0.toData() }
         if let json = try? JSONEncoder().encode(data) {
             try? json.write(to: URL(fileURLWithPath: LOCAL_TABS_PATH))
         }
+        DispatchQueue.main.async { self.isSavingInternally = false }
     }
 
     // MARK: - Tab Management
