@@ -33,5 +33,6 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 - **Drag-to-reorder**: Click and drag list prefixes to reorder; blue insertion line shows drop target; dropped lines match target indentation
 - **Dictation auto-restart**: When mic is enabled, dictation auto-restarts after system timeout or when app regains focus
 - **Audio recording**: Record system audio (via ScreenCaptureKit) + microphone per tab, PCM-level merge, stored as .m4a in ~/.floatnote-recordings/
-- **Transcription**: Deepgram-powered transcription with multi-language support (English, Turkish)
+- **Transcription**: Deepgram-powered transcription with multi-language support (English, Turkish); 5-min timeout for large files
+- **AI Summary**: OpenRouter-powered meeting summary (transcribe → summarize via AI); models: `openai/gpt-oss-120b:free` primary, `minimax/minimax-m2.5:free` fallback; outputs plain text with FloatNote-native formatting (• bullets, ☐ action items); auto-retry with model fallback on rate limits; API key at `~/.floatnote-openrouter.key`
 - **Recording playback**: In-app audio player with seek, play/pause, stop; recordings linked to tabs

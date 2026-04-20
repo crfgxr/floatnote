@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.10.0"
+let APP_VERSION = "v1.11.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 
@@ -153,12 +153,13 @@ class EditorViewModel: ObservableObject {
     @Published var recordingTabId: UUID?
     @Published var recordingStartTime: Date?
     @Published var currentRecordingPath: String?
-    @Published var selectedLanguage: TranscriptLanguage = .auto
+    @Published var selectedLanguage: TranscriptLanguage = .turkish
     @Published var isTranscribing = false
     @Published var isSummarizing = false
 
     let recordingManager = RecordingManager()
     let deepgramClient = DeepgramClient()
+    let openRouterClient = OpenRouterClient()
 
     var activeTab: NoteTab? { tabs.first { $0.id == activeTabId } }
     var attributedText = NSMutableAttributedString()
@@ -525,17 +526,32 @@ class EditorViewModel: ObservableObject {
 
     func summarizeRecording() async {
         let path = currentRecordingPath ?? activeTab?.recordingPath
-        guard let path, let client = deepgramClient else { return }
+        guard let path, let deepgram = deepgramClient, let router = openRouterClient else {
+            dbg("summarize: guard failed — path=\(currentRecordingPath ?? activeTab?.recordingPath ?? "nil") deepgram=\(deepgramClient != nil) router=\(openRouterClient != nil)")
+            return
+        }
         let fileURL = URL(fileURLWithPath: path)
         isSummarizing = true
-        guard let result = await client.transcribe(fileURL: fileURL, language: .english, includeSummary: true) else {
+        status = "Transcribing…"
+
+        // Step 1: Transcribe audio via Deepgram
+        guard let result = await deepgram.transcribe(fileURL: fileURL, language: selectedLanguage, includeSummary: false) else {
+            isSummarizing = false
+            status = "Transcription failed"
+            return
+        }
+
+        // Step 2: Summarize transcript via OpenRouter
+        guard let summary = await router.summarize(transcript: result.transcript, language: selectedLanguage, onStatus: { [weak self] msg in
+            self?.status = msg
+        }) else {
             isSummarizing = false
             return
         }
+
         isSummarizing = false
-        if let summary = result.summary {
-            insertTextIntoEditor("Summary:\n\(summary)")
-        }
+        status = "Summary done"
+        insertTextIntoEditor(summary)
     }
 
     private func insertTextIntoEditor(_ text: String) {
@@ -664,13 +680,11 @@ class EditorViewModel: ObservableObject {
 // MARK: - Deepgram Client
 
 enum TranscriptLanguage: String, CaseIterable {
-    case auto = "auto"
-    case english = "en"
     case turkish = "tr"
+    case english = "en"
 
     var label: String {
         switch self {
-        case .auto: return "Auto"
         case .english: return "English"
         case .turkish: return "Turkish"
         }
@@ -680,6 +694,137 @@ enum TranscriptLanguage: String, CaseIterable {
 struct DeepgramResult {
     var transcript: String   // diarized speaker-formatted text
     var summary: String?     // summarize=v2 result (English only)
+}
+
+// MARK: - OpenRouter Client
+
+class OpenRouterClient {
+    private let apiKey: String
+    private let models = [
+        "openai/gpt-oss-120b:free",
+        "minimax/minimax-m2.5:free"
+    ]
+
+    init?() {
+        let keyPath = NSHomeDirectory() + "/.floatnote-openrouter.key"
+        guard let key = try? String(contentsOfFile: keyPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              !key.isEmpty else { return nil }
+        self.apiKey = key
+    }
+
+    func summarize(transcript: String, language: TranscriptLanguage, onStatus: @escaping (String) -> Void) async -> String? {
+        for (i, model) in models.enumerated() {
+            let shortName = model.components(separatedBy: "/").last?.replacingOccurrences(of: ":free", with: "") ?? model
+            onStatus("Summarizing via \(shortName)…")
+            dbg("openrouter: trying model \(model)")
+            if let result = await callModel(model: model, transcript: transcript, language: language, onStatus: onStatus, shortName: shortName) {
+                return result
+            }
+            if i < models.count - 1 {
+                onStatus("\(shortName) rate limited, trying next…")
+            }
+            dbg("openrouter: \(model) failed, trying next")
+        }
+        onStatus("All AI models rate limited")
+        dbg("openrouter: all models failed")
+        return nil
+    }
+
+    private func callModel(model: String, transcript: String, language: TranscriptLanguage, onStatus: @escaping (String) -> Void, shortName: String) async -> String? {
+        guard let url = URL(string: "https://openrouter.ai/api/v1/chat/completions") else { return nil }
+
+        let langInstruction: String
+        switch language {
+        case .turkish:
+            langInstruction = "Respond entirely in Turkish."
+        case .english:
+            langInstruction = "Respond entirely in English."
+        }
+
+        let systemPrompt = """
+            You are a meeting notes summarizer. Summarize the following meeting transcript into clear, structured meeting notes. \(langInstruction)
+
+            CRITICAL FORMATTING RULES — you MUST follow these exactly:
+            - Output ONLY plain text. NO markdown whatsoever. No **, no ## , no |tables|, no ---, no ```code```.
+            - For section headers, write them as a plain line in ALL CAPS or with a colon, e.g. "DECISIONS:" or "Action Items:"
+            - For bullet points, start the line with "• " (bullet character followed by a space)
+            - For action items/tasks, start the line with "☐ " (checkbox character followed by a space)
+            - Use blank lines to separate sections
+            - For sub-items, indent with 4 spaces before the bullet: "    • sub-item"
+            - Never use tables. Use bullet lists instead.
+            - Keep it concise and well-organized.
+
+            Structure the notes as:
+            1. Meeting title and date
+            2. Key discussion points (use • bullets)
+            3. Decisions made (use • bullets)
+            4. Action items with responsible person (use ☐ checkboxes)
+            """
+
+        let body: [String: Any] = [
+            "model": model,
+            "messages": [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user", "content": transcript]
+            ]
+        ]
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = jsonData
+
+        dbg("openrouter: sending \(transcript.count) chars, lang=\(language.rawValue), model=\(model)")
+
+        // Retry up to 2 times on 429 rate limit per model
+        for attempt in 1...2 {
+            if attempt > 1 {
+                onStatus("\(shortName) rate limited, retrying in 10s…")
+                dbg("openrouter: retry \(attempt)/2 after 10s for \(model)")
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                onStatus("Retrying \(shortName)…")
+            }
+
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await URLSession.shared.data(for: request)
+            } catch {
+                dbg("openrouter: request failed — \(error.localizedDescription)")
+                continue
+            }
+            guard let httpResp = response as? HTTPURLResponse else {
+                dbg("openrouter: not an HTTP response")
+                return nil
+            }
+            if httpResp.statusCode == 429 {
+                dbg("openrouter: 429 rate limited \(model) (attempt \(attempt)/2)")
+                continue
+            }
+            guard httpResp.statusCode == 200 else {
+                dbg("openrouter: HTTP \(httpResp.statusCode) — \(String(data: data, encoding: .utf8) ?? "")")
+                return nil
+            }
+
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let first = choices.first,
+                  let message = first["message"] as? [String: Any],
+                  let content = message["content"] as? String else {
+                dbg("openrouter: failed to parse response from \(model)")
+                return nil
+            }
+
+            dbg("openrouter: success with \(model)")
+            return content.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return nil
+    }
 }
 
 class DeepgramClient {
@@ -695,12 +840,7 @@ class DeepgramClient {
     func transcribe(fileURL: URL, language: TranscriptLanguage, includeSummary: Bool) async -> DeepgramResult? {
         guard let audioData = try? Data(contentsOf: fileURL) else { return nil }
 
-        var params = "model=nova-3&diarize=true&smart_format=true&punctuate=true&utterances=true"
-        if language == .auto {
-            params += "&language=multi"
-        } else {
-            params += "&language=\(language.rawValue)"
-        }
+        var params = "model=nova-3&diarize=true&smart_format=true&punctuate=true&utterances=true&language=\(language.rawValue)"
         if includeSummary {
             params += "&summarize=v2"
         }
@@ -711,11 +851,21 @@ class DeepgramClient {
         request.httpMethod = "POST"
         request.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("audio/m4a", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 300  // 5 min for large audio files
         request.httpBody = audioData
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let httpResp = response as? HTTPURLResponse else {
-            dbg("deepgram: request failed")
+        dbg("deepgram: uploading \(audioData.count) bytes, timeout=300s")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            dbg("deepgram: request failed — \(error.localizedDescription)")
+            return nil
+        }
+        guard let httpResp = response as? HTTPURLResponse else {
+            dbg("deepgram: not an HTTP response")
             return nil
         }
         guard httpResp.statusCode == 200 else {
@@ -1865,8 +2015,8 @@ struct RecordingPlayerView: View {
                         }
                         .buttonStyle(.plain)
                         .foregroundColor(vm.isSummarizing ? .secondary : .accentColor)
-                        .disabled(vm.isTranscribing || vm.isSummarizing || vm.selectedLanguage == .turkish)
-                        .help(vm.selectedLanguage == .turkish ? "Summary is available for English only" : "Get AI summary")
+                        .disabled(vm.isTranscribing || vm.isSummarizing)
+                        .help("Transcribe & summarize with AI")
 
                         Spacer()
                     }
