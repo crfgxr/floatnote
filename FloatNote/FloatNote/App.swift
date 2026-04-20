@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.11.0"
+let APP_VERSION = "v1.15.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 
@@ -85,12 +85,23 @@ struct WindowAccessor: NSViewRepresentable {
         let view = NSView()
         DispatchQueue.main.async {
             if let window = view.window {
-                window.minSize = NSSize(width: 50, height: 50)
+                window.title = "FloatNote"
+                window.titleVisibility = .hidden
+                window.titlebarAppearsTransparent = true
+                window.toolbar = nil
+                Self.applyMinSize(window: window, sidebarCollapsed: false)
             }
         }
         return view
     }
+
     func updateNSView(_ nsView: NSView, context: Context) {}
+
+    /// Small global minimum so the window never collapses to nothing;
+    /// responsive auto-hide of the sidebar lives in EditorView via GeometryReader.
+    static func applyMinSize(window: NSWindow, sidebarCollapsed: Bool) {
+        window.minSize = NSSize(width: 240, height: 180)
+    }
 }
 
 // MARK: - Format Actions
@@ -141,6 +152,19 @@ class EditorViewModel: ObservableObject {
     @Published var isSaving = false
     @Published var charCount: Int = 0
     @Published var isPinned: Bool = false
+    @Published var isSidebarCollapsed: Bool = UserDefaults.standard.bool(forKey: "fn.sidebarCollapsed") {
+        didSet { UserDefaults.standard.set(isSidebarCollapsed, forKey: "fn.sidebarCollapsed") }
+    }
+    /// True while the sidebar was closed by the auto-hide threshold (not the user).
+    /// Lets us re-open on resize without overriding a manual collapse.
+    @Published var isSidebarAutoHidden: Bool = false
+    /// User-resizable sidebar width, persisted across launches.
+    @Published var sidebarWidth: CGFloat = {
+        let v = UserDefaults.standard.double(forKey: "fn.sidebarWidth")
+        return v > 0 ? CGFloat(v) : 220
+    }() {
+        didSet { UserDefaults.standard.set(Double(sidebarWidth), forKey: "fn.sidebarWidth") }
+    }
     @Published var isDictating: Bool = false
     var wantsDictation: Bool = false  // user intent: keep dictation alive
     @Published var tabs: [NoteTab] = []
@@ -312,6 +336,19 @@ class EditorViewModel: ObservableObject {
     }
 
     // MARK: - Tab Management
+
+    /// Re-render the current note with fresh attributes (used after changing
+    /// body font size so existing content picks up the new scale).
+    func reloadActive() {
+        guard let id = activeTabId, let tab = tabs.first(where: { $0.id == id }) else { return }
+        isLoadingContent = true
+        if let attrStr = htmlToAttributedString(tab.html) {
+            attributedText = NSMutableAttributedString(attributedString: attrStr)
+            charCount = attributedText.length
+            onContentLoaded?(attributedText)
+        }
+        DispatchQueue.main.async { self.isLoadingContent = false }
+    }
 
     func switchTab(_ id: UUID) {
         guard id != activeTabId, let newTab = tabs.first(where: { $0.id == id }) else { return }
@@ -656,7 +693,7 @@ class EditorViewModel: ObservableObject {
     func htmlToAttributedString(_ html: String) -> NSAttributedString? {
         let styledHTML = """
         <html dir="ltr"><head><style>
-        body { font-family: 'Times New Roman', serif; font-size: 16px; color: #e0e0e0; direction: ltr; text-align: left; }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px; color: #e0e0e0; direction: ltr; text-align: left; }
         h1 { font-size: 28px; font-weight: 700; }
         h2 { font-size: 22px; font-weight: 600; }
         h3 { font-size: 18px; font-weight: 600; }
@@ -664,7 +701,7 @@ class EditorViewModel: ObservableObject {
         </style></head><body dir="ltr">\(html)</body></html>
         """
         guard let data = styledHTML.data(using: .utf8),
-              let attrStr = try? NSAttributedString(
+              let attrStr = try? NSMutableAttributedString(
                 data: data,
                 options: [
                     .documentType: NSAttributedString.DocumentType.html,
@@ -672,6 +709,34 @@ class EditorViewModel: ObservableObject {
                 ],
                 documentAttributes: nil
               ) else { return nil }
+
+        // Normalize legacy fonts to the new sans-serif defaults while preserving
+        // bold/italic traits and heading sizes. Old notes were saved at Times 16pt;
+        // we remap body-size ranges to 14pt so every note reads the same.
+        let full = NSRange(location: 0, length: attrStr.length)
+        attrStr.enumerateAttribute(.font, in: full, options: []) { value, range, _ in
+            guard let font = value as? NSFont else { return }
+            let traits = font.fontDescriptor.symbolicTraits
+            let originalSize = font.pointSize
+
+            // Heading buckets: snap to the current heading sizes.
+            // Non-heading sizes collapse to the 14pt body default.
+            let newSize: CGFloat
+            if originalSize >= 26 { newSize = 24 }
+            else if originalSize >= 20 { newSize = 19 }
+            else if originalSize >= 17 { newSize = 16 }
+            else { newSize = 14 }
+
+            var replacement = NSFont.systemFont(ofSize: newSize)
+            if traits.contains(.bold) && traits.contains(.italic) {
+                replacement = NSFontManager.shared.convert(NSFont.boldSystemFont(ofSize: newSize), toHaveTrait: .italicFontMask)
+            } else if traits.contains(.bold) {
+                replacement = NSFont.boldSystemFont(ofSize: newSize)
+            } else if traits.contains(.italic) {
+                replacement = NSFontManager.shared.convert(NSFont.systemFont(ofSize: newSize), toHaveTrait: .italicFontMask)
+            }
+            attrStr.addAttribute(.font, value: replacement, range: range)
+        }
 
         return attrStr
     }
@@ -1297,43 +1362,217 @@ class SystemAudioDelegate: NSObject, SCStreamOutput {
 struct EditorView: View {
     @EnvironmentObject var vm: EditorViewModel
 
+    /// Window widths below this force the sidebar closed even if the user had
+    /// it open; 220pt sidebar + ~340pt minimum editor room = 560pt.
+    private let sidebarAutoHideThreshold: CGFloat = 560
+
     var body: some View {
-        VStack(spacing: 0) {
-            FormatToolbar()
-            Divider()
-            TabBar()
-            Divider()
-            if vm.isRecording && vm.activeTabId == vm.recordingTabId {
-                RecordingInProgressView(startTime: vm.recordingStartTime ?? Date())
-                Divider()
-            } else if vm.isSavingRecording {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Saving recording…")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                    Spacer()
+        GeometryReader { geo in
+            content
+                .onAppear { evaluateAutoHide(width: geo.size.width) }
+                .onChange(of: geo.size.width) { _, newWidth in
+                    evaluateAutoHide(width: newWidth)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(.bar)
-                .task {
-                    // Auto-dismiss after 10s if background stop hangs
-                    try? await Task.sleep(nanoseconds: 10_000_000_000)
-                    vm.isSavingRecording = false
-                }
-                Divider()
-            } else if let path = vm.activeTab?.recordingPath {
-                RecordingPlayerView(fileURL: URL(fileURLWithPath: path))
-                    .id(path)  // Force recreation when tab/path changes
-                Divider()
+        }
+    }
+
+    private func evaluateAutoHide(width: CGFloat) {
+        let shouldAutoHide = width < sidebarAutoHideThreshold
+        if shouldAutoHide && !vm.isSidebarCollapsed {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                vm.isSidebarAutoHidden = true
+                vm.isSidebarCollapsed = true
             }
-            RichTextEditor()
-                .environmentObject(vm)
+        } else if !shouldAutoHide && vm.isSidebarAutoHidden {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                vm.isSidebarAutoHidden = false
+                vm.isSidebarCollapsed = false
+            }
+        }
+    }
+
+    private var content: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                if !vm.isSidebarCollapsed {
+                    NotesSidebar()
+                        .frame(width: vm.sidebarWidth)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                    SidebarResizeHandle()
+                        .environmentObject(vm)
+                }
+                VStack(spacing: 0) {
+                    FormatToolbar()
+                    Divider()
+                    if vm.isRecording && vm.activeTabId == vm.recordingTabId {
+                        RecordingInProgressView(startTime: vm.recordingStartTime ?? Date())
+                        Divider()
+                    } else if vm.isSavingRecording {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Saving recording…")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(.bar)
+                        .task {
+                            try? await Task.sleep(nanoseconds: 10_000_000_000)
+                            vm.isSavingRecording = false
+                        }
+                        Divider()
+                    } else if let path = vm.activeTab?.recordingPath {
+                        RecordingPlayerView(fileURL: URL(fileURLWithPath: path))
+                            .id(path)
+                        Divider()
+                    }
+                    RichTextEditor()
+                        .environmentObject(vm)
+                }
+            }
             Divider()
             StatusBar()
         }
         .frame(minWidth: 0, minHeight: 0)
+    }
+}
+
+// MARK: - Sidebar Resize Handle
+
+struct SidebarResizeHandle: View {
+    @EnvironmentObject var vm: EditorViewModel
+    @State private var isDragging = false
+    @State private var startWidth: CGFloat = 0
+
+    private let minWidth: CGFloat = 160
+    private let maxWidth: CGFloat = 420
+    private let hitWidth: CGFloat = 6
+
+    var body: some View {
+        ZStack {
+            // Hairline divider line for visual continuity
+            Rectangle()
+                .fill(Color.primary.opacity(0.1))
+                .frame(width: 1)
+            // Wider invisible hit-area for easy grabbing
+            Color.clear
+                .frame(width: hitWidth)
+                .contentShape(Rectangle())
+        }
+        .frame(width: hitWidth)
+        .onHover { hovering in
+            if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { value in
+                    if !isDragging {
+                        isDragging = true
+                        startWidth = vm.sidebarWidth
+                    }
+                    let proposed = startWidth + value.translation.width
+                    let clamped = min(maxWidth, max(minWidth, proposed))
+                    if abs(clamped - vm.sidebarWidth) > 0.5 {
+                        vm.sidebarWidth = clamped
+                    }
+                }
+                .onEnded { _ in isDragging = false }
+        )
+    }
+}
+
+// MARK: - Notes Sidebar
+
+struct NotesSidebar: View {
+    @EnvironmentObject var vm: EditorViewModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("NOTES")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .kerning(0.6)
+                Spacer()
+                Button(action: { vm.addTab() }) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11))
+                        .frame(width: 22, height: 22)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("New note")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(vm.tabs) { tab in
+                        SidebarNoteItemView(tab: tab)
+                            .id(tab.id)
+                    }
+                }
+                .padding(4)
+            }
+        }
+        .background(.bar)
+    }
+}
+
+struct SidebarNoteItemView: View {
+    @ObservedObject var tab: NoteTab
+    @EnvironmentObject var vm: EditorViewModel
+    @FocusState private var isFieldFocused: Bool
+
+    var isActive: Bool { vm.activeTabId == tab.id }
+    var isDragging: Bool { vm.draggingTabId == tab.id }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if tab.recordingPath != nil {
+                Text("\u{1F3A4}")
+                    .font(.system(size: 10))
+            }
+            if vm.editingTabId == tab.id {
+                TextField("", text: $tab.title)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .focused($isFieldFocused)
+                    .onSubmit { vm.renameTab(tab.id, title: tab.title) }
+                    .onAppear { isFieldFocused = true }
+            } else {
+                Text(tab.title)
+                    .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+                    .foregroundColor(isActive ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isActive ? Color.accentColor.opacity(0.18) : Color.clear)
+        )
+        .opacity(isDragging ? 0.4 : 1.0)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { vm.editingTabId = tab.id }
+        .onTapGesture(count: 1) {
+            if vm.editingTabId != tab.id { vm.switchTab(tab.id) }
+        }
+        .onDrag {
+            vm.draggingTabId = tab.id
+            return NSItemProvider(object: tab.id.uuidString as NSString)
+        }
+        .onDrop(of: [.text], delegate: TabDropDelegate(tab: tab, vm: vm))
     }
 }
 
@@ -1677,6 +1916,35 @@ struct FlowLayout: Layout {
     }
 }
 
+// MARK: - Body Size Picker
+
+struct BodySizePicker: View {
+    @EnvironmentObject var vm: EditorViewModel
+    @State private var currentSize: Int = Int(Tokens.currentBodySize)
+
+    var body: some View {
+        Menu {
+            ForEach(Tokens.bodySizeOptions, id: \.self) { size in
+                Button("\(Int(size)) pt") {
+                    Tokens.setBodySize(size)
+                    currentSize = Int(size)
+                    vm.reloadActive()
+                }
+            }
+        } label: {
+            Text("\(currentSize)pt")
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundColor(.secondary)
+                .frame(height: 22)
+                .padding(.horizontal, 6)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Body font size")
+    }
+}
+
 // MARK: - Format Toolbar
 
 struct FormatToolbar: View {
@@ -1685,113 +1953,154 @@ struct FormatToolbar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            Group {
-                toolBtn("H1", id: "h1") { vm.performFormat(.heading1) }
-                toolBtn("H2", id: "h2") { vm.performFormat(.heading2) }
-                toolBtn("H3", id: "h3") { vm.performFormat(.heading3) }
-                toolBtn("Aa", id: "body") { vm.performFormat(.body) }
-            }
+            // Leading: sidebar toggle (fixed, always visible)
+            sidebarToggle
 
             thinDivider()
 
-            Group {
-                iconBtn("bold", id: "bold") { vm.performFormat(.bold) }
-                iconBtn("italic", id: "italic") { vm.performFormat(.italic) }
-                iconBtn("underline", id: "underline") { vm.performFormat(.underline) }
-            }
+            // Scrollable middle zone — all format groups live here so nothing
+            // clips when the window is narrow.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 0) {
+                    Group {
+                        toolBtn("H1", id: "h1") { vm.performFormat(.heading1) }
+                        toolBtn("H2", id: "h2") { vm.performFormat(.heading2) }
+                        toolBtn("H3", id: "h3") { vm.performFormat(.heading3) }
+                        toolBtn("Aa", id: "body") { vm.performFormat(.body) }
+                        BodySizePicker().environmentObject(vm)
+                    }
 
-            thinDivider()
+                    thinDivider()
 
-            Group {
-                iconBtn("list.bullet", id: "bullet") { vm.performFormat(.bulletList) }
-                iconBtn("checklist", id: "check") { vm.performFormat(.checklist) }
-                iconBtn("link", id: "link") { vm.performFormat(.link) }
-                iconBtn("minus", id: "divider") { vm.performFormat(.divider) }
-            }
+                    Group {
+                        iconBtn("bold", id: "bold") { vm.performFormat(.bold) }
+                        iconBtn("italic", id: "italic") { vm.performFormat(.italic) }
+                        iconBtn("underline", id: "underline") { vm.performFormat(.underline) }
+                    }
 
-            thinDivider()
+                    thinDivider()
 
-            Group {
-                Button(action: { vm.togglePin() }) {
-                    Image(systemName: vm.isPinned ? "pin.fill" : "pin")
-                        .font(.system(size: 11))
-                        .frame(maxWidth: .infinity, minHeight: 22)
-                        .foregroundColor(vm.isPinned ? .accentColor : .secondary)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(hoveredButton == "pin" ? Color.primary.opacity(0.08) : Color.clear)
-                        )
+                    Group {
+                        iconBtn("list.bullet", id: "bullet") { vm.performFormat(.bulletList) }
+                        iconBtn("checklist", id: "check") { vm.performFormat(.checklist) }
+                        iconBtn("link", id: "link") { vm.performFormat(.link) }
+                        iconBtn("minus", id: "divider") { vm.performFormat(.divider) }
+                    }
+
+                    thinDivider()
+
+                    Group {
+                        micButton
+                        recordButton
+                    }
                 }
-                .buttonStyle(.plain)
-                .onHover { hoveredButton = $0 ? "pin" : nil }
-                .help(vm.isPinned ? "Unpin from top" : "Pin to top")
-
-                Button(action: { toggleDictation() }) {
-                    Image(systemName: vm.isDictating ? "mic.fill" : "mic")
-                        .font(.system(size: 11))
-                        .frame(maxWidth: .infinity, minHeight: 22)
-                        .foregroundColor(vm.isDictating ? .red : .secondary)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(hoveredButton == "mic" ? Color.primary.opacity(0.08) : Color.clear)
-                        )
-                }
-                .buttonStyle(.plain)
-                .onHover { hoveredButton = $0 ? "mic" : nil }
-                .help(vm.isDictating ? "Stop Dictation" : "Start Dictation")
             }
+            .layoutPriority(1)
 
-            thinDivider()
-
-            Button(action: {
-                if vm.recordPermissionDenied {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
-                } else if vm.isRecording {
-                    Task { await vm.stopRecording() }
-                } else {
-                    Task { await vm.startRecording() }
-                }
-            }) {
-                Image(systemName: vm.isRecording ? "stop.circle.fill" : "record.circle")
-                    .font(.system(size: 11))
-                    .frame(maxWidth: .infinity, minHeight: 22)
-                    .foregroundColor(
-                        vm.recordPermissionDenied ? .secondary.opacity(0.4) :
-                        vm.isRecording ? .red : .secondary
-                    )
-                    .background(
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(hoveredButton == "rec" ? Color.primary.opacity(0.08) : Color.clear)
-                    )
-            }
-            .buttonStyle(.plain)
-            .onHover { hoveredButton = $0 ? "rec" : nil }
-            .opacity(vm.recordPermissionDenied ? 0.5 : 1.0)
-            .help(
-                vm.recordPermissionDenied ? "Permission required — click to open Settings" :
-                vm.isRecording ? "Stop Recording" : "Start Recording"
-            )
+            // Trailing: pin button (always pinned to the right edge)
+            pinButton
         }
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .background(.bar)
+    }
+
+    private var sidebarToggle: some View {
+        Button(action: {
+            withAnimation(.easeInOut(duration: 0.18)) { vm.isSidebarCollapsed.toggle() }
+        }) {
+            Image(systemName: vm.isSidebarCollapsed ? "sidebar.left" : "sidebar.leading")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(.secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "sidebar" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "sidebar" : nil }
+        .help(vm.isSidebarCollapsed ? "Show notes sidebar" : "Hide notes sidebar")
+    }
+
+    private var micButton: some View {
+        Button(action: { toggleDictation() }) {
+            Image(systemName: vm.isDictating ? "mic.fill" : "mic")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(vm.isDictating ? .red : .secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "mic" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "mic" : nil }
+        .help(vm.isDictating ? "Stop Dictation" : "Start Dictation")
+    }
+
+    private var recordButton: some View {
+        Button(action: {
+            if vm.recordPermissionDenied {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+            } else if vm.isRecording {
+                Task { await vm.stopRecording() }
+            } else {
+                Task { await vm.startRecording() }
+            }
+        }) {
+            Image(systemName: vm.isRecording ? "stop.circle.fill" : "record.circle")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(
+                    vm.recordPermissionDenied ? .secondary.opacity(0.4) :
+                    vm.isRecording ? .red : .secondary
+                )
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "rec" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "rec" : nil }
+        .opacity(vm.recordPermissionDenied ? 0.5 : 1.0)
+        .help(
+            vm.recordPermissionDenied ? "Permission required — click to open Settings" :
+            vm.isRecording ? "Stop Recording" : "Start Recording"
+        )
+    }
+
+    private var pinButton: some View {
+        Button(action: { vm.togglePin() }) {
+            Image(systemName: vm.isPinned ? "pin.fill" : "pin")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(vm.isPinned ? .accentColor : .secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "pin" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "pin" : nil }
+        .help(vm.isPinned ? "Unpin from top" : "Pin to top")
     }
 
     func thinDivider() -> some View {
         Rectangle()
             .fill(Color.primary.opacity(0.1))
-            .frame(width: 1, height: 16)
-            .padding(.horizontal, 2)
+            .frame(width: 1, height: 14)
+            .padding(.horizontal, 4)
     }
 
     func toolBtn(_ title: String, id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 10, weight: .medium, design: .rounded))
-                .frame(maxWidth: .infinity, minHeight: 22)
-                .foregroundColor(.secondary)
+                .font(.system(size: 11, weight: .medium))
+                .frame(width: 26, height: 22)
+                .foregroundColor(.primary)
                 .background(
-                    RoundedRectangle(cornerRadius: 4)
+                    RoundedRectangle(cornerRadius: 3)
                         .fill(hoveredButton == id ? Color.primary.opacity(0.08) : Color.clear)
                 )
         }
@@ -1858,10 +2167,10 @@ struct FormatToolbar: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 11))
-                .frame(maxWidth: .infinity, minHeight: 22)
-                .foregroundColor(.secondary)
+                .frame(width: 26, height: 22)
+                .foregroundColor(.primary)
                 .background(
-                    RoundedRectangle(cornerRadius: 4)
+                    RoundedRectangle(cornerRadius: 3)
                         .fill(hoveredButton == id ? Color.primary.opacity(0.08) : Color.clear)
                 )
         }
@@ -2225,10 +2534,11 @@ class BlockCaretTextView: NSTextView {
 
         recordUndoSnapshot()
 
-        let bodyFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
+        let bodyFont = Tokens.Typography.body()
         let ps = NSMutableParagraphStyle()
         ps.baseWritingDirection = .leftToRight
         ps.alignment = .left
+        ps.applyReadableBodySpacing()
         let bodyAttrs: [NSAttributedString.Key: Any] = [
             .font: bodyFont,
             .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
@@ -2745,7 +3055,7 @@ class BlockCaretTextView: NSTextView {
             rectCount: &rectCount
         ), rectCount > 0 else {
             // Fallback for empty doc
-            let baseFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
+            let baseFont = Tokens.Typography.body()
             let h = ceil(baseFont.ascender - baseFont.descender)
             moveCaretTo(NSRect(
                 x: textContainerInset.width + (textContainer?.lineFragmentPadding ?? 5),
@@ -2757,7 +3067,7 @@ class BlockCaretTextView: NSTextView {
         }
 
         let rect = rects[0]
-        let baseFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
+        let baseFont = Tokens.Typography.body()
         let h = ceil(baseFont.ascender - baseFont.descender)
         let y = rect.origin.y + textContainerInset.height + (rect.height - h) / 2
 
@@ -2823,13 +3133,15 @@ struct RichTextEditor: NSViewRepresentable {
             let p = NSMutableParagraphStyle()
             p.baseWritingDirection = .leftToRight
             p.alignment = .left
+            p.applyReadableBodySpacing()
             return p
         }()
 
-        let defaultFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
+        let defaultFont = Tokens.Typography.body()
         let ltrParagraph = NSMutableParagraphStyle()
         ltrParagraph.baseWritingDirection = .leftToRight
         ltrParagraph.alignment = .left
+        ltrParagraph.applyReadableBodySpacing()
         textView.typingAttributes = [
             .font: defaultFont,
             .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
@@ -2854,6 +3166,7 @@ struct RichTextEditor: NSViewRepresentable {
                     let ltr = NSMutableParagraphStyle()
                     ltr.baseWritingDirection = .leftToRight
                     ltr.alignment = .left
+                    ltr.applyReadableBodySpacing()
                     // Apply LTR paragraph style to all lines
                     fixed.addAttribute(.paragraphStyle, value: ltr, range: fullRange)
                     // Apply text color to all
@@ -2897,7 +3210,8 @@ struct RichTextEditor: NSViewRepresentable {
                 let defaultParagraph = NSMutableParagraphStyle()
                 defaultParagraph.baseWritingDirection = .leftToRight
                 defaultParagraph.alignment = .left
-                let defaultFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
+                defaultParagraph.applyReadableBodySpacing()
+                let defaultFont = Tokens.Typography.body()
                 textView.typingAttributes = [
                     .font: defaultFont,
                     .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
@@ -2925,10 +3239,10 @@ struct RichTextEditor: NSViewRepresentable {
         let vm: EditorViewModel
         weak var textView: NSTextView?
 
-        let bodyFont = NSFont(name: "Times New Roman", size: 16) ?? NSFont.systemFont(ofSize: 16)
-        let h1Font = NSFont(name: "Times New Roman Bold", size: 28) ?? NSFont.boldSystemFont(ofSize: 28)
-        let h2Font = NSFont(name: "Times New Roman Bold", size: 22) ?? NSFont.boldSystemFont(ofSize: 22)
-        let h3Font = NSFont(name: "Times New Roman Bold", size: 18) ?? NSFont.boldSystemFont(ofSize: 18)
+        let bodyFont = Tokens.Typography.body()
+        let h1Font = Tokens.Typography.bold(size: Tokens.Typography.h1Size)
+        let h2Font = Tokens.Typography.bold(size: Tokens.Typography.h2Size)
+        let h3Font = Tokens.Typography.bold(size: Tokens.Typography.h3Size)
         let textColor = NSColor(calibratedWhite: 0.88, alpha: 1.0)
 
         private var isProcessingMarkdown = false
@@ -3005,10 +3319,7 @@ struct RichTextEditor: NSViewRepresentable {
 
             if let prefix = prefixStr {
                 let prefixWidth = (prefix as NSString).size(withAttributes: [.font: bodyFont]).width
-                let ps = NSMutableParagraphStyle()
-                ps.baseWritingDirection = .leftToRight
-                ps.alignment = .left
-                ps.headIndent = prefixWidth
+                let ps = NSMutableParagraphStyle.tightListItem(headIndent: prefixWidth)
 
                 // Check if next line is indented deeper → this is a "parent" item
                 let lineEnd = NSMaxRange(lineRange)
@@ -3021,7 +3332,7 @@ struct RichTextEditor: NSViewRepresentable {
                                         nextLineStr.dropFirst(nextIndent).hasPrefix("☐ ") ||
                                         nextLineStr.dropFirst(nextIndent).hasPrefix("☑ ")
                     if nextHasPrefix && nextIndent > currentIndent {
-                        ps.paragraphSpacingBefore = 8
+                        ps.paragraphSpacingBefore = Tokens.Spacing.listParentSpacingBefore
                     }
                 }
 
@@ -3062,10 +3373,7 @@ struct RichTextEditor: NSViewRepresentable {
 
                 if let prefix = prefixStr {
                     let prefixWidth = (prefix as NSString).size(withAttributes: [.font: bodyFont]).width
-                    let ps = NSMutableParagraphStyle()
-                    ps.baseWritingDirection = .leftToRight
-                    ps.alignment = .left
-                    ps.headIndent = prefixWidth
+                    let ps = NSMutableParagraphStyle.tightListItem(headIndent: prefixWidth)
 
                     let currentIndent = indentLevel(of: lineStr)
 
@@ -3077,14 +3385,11 @@ struct RichTextEditor: NSViewRepresentable {
                                             nextStr.dropFirst(nextIndent).hasPrefix("☐ ") ||
                                             nextStr.dropFirst(nextIndent).hasPrefix("☑ ")
                         if nextHasPrefix && nextIndent > currentIndent {
-                            // This is a parent — add spacing only if not the first line
-                            // and previous line is not an indented child of us
                             if i > 0 {
                                 let prevStr = lines[i - 1].str
                                 let prevIndent = indentLevel(of: prevStr)
-                                // Add gap if previous line is at same or lower indent (sibling/ancestor, not child)
                                 if prevIndent <= currentIndent {
-                                    ps.paragraphSpacingBefore = 8
+                                    ps.paragraphSpacingBefore = Tokens.Spacing.listParentSpacingBefore
                                 }
                             }
                         }
