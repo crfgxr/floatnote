@@ -16,9 +16,10 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.15.0"
+let APP_VERSION = "v1.17.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
+let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
 
 @main
 struct FloatNoteApp: App {
@@ -118,6 +119,7 @@ struct TabData: Codable {
     var noteGuid: String?  // legacy field, ignored
     var html: String
     var recordingPath: String?
+    var folderId: String?  // optional — nil means "root / ungrouped"
 }
 
 class NoteTab: Identifiable, ObservableObject {
@@ -126,6 +128,7 @@ class NoteTab: Identifiable, ObservableObject {
     var html: String = ""
     var lastSavedHTML: String = ""
     var recordingPath: String? = nil
+    @Published var folderId: UUID? = nil
 
     init(id: UUID = UUID(), title: String) {
         self.id = id
@@ -133,14 +136,49 @@ class NoteTab: Identifiable, ObservableObject {
     }
 
     func toData() -> TabData {
-        TabData(id: id.uuidString, title: title, html: html, recordingPath: recordingPath)
+        TabData(
+            id: id.uuidString,
+            title: title,
+            html: html,
+            recordingPath: recordingPath,
+            folderId: folderId?.uuidString
+        )
     }
 
     static func from(_ data: TabData) -> NoteTab {
         let tab = NoteTab(id: UUID(uuidString: data.id) ?? UUID(), title: data.title)
         tab.html = data.html
         tab.recordingPath = data.recordingPath
+        if let fid = data.folderId { tab.folderId = UUID(uuidString: fid) }
         return tab
+    }
+}
+
+// MARK: - Folder model
+
+struct FolderData: Codable {
+    var id: String
+    var name: String
+    var isExpanded: Bool
+}
+
+class Folder: Identifiable, ObservableObject {
+    let id: UUID
+    @Published var name: String
+    @Published var isExpanded: Bool
+
+    init(id: UUID = UUID(), name: String, isExpanded: Bool = true) {
+        self.id = id
+        self.name = name
+        self.isExpanded = isExpanded
+    }
+
+    func toData() -> FolderData {
+        FolderData(id: id.uuidString, name: name, isExpanded: isExpanded)
+    }
+
+    static func from(_ data: FolderData) -> Folder {
+        Folder(id: UUID(uuidString: data.id) ?? UUID(), name: data.name, isExpanded: data.isExpanded)
     }
 }
 
@@ -165,6 +203,14 @@ class EditorViewModel: ObservableObject {
     }() {
         didSet { UserDefaults.standard.set(Double(sidebarWidth), forKey: "fn.sidebarWidth") }
     }
+    /// Folders tree. Flat list; notes reference folders by `folderId`.
+    @Published var folders: [Folder] = []
+    /// Folder pending deletion — set to show the confirmation alert.
+    @Published var folderPendingDeletion: Folder?
+    /// ID of a folder that the user just created — lets the sidebar focus its title for rename.
+    @Published var editingFolderId: UUID?
+    /// Drop-target folder during a tab drag (nil = root).
+    @Published var dropTargetFolderId: UUID? = nil
     @Published var isDictating: Bool = false
     var wantsDictation: Bool = false  // user intent: keep dictation alive
     @Published var tabs: [NoteTab] = []
@@ -189,6 +235,12 @@ class EditorViewModel: ObservableObject {
     var attributedText = NSMutableAttributedString()
     var onContentLoaded: ((NSAttributedString) -> Void)?
     weak var editorCoordinator: RichTextEditor.Coordinator?
+    /// Hooks supplied by the text view so we can capture / restore its scroll
+    /// position and caret per note when the user switches tabs.
+    var captureScrollState: (() -> (scrollY: CGFloat, selection: NSRange)?)?
+    var restoreScrollState: ((CGFloat, NSRange) -> Void)?
+    /// Scroll + caret position remembered per tab (in-memory; per-session).
+    var tabScrollStates: [UUID: (scrollY: CGFloat, selection: NSRange)] = [:]
     var isLoadingContent = false
 
     private var lastSavedHTML: String = ""
@@ -211,6 +263,7 @@ class EditorViewModel: ObservableObject {
         }
 
         loadTabsLocal()
+        loadFoldersLocal()
 
         if tabs.isEmpty {
             let tab = NoteTab(title: "Untitled")
@@ -335,6 +388,62 @@ class EditorViewModel: ObservableObject {
         DispatchQueue.main.async { self.isSavingInternally = false }
     }
 
+    // MARK: - Folder Management
+
+    func loadFoldersLocal() {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_FOLDERS_PATH)),
+              let list = try? JSONDecoder().decode([FolderData].self, from: data) else { return }
+        folders = list.map { Folder.from($0) }
+    }
+
+    func saveFoldersLocal() {
+        let payload = folders.map { $0.toData() }
+        if let json = try? JSONEncoder().encode(payload) {
+            let tmp = URL(fileURLWithPath: LOCAL_FOLDERS_PATH + ".tmp")
+            try? json.write(to: tmp)
+            _ = try? FileManager.default.replaceItemAt(
+                URL(fileURLWithPath: LOCAL_FOLDERS_PATH), withItemAt: tmp
+            )
+        }
+    }
+
+    func addFolder(name: String = "New Folder") {
+        let folder = Folder(name: name, isExpanded: true)
+        folders.append(folder)
+        editingFolderId = folder.id
+        saveFoldersLocal()
+    }
+
+    func renameFolder(_ id: UUID, to newName: String) {
+        guard let f = folders.first(where: { $0.id == id }) else { return }
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+        f.name = trimmed.isEmpty ? "Untitled" : trimmed
+        editingFolderId = nil
+        saveFoldersLocal()
+    }
+
+    func toggleFolderExpanded(_ id: UUID) {
+        guard let f = folders.first(where: { $0.id == id }) else { return }
+        f.isExpanded.toggle()
+        saveFoldersLocal()
+    }
+
+    /// Remove a folder. Notes inside move back to root (folderId = nil).
+    func deleteFolder(_ id: UUID) {
+        for tab in tabs where tab.folderId == id { tab.folderId = nil }
+        folders.removeAll { $0.id == id }
+        saveFoldersLocal()
+        saveTabsLocal()
+    }
+
+    /// Move a note into a folder (or pass nil to move back to root).
+    func moveTab(_ tabId: UUID, toFolder folderId: UUID?) {
+        guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
+        guard tab.folderId != folderId else { return }
+        tab.folderId = folderId
+        saveTabsLocal()
+    }
+
     // MARK: - Tab Management
 
     /// Re-render the current note with fresh attributes (used after changing
@@ -365,6 +474,10 @@ class EditorViewModel: ObservableObject {
         if let current = activeTab {
             current.html = currentHTML
             current.lastSavedHTML = lastSavedHTML
+            // Remember where the user was (scroll + caret) so we can restore on return.
+            if let state = captureScrollState?() {
+                tabScrollStates[current.id] = state
+            }
         }
         saveTabsLocal()
 
@@ -383,7 +496,12 @@ class EditorViewModel: ObservableObject {
             charCount = 0
             onContentLoaded?(NSAttributedString(string: ""))
         }
-        // Reset flag after async onContentLoaded completes
+        // Restore previously-remembered scroll + caret for this note, if any.
+        if let saved = tabScrollStates[id] {
+            DispatchQueue.main.async { [weak self] in
+                self?.restoreScrollState?(saved.scrollY, saved.selection)
+            }
+        }
         DispatchQueue.main.async { self.isLoadingContent = false }
         status = "Loaded"
     }
@@ -1488,14 +1606,25 @@ struct SidebarResizeHandle: View {
 struct NotesSidebar: View {
     @EnvironmentObject var vm: EditorViewModel
 
+    /// Notes that are not inside any folder (rendered at the root level).
+    private var rootTabs: [NoteTab] { vm.tabs.filter { $0.folderId == nil } }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 2) {
                 Text("NOTES")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(.secondary)
                     .kerning(0.6)
                 Spacer()
+                Button(action: { vm.addFolder() }) {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 11))
+                        .frame(width: 22, height: 22)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("New folder")
                 Button(action: { vm.addTab() }) {
                     Image(systemName: "plus")
                         .font(.system(size: 11))
@@ -1513,15 +1642,132 @@ struct NotesSidebar: View {
 
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    ForEach(vm.tabs) { tab in
+                    // Folders first, each with its notes nested inside.
+                    ForEach(vm.folders) { folder in
+                        SidebarFolderView(folder: folder)
+                            .id(folder.id)
+                    }
+
+                    // Root-level notes (not in any folder).
+                    ForEach(rootTabs) { tab in
                         SidebarNoteItemView(tab: tab)
                             .id(tab.id)
                     }
                 }
                 .padding(4)
             }
+            // Dropping a note onto the empty sidebar area moves it to root.
+            .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: nil, vm: vm))
         }
         .background(.bar)
+        .alert(
+            "Delete folder?",
+            isPresented: Binding(
+                get: { vm.folderPendingDeletion != nil },
+                set: { if !$0 { vm.folderPendingDeletion = nil } }
+            ),
+            presenting: vm.folderPendingDeletion
+        ) { folder in
+            Button("Delete", role: .destructive) {
+                vm.deleteFolder(folder.id)
+                vm.folderPendingDeletion = nil
+            }
+            Button("Cancel", role: .cancel) { vm.folderPendingDeletion = nil }
+        } message: { folder in
+            Text("\"\(folder.name)\" will be removed. Notes inside will move back to the root.")
+        }
+    }
+}
+
+// MARK: - Sidebar Folder Row
+
+struct SidebarFolderView: View {
+    @ObservedObject var folder: Folder
+    @EnvironmentObject var vm: EditorViewModel
+    @FocusState private var isFieldFocused: Bool
+
+    private var tabsInFolder: [NoteTab] { vm.tabs.filter { $0.folderId == folder.id } }
+    private var isDropTarget: Bool { vm.dropTargetFolderId == folder.id }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 4) {
+                Button(action: { vm.toggleFolderExpanded(folder.id) }) {
+                    Image(systemName: folder.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 12)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+
+                Image(systemName: "folder")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                if vm.editingFolderId == folder.id {
+                    TextField("", text: $folder.name)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12, weight: .semibold))
+                        .focused($isFieldFocused)
+                        .onSubmit { vm.renameFolder(folder.id, to: folder.name) }
+                        .onAppear { isFieldFocused = true }
+                } else {
+                    Text(folder.name)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isDropTarget ? Color.accentColor.opacity(0.22) : Color.clear)
+            )
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { vm.editingFolderId = folder.id }
+            .onTapGesture(count: 1) {
+                if vm.editingFolderId != folder.id { vm.toggleFolderExpanded(folder.id) }
+            }
+            .contextMenu {
+                Button("Rename") { vm.editingFolderId = folder.id }
+                Divider()
+                Button("Delete Folder…", role: .destructive) {
+                    vm.folderPendingDeletion = folder
+                }
+            }
+            .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: folder.id, vm: vm))
+
+            if folder.isExpanded {
+                ForEach(tabsInFolder) { tab in
+                    SidebarNoteItemView(tab: tab)
+                        .padding(.leading, 16)
+                        .id(tab.id)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Folder Drop Delegate
+
+struct FolderDropDelegate: DropDelegate {
+    let folderId: UUID?
+    let vm: EditorViewModel
+
+    func dropEntered(info: DropInfo) { vm.dropTargetFolderId = folderId }
+    func dropExited(info: DropInfo)  { if vm.dropTargetFolderId == folderId { vm.dropTargetFolderId = nil } }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func validateDrop(info: DropInfo) -> Bool { true }
+
+    func performDrop(info: DropInfo) -> Bool {
+        vm.dropTargetFolderId = nil
+        guard let draggingId = vm.draggingTabId else { return false }
+        vm.moveTab(draggingId, toFolder: folderId)
+        vm.draggingTabId = nil
+        return true
     }
 }
 
@@ -2397,6 +2643,10 @@ struct RecordingPlayerView: View {
 // MARK: - Block Caret NSTextView
 
 class BlockCaretTextView: NSTextView {
+    /// Weak view-model ref so keyboard shortcuts (Cmd+B/I/U) can dispatch
+    /// through the same format pipeline as the toolbar buttons.
+    weak var editorViewModel: EditorViewModel?
+
     private let caretView: NSView = {
         let v = NSView()
         v.wantsLayer = true
@@ -2643,6 +2893,15 @@ class BlockCaretTextView: NSTextView {
     // MARK: - Arrow key overrides
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Cmd+B/I/U → dispatch to the same format pipeline the toolbar uses.
+        if flags == .command, let chars = event.charactersIgnoringModifiers?.lowercased(), let vm = editorViewModel {
+            switch chars {
+            case "b": vm.performFormat(.bold);      updateCaretPosition(); return
+            case "i": vm.performFormat(.italic);    updateCaretPosition(); return
+            case "u": vm.performFormat(.underline); updateCaretPosition(); return
+            default: break
+            }
+        }
         // Option+Up or Option+Down to move lines (with children)
         if flags.contains(.option) && !flags.contains(.command) {
             if event.keyCode == 126 { // Up arrow
@@ -3003,14 +3262,19 @@ class BlockCaretTextView: NSTextView {
 
         recordUndoSnapshot()
 
+        let boxFont = Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium)
+        let boxRange = NSRange(location: charIndex, length: 1)
+
         if char == "☐" {
-            storage.replaceCharacters(in: NSRange(location: charIndex, length: 1), with: "☑")
+            storage.replaceCharacters(in: boxRange, with: "☑")
+            storage.addAttribute(.font, value: boxFont, range: boxRange)
             if contentRange.length > 0 {
                 storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: contentRange)
                 storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.45, alpha: 1.0), range: contentRange)
             }
         } else if char == "☑" {
-            storage.replaceCharacters(in: NSRange(location: charIndex, length: 1), with: "☐")
+            storage.replaceCharacters(in: boxRange, with: "☐")
+            storage.addAttribute(.font, value: boxFont, range: boxRange)
             if contentRange.length > 0 {
                 storage.removeAttribute(.strikethroughStyle, range: contentRange)
                 storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: contentRange)
@@ -3111,6 +3375,7 @@ struct RichTextEditor: NSViewRepresentable {
         textStorage.addLayoutManager(layoutManager)
 
         let textView = BlockCaretTextView(frame: NSRect(origin: .zero, size: contentSize), textContainer: textContainer)
+        textView.editorViewModel = vm
         textView.autoresizingMask = [.width]
         textView.isEditable = true
         textView.isSelectable = true
@@ -3151,6 +3416,21 @@ struct RichTextEditor: NSViewRepresentable {
         scrollView.documentView = textView
         textView.delegate = context.coordinator
         context.coordinator.textView = textView
+
+        // Capture/restore per-note scroll + caret position so switching tabs
+        // returns the user to where they were.
+        vm.captureScrollState = { [weak scrollView, weak textView] in
+            guard let sv = scrollView, let tv = textView else { return nil }
+            return (sv.contentView.bounds.origin.y, tv.selectedRange())
+        }
+        vm.restoreScrollState = { [weak scrollView, weak textView] y, sel in
+            guard let sv = scrollView, let tv = textView else { return }
+            let clampedStart = max(0, min(sel.location, tv.textStorage?.length ?? 0))
+            let clampedLen = max(0, min(sel.length, (tv.textStorage?.length ?? 0) - clampedStart))
+            tv.setSelectedRange(NSRange(location: clampedStart, length: clampedLen))
+            sv.contentView.setBoundsOrigin(NSPoint(x: 0, y: y))
+            sv.reflectScrolledClipView(sv.contentView)
+        }
 
         vm.onContentLoaded = { [weak textView] attrStr in
             DispatchQueue.main.async {
@@ -3195,6 +3475,13 @@ struct RichTextEditor: NSViewRepresentable {
                                 storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: cRange)
                                 storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.45, alpha: 1.0), range: cRange)
                             }
+                        }
+                        // Enlarge checkbox glyphs (☐/☑) so they read as proper boxes.
+                        if afterIndent.hasPrefix("☐") || afterIndent.hasPrefix("☑") {
+                            let boxStart = lr.location + leading.count
+                            let boxRange = NSRange(location: boxStart, length: 1)
+                            storage.addAttribute(.font, value: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium), range: boxRange)
+                            // Slight baseline nudge so the bigger glyph sits on the text baseline.
                         }
                         let next = lr.location + lr.length
                         if next <= pos { break }
@@ -3396,6 +3683,13 @@ struct RichTextEditor: NSViewRepresentable {
                     }
 
                     storage.addAttribute(.paragraphStyle, value: ps, range: lineRange)
+
+                    // Bump size of the checkbox glyph (☐/☑) so it reads as a real box.
+                    if afterIndent.hasPrefix("☐") || afterIndent.hasPrefix("☑") {
+                        let boxStart = lineRange.location + leadingWS.count
+                        let boxRange = NSRange(location: boxStart, length: 1)
+                        storage.addAttribute(.font, value: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium), range: boxRange)
+                    }
                 }
             }
             storage.endEditing()
@@ -3774,7 +4068,12 @@ struct RichTextEditor: NSViewRepresentable {
                 let isAtLineStart = range.location == lineRange.location
                 let hasListPrefix = lineStr.hasPrefix("• ") || lineStr.hasPrefix("☐ ") || lineStr.hasPrefix("☑ ")
                 if isAtLineStart && hasListPrefix {
-                    let newLine = NSAttributedString(string: "☐ \n", attributes: [.font: bodyFont, .foregroundColor: textColor])
+                    let newLine = NSMutableAttributedString()
+                    newLine.append(NSAttributedString(string: "☐", attributes: [
+                        .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
+                        .foregroundColor: textColor
+                    ]))
+                    newLine.append(NSAttributedString(string: " \n", attributes: [.font: bodyFont, .foregroundColor: textColor]))
                     storage.insert(newLine, at: lineRange.location)
                     textView.setSelectedRange(NSRange(location: lineRange.location + 2, length: 0))
                     textView.didChangeText()
@@ -3787,7 +4086,12 @@ struct RichTextEditor: NSViewRepresentable {
             if str.length == 0 || (fromSlashMenu && range.location == str.length && range.length == 0) {
                 // Insert prefix at current position
                 let insertPos = min(range.location, str.length)
-                let attrPrefix = NSAttributedString(string: "☐ ", attributes: [.font: bodyFont, .foregroundColor: textColor])
+                let attrPrefix = NSMutableAttributedString()
+                attrPrefix.append(NSAttributedString(string: "☐", attributes: [
+                    .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
+                    .foregroundColor: textColor
+                ]))
+                attrPrefix.append(NSAttributedString(string: " ", attributes: [.font: bodyFont, .foregroundColor: textColor]))
                 storage.insert(attrPrefix, at: insertPos)
                 textView.setSelectedRange(NSRange(location: insertPos + 2, length: 0))
                 textView.didChangeText()
@@ -3836,10 +4140,18 @@ struct RichTextEditor: NSViewRepresentable {
                     }
                     let curStr = storage.string as NSString
                     let curLr = curStr.lineRange(for: NSRange(location: min(insertAt, max(0, curStr.length - 1)), length: 0))
-                    let attrPrefix = NSAttributedString(string: "☐ ", attributes: [
+                    let boxFont = Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium)
+                    let box = NSAttributedString(string: "☐", attributes: [
+                        .font: boxFont,
+                        .foregroundColor: textColor
+                    ])
+                    let spaceAfter = NSAttributedString(string: " ", attributes: [
                         .font: bodyFont,
                         .foregroundColor: textColor
                     ])
+                    let attrPrefix = NSMutableAttributedString()
+                    attrPrefix.append(box)
+                    attrPrefix.append(spaceAfter)
                     storage.insert(attrPrefix, at: curLr.location)
                 }
             }
@@ -3922,13 +4234,29 @@ struct RichTextEditor: NSViewRepresentable {
 
                 // Continue with same indent + prefix (☑ continues as ☐)
                 let continuationPrefix = (prefix == "☑ ") ? "☐ " : prefix
-                let insertionStr = "\n" + leadingSpaces + continuationPrefix
-                let insertion = NSAttributedString(string: insertionStr, attributes: [
+                let head = "\n" + leadingSpaces  // newline + any indent
+                let insertion = NSMutableAttributedString(string: head, attributes: [
                     .font: bodyFont,
                     .foregroundColor: textColor
                 ])
+                // If the prefix is a checkbox, use the rounded SF glyph for the box itself.
+                if continuationPrefix == "☐ " || continuationPrefix == "☑ " {
+                    let boxChar = String(continuationPrefix.first!)
+                    insertion.append(NSAttributedString(string: boxChar, attributes: [
+                        .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
+                        .foregroundColor: textColor
+                    ]))
+                    insertion.append(NSAttributedString(string: " ", attributes: [
+                        .font: bodyFont, .foregroundColor: textColor
+                    ]))
+                } else {
+                    insertion.append(NSAttributedString(string: continuationPrefix, attributes: [
+                        .font: bodyFont, .foregroundColor: textColor
+                    ]))
+                }
                 storage.replaceCharacters(in: range, with: insertion)
-                textView.setSelectedRange(NSRange(location: range.location + insertionStr.count, length: 0))
+                let newCaret = range.location + head.count + continuationPrefix.count
+                textView.setSelectedRange(NSRange(location: newCaret, length: 0))
                 textView.didChangeText()
                 return true
             }
@@ -3953,9 +4281,11 @@ struct RichTextEditor: NSViewRepresentable {
                 pos = NSMaxRange(lr)
             }
 
-            // If multiple lines or cursor is on a bullet/checklist line, indent lines
+            // If multiple lines or cursor is on a bullet/checklist line, indent lines.
+            // Check after any existing leading whitespace so already-indented items still count.
             let firstLineStr = str.substring(with: str.lineRange(for: NSRange(location: fullLineRange.location, length: 0)))
-            let hasList = firstLineStr.hasPrefix("• ") || firstLineStr.hasPrefix("☐ ") || firstLineStr.hasPrefix("☑ ")
+            let firstTrimmed = firstLineStr.drop(while: { $0 == " " || $0 == "\u{00a0}" })
+            let hasList = firstTrimmed.hasPrefix("• ") || firstTrimmed.hasPrefix("☐ ") || firstTrimmed.hasPrefix("☑ ")
 
             if lineStarts.count > 1 || hasList {
                 storage.beginEditing()

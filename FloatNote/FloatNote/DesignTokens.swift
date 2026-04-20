@@ -37,11 +37,26 @@ enum Tokens {
         }
         static func bold(size: CGFloat) -> NSFont { NSFont.boldSystemFont(ofSize: size) }
 
+        /// SF Pro Rounded variant — used for ☐/☑ checkbox glyphs so the box
+        /// corners read noticeably rounder than the default system font.
+        static func rounded(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+            let base = NSFont.systemFont(ofSize: size, weight: weight)
+            if let desc = base.fontDescriptor.withDesign(.rounded),
+               let font = NSFont(descriptor: desc, size: size) {
+                return font
+            }
+            return base
+        }
+
         // Editor body + heading sizes (derived from current body size)
         static var bodySize: CGFloat { Tokens.currentBodySize }
         static var h3Size:   CGFloat { round(bodySize * 1.14) }
         static var h2Size:   CGFloat { round(bodySize * 1.36) }
         static var h1Size:   CGFloat { round(bodySize * 1.71) }
+        /// Size multiplier applied to ☐ / ☑ checkbox characters so they render
+        /// visibly larger than surrounding body text. The glyph edges also
+        /// appear more rounded at higher sizes.
+        static var checkboxSize: CGFloat { round(bodySize * 1.35) }
 
         // Chrome sizes (fixed)
         static let toolbar:        CGFloat = 11
@@ -55,13 +70,15 @@ enum Tokens {
 
     // MARK: - Spacing (editor + lists)
     enum Spacing {
-        /// Multiplier for body prose line height. Matches Obsidian's
-        /// `--line-height-normal` (1.5) — helps scannability of wrapped text.
-        static let lineHeightMultiple: CGFloat = 1.5
-        /// Tighter line-height for single-line list items. AppKit applies
-        /// lineHeightMultiple per-line (unlike CSS which collapses on short
-        /// lines), so lists need a lower multiplier to avoid excess vertical air.
-        static let listLineHeightMultiple: CGFloat = 1.2
+        /// Space added between wrapped lines of the same paragraph (AppKit
+        /// `lineSpacing`). Gives Obsidian-like breathing room on prose while
+        /// leaving single-line paragraphs at the font's natural height — this
+        /// is important because `lineHeightMultiple` inflates the line box
+        /// which pushes the text caret off-center.
+        static var bodyLineSpacing: CGFloat { round(Tokens.currentBodySize * 0.35) }
+        /// Smaller lineSpacing for list items — bullets sit tight but still
+        /// breathe when wrapped.
+        static var listLineSpacing: CGFloat { round(Tokens.currentBodySize * 0.15) }
         /// Space after a true paragraph (hard return between blocks).
         /// ≈ 1em at current body size.
         static var paragraphSpacing: CGFloat { round(Tokens.currentBodySize * 0.85) }
@@ -129,25 +146,27 @@ enum Tokens {
 // MARK: - Paragraph style helpers
 
 extension NSMutableParagraphStyle {
-    /// Body paragraph style: LTR, left-aligned, 1.5× line height, ~1em
-    /// after-paragraph spacing. Use for regular prose lines.
+    /// Body paragraph style: LTR, left-aligned, uses `lineSpacing` (between
+    /// wrapped lines) rather than `lineHeightMultiple` so the caret stays
+    /// visually aligned on short/single-line paragraphs.
     static func readableBody() -> NSMutableParagraphStyle {
         let p = NSMutableParagraphStyle()
         p.baseWritingDirection = .leftToRight
         p.alignment = .left
-        p.lineHeightMultiple = Tokens.Spacing.lineHeightMultiple
+        p.lineHeightMultiple = 0            // reset any inherited inflation
+        p.lineSpacing        = Tokens.Spacing.bodyLineSpacing
         p.paragraphSpacing   = Tokens.Spacing.paragraphSpacing
         return p
     }
 
-    /// Tight list-item paragraph style: reduced line-height (1.2) and zero
-    /// after-paragraph spacing so list items sit flush — matches Obsidian's
-    /// visual density for bullets/checkboxes.
+    /// Tight list-item paragraph style: small lineSpacing for wrapped lines,
+    /// zero paragraphSpacing so items sit flush.
     static func tightListItem(headIndent: CGFloat = 0) -> NSMutableParagraphStyle {
         let p = NSMutableParagraphStyle()
         p.baseWritingDirection = .leftToRight
         p.alignment = .left
-        p.lineHeightMultiple = Tokens.Spacing.listLineHeightMultiple
+        p.lineHeightMultiple = 0
+        p.lineSpacing        = Tokens.Spacing.listLineSpacing
         p.paragraphSpacing   = Tokens.Spacing.listItemSpacing
         p.headIndent = headIndent
         return p
@@ -155,13 +174,15 @@ extension NSMutableParagraphStyle {
 
     /// Applies readable body spacing (legacy helper). Prefer the factory methods.
     func applyReadableBodySpacing() {
-        self.lineHeightMultiple = Tokens.Spacing.lineHeightMultiple
+        self.lineHeightMultiple = 0
+        self.lineSpacing        = Tokens.Spacing.bodyLineSpacing
         self.paragraphSpacing   = Tokens.Spacing.paragraphSpacing
     }
 
-    /// Applies tight list-item spacing (1.2× line-height, 0 after-paragraph).
+    /// Applies tight list-item spacing (small lineSpacing, 0 after-paragraph).
     func applyTightListSpacing() {
-        self.lineHeightMultiple = Tokens.Spacing.listLineHeightMultiple
+        self.lineHeightMultiple = 0
+        self.lineSpacing        = Tokens.Spacing.listLineSpacing
         self.paragraphSpacing   = Tokens.Spacing.listItemSpacing
     }
 }
