@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.17.1"
+let APP_VERSION = "v1.18.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -660,10 +660,14 @@ class EditorViewModel: ObservableObject {
     }
 
     func transcribeRecording() async {
-        dbg("transcribe: CALLED, currentPath=\(currentRecordingPath ?? "nil") tabPath=\(activeTab?.recordingPath ?? "nil")")
-        let path = currentRecordingPath ?? activeTab?.recordingPath
-        guard let path, let client = deepgramClient else {
-            dbg("transcribe: guard failed — path=\(path ?? "nil") client=\(deepgramClient != nil)")
+        // Capture origin tab + path up-front so the result lands on the note the
+        // user pressed the button on, even if they switch tabs while it's running.
+        let originTabId = activeTabId
+        let originPath = tabs.first(where: { $0.id == originTabId })?.recordingPath
+            ?? currentRecordingPath
+        dbg("transcribe: CALLED, originTab=\(originTabId?.uuidString ?? "nil") path=\(originPath ?? "nil")")
+        guard let path = originPath, let client = deepgramClient else {
+            dbg("transcribe: guard failed — path=\(originPath ?? "nil") client=\(deepgramClient != nil)")
             return
         }
         let fileURL = URL(fileURLWithPath: path)
@@ -676,13 +680,15 @@ class EditorViewModel: ObservableObject {
         }
         isTranscribing = false
         status = "Transcription done"
-        insertTextIntoEditor(result.transcript)
+        insertTextIntoEditor(result.transcript, targetTabId: originTabId)
     }
 
     func summarizeRecording() async {
-        let path = currentRecordingPath ?? activeTab?.recordingPath
-        guard let path, let deepgram = deepgramClient, let router = openRouterClient else {
-            dbg("summarize: guard failed — path=\(currentRecordingPath ?? activeTab?.recordingPath ?? "nil") deepgram=\(deepgramClient != nil) router=\(openRouterClient != nil)")
+        let originTabId = activeTabId
+        let originPath = tabs.first(where: { $0.id == originTabId })?.recordingPath
+            ?? currentRecordingPath
+        guard let path = originPath, let deepgram = deepgramClient, let router = openRouterClient else {
+            dbg("summarize: guard failed — path=\(originPath ?? "nil") deepgram=\(deepgramClient != nil) router=\(openRouterClient != nil)")
             return
         }
         let fileURL = URL(fileURLWithPath: path)
@@ -706,10 +712,13 @@ class EditorViewModel: ObservableObject {
 
         isSummarizing = false
         status = "Summary done"
-        insertTextIntoEditor(summary)
+        insertTextIntoEditor(summary, targetTabId: originTabId)
     }
 
-    private func insertTextIntoEditor(_ text: String) {
+    private func insertTextIntoEditor(_ text: String, targetTabId: UUID? = nil) {
+        let tid = targetTabId ?? activeTabId
+        guard let tid, let tab = tabs.first(where: { $0.id == tid }) else { return }
+
         let newHtml = text.components(separatedBy: "\n").map { line in
             let escaped = line.replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "<", with: "&lt;")
@@ -717,22 +726,21 @@ class EditorViewModel: ObservableObject {
             return "<p>\(escaped.isEmpty ? "<br>" : escaped)</p>"
         }.joined()
 
-        let existing = currentHTML.trimmingCharacters(in: .whitespacesAndNewlines)
-        let html: String
-        if existing.isEmpty {
-            html = newHtml
-        } else {
-            html = existing + "<hr>" + newHtml
-        }
+        let baseHtml = (tid == activeTabId) ? currentHTML : tab.html
+        let existing = baseHtml.trimmingCharacters(in: .whitespacesAndNewlines)
+        let html = existing.isEmpty ? newHtml : existing + "<hr>" + newHtml
 
-        currentHTML = html
-        activeTab?.html = html
-        if let attrStr = htmlToAttributedString(html) {
-            attributedText = NSMutableAttributedString(attributedString: attrStr)
-            charCount = attributedText.length
-            onContentLoaded?(attributedText)
+        tab.html = html
+
+        if tid == activeTabId {
+            currentHTML = html
+            if let attrStr = htmlToAttributedString(html) {
+                attributedText = NSMutableAttributedString(attributedString: attrStr)
+                charCount = attributedText.length
+                onContentLoaded?(attributedText)
+            }
+            saveLocal(html: html)
         }
-        saveLocal(html: html)
         saveTabsLocal()
     }
 
@@ -2476,6 +2484,15 @@ struct RecordingPlayerView: View {
     @State private var timeObserver: Any?
     @State private var endObserver: Any?
     @State private var fileExists = false
+    @State private var samples: [Float] = []
+    @State private var selStart: Double? = nil
+    @State private var selEnd: Double? = nil
+    @State private var isCutting = false
+
+    private var hasSelection: Bool {
+        if let s = selStart, let e = selEnd, e - s > 0.05 { return true }
+        return false
+    }
 
     var body: some View {
         Group {
@@ -2486,6 +2503,17 @@ struct RecordingPlayerView: View {
                 .padding(.vertical, 6)
         } else {
             VStack(spacing: 0) {
+                // Waveform row
+                WaveformView(samples: samples,
+                             duration: duration,
+                             currentTime: currentTime,
+                             selStart: $selStart,
+                             selEnd: $selEnd,
+                             onSeek: { t in seek(to: t) })
+                    .frame(height: 44)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 6)
+
                 // Player controls row
                 HStack(spacing: 8) {
                     Button { togglePlay() } label: {
@@ -2510,6 +2538,38 @@ struct RecordingPlayerView: View {
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                         .frame(minWidth: 70, alignment: .trailing)
+
+                    if hasSelection {
+                        Button {
+                            Task { await performCut() }
+                        } label: {
+                            HStack(spacing: 3) {
+                                if isCutting {
+                                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                                } else {
+                                    Image(systemName: "scissors")
+                                        .font(.system(size: 10))
+                                }
+                                Text(isCutting ? "Cutting…" : "Cut")
+                                    .font(.system(size: 10, weight: .medium))
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(isCutting ? .secondary : .accentColor)
+                        .disabled(isCutting)
+                        .help("Remove selected region")
+
+                        Button {
+                            selStart = nil; selEnd = nil
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.secondary)
+                        .disabled(isCutting)
+                        .help("Clear selection")
+                    }
 
                     Button("Open Folder") {
                         NSWorkspace.shared.open(URL(fileURLWithPath: RecordingManager.recordingsDir))
@@ -2597,7 +2657,7 @@ struct RecordingPlayerView: View {
                 duration = max(dur.seconds, 1)
             }
         }
-        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
         timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { t in
             currentTime = t.seconds
         }
@@ -2606,6 +2666,122 @@ struct RecordingPlayerView: View {
             currentTime = 0
             p.seek(to: .zero)
         }
+        loadWaveform()
+    }
+
+    private func loadWaveform() {
+        let url = fileURL
+        Task.detached(priority: .utility) {
+            let peaks = Self.computePeaks(url: url, targetBars: 240)
+            await MainActor.run { self.samples = peaks }
+        }
+    }
+
+    private static func computePeaks(url: URL, targetBars: Int) -> [Float] {
+        guard let file = try? AVAudioFile(forReading: url) else { return [] }
+        let frameCount = AVAudioFrameCount(file.length)
+        guard frameCount > 0,
+              let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frameCount) else { return [] }
+        do { try file.read(into: buf) } catch { return [] }
+        guard let data = buf.floatChannelData else { return [] }
+        let channels = Int(buf.format.channelCount)
+        let total = Int(buf.frameLength)
+        let perBar = max(1, total / targetBars)
+        var result: [Float] = []
+        result.reserveCapacity(targetBars)
+        var i = 0
+        while i < total {
+            let end = min(i + perBar, total)
+            var peak: Float = 0
+            for c in 0..<channels {
+                let ch = data[c]
+                for j in i..<end {
+                    let v = abs(ch[j])
+                    if v > peak { peak = v }
+                }
+            }
+            result.append(peak)
+            i = end
+        }
+        // Normalize
+        if let maxV = result.max(), maxV > 0 {
+            result = result.map { $0 / maxV }
+        }
+        return result
+    }
+
+    private func performCut() async {
+        guard let s = selStart, let e = selEnd, e > s else { return }
+        isCutting = true
+        defer { isCutting = false }
+
+        // Pause playback before mutating file
+        player?.pause()
+        isPlaying = false
+
+        let src = fileURL
+        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fn_cut_\(UUID().uuidString).m4a")
+
+        let asset = AVURLAsset(url: src)
+        let comp = AVMutableComposition()
+        guard let track = comp.addMutableTrack(withMediaType: .audio,
+                                               preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            dbg("CUT: failed to add track"); return
+        }
+
+        do {
+            let srcTracks = try await asset.loadTracks(withMediaType: .audio)
+            guard let srcTrack = srcTracks.first else { dbg("CUT: no audio track"); return }
+            let totalDur = try await asset.load(.duration)
+            let totalSec = totalDur.seconds
+            let clampedS = max(0, min(s, totalSec))
+            let clampedE = max(clampedS, min(e, totalSec))
+            let startCM = CMTime(seconds: clampedS, preferredTimescale: 600)
+            let endCM = CMTime(seconds: clampedE, preferredTimescale: 600)
+
+            if clampedS > 0 {
+                let r1 = CMTimeRange(start: .zero, end: startCM)
+                try track.insertTimeRange(r1, of: srcTrack, at: .zero)
+            }
+            if clampedE < totalSec {
+                let r2 = CMTimeRange(start: endCM, end: totalDur)
+                try track.insertTimeRange(r2, of: srcTrack, at: startCM)
+            }
+        } catch {
+            dbg("CUT: composition failed: \(error)"); return
+        }
+
+        guard let exporter = AVAssetExportSession(asset: comp,
+                                                  presetName: AVAssetExportPresetAppleM4A) else {
+            dbg("CUT: exporter init failed"); return
+        }
+        exporter.outputURL = tempURL
+        exporter.outputFileType = .m4a
+
+        await exporter.export()
+        guard exporter.status == .completed else {
+            dbg("CUT: export failed status=\(exporter.status.rawValue) err=\(String(describing: exporter.error))")
+            try? FileManager.default.removeItem(at: tempURL)
+            return
+        }
+
+        // Replace original atomically
+        do {
+            _ = try FileManager.default.replaceItemAt(src, withItemAt: tempURL)
+        } catch {
+            dbg("CUT: replace failed: \(error)")
+            try? FileManager.default.removeItem(at: tempURL)
+            return
+        }
+
+        // Reload player + waveform
+        cleanup()
+        selStart = nil
+        selEnd = nil
+        currentTime = 0
+        samples = []
+        setupPlayer()
     }
 
     private func cleanup() {
@@ -2637,6 +2813,109 @@ struct RecordingPlayerView: View {
         guard s.isFinite && s >= 0 else { return "0:00" }
         let t = Int(s)
         return String(format: "%d:%02d", t / 60, t % 60)
+    }
+}
+
+// MARK: - Waveform View
+
+struct WaveformView: View {
+    let samples: [Float]
+    let duration: Double
+    let currentTime: Double
+    @Binding var selStart: Double?
+    @Binding var selEnd: Double?
+    let onSeek: (Double) -> Void
+
+    @State private var dragAnchor: Double? = nil
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            ZStack(alignment: .topLeading) {
+                // Background
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.primary.opacity(0.04))
+
+                // Bars
+                Canvas { ctx, size in
+                    guard !samples.isEmpty else { return }
+                    let n = samples.count
+                    let barW = size.width / CGFloat(n)
+                    let midY = size.height / 2
+                    for (i, s) in samples.enumerated() {
+                        let x = CGFloat(i) * barW
+                        let bh = max(1, CGFloat(s) * size.height * 0.9)
+                        let rect = CGRect(x: x,
+                                          y: midY - bh/2,
+                                          width: max(1, barW - 1),
+                                          height: bh)
+                        ctx.fill(Path(rect),
+                                 with: .color(Color.secondary.opacity(0.7)))
+                    }
+                }
+
+                // Selection overlay
+                if let s = selStart, let e = selEnd, duration > 0 {
+                    let sx = CGFloat(max(0, min(s, duration)) / duration) * w
+                    let ex = CGFloat(max(0, min(e, duration)) / duration) * w
+                    let width = max(0, ex - sx)
+                    ZStack {
+                        Rectangle()
+                            .fill(Color.yellow.opacity(0.28))
+                        RoundedRectangle(cornerRadius: 3)
+                            .stroke(Color.yellow, lineWidth: 1.5)
+                    }
+                    .frame(width: width, height: h)
+                    .offset(x: sx)
+                }
+
+                // Playhead
+                if duration > 0 {
+                    let px = CGFloat(max(0, min(currentTime, duration)) / duration) * w
+                    Rectangle()
+                        .fill(Color.accentColor)
+                        .frame(width: 1.5, height: h)
+                        .offset(x: px)
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        guard duration > 0, w > 0 else { return }
+                        let px = min(max(g.location.x, 0), w)
+                        let t = Double(px / w) * duration
+                        if dragAnchor == nil {
+                            let anchorPx = min(max(g.startLocation.x, 0), w)
+                            dragAnchor = Double(anchorPx / w) * duration
+                        }
+                        if let a = dragAnchor {
+                            let lo = min(a, t)
+                            let hi = max(a, t)
+                            if hi - lo < 0.05 {
+                                selStart = nil
+                                selEnd = nil
+                            } else {
+                                selStart = lo
+                                selEnd = hi
+                            }
+                        }
+                    }
+                    .onEnded { g in
+                        defer { dragAnchor = nil }
+                        guard duration > 0, w > 0 else { return }
+                        let dx = abs(g.translation.width)
+                        if dx < 3 {
+                            // Treat as a tap: clear selection & seek
+                            selStart = nil
+                            selEnd = nil
+                            let px = min(max(g.location.x, 0), w)
+                            onSeek(Double(px / w) * duration)
+                        }
+                    }
+            )
+        }
     }
 }
 
