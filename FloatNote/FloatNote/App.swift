@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.18.1"
+let APP_VERSION = "v1.19.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -111,6 +111,84 @@ enum FormatAction: Equatable {
     case bold, italic, underline, heading1, heading2, heading3, bulletList, checklist, link, divider, body
 }
 
+// MARK: - Theme
+
+enum AppTheme: String, CaseIterable, Identifiable {
+    case obsidian, paper, sepia
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .obsidian: return "Obsidian"
+        case .paper: return "Paper"
+        case .sepia: return "Sepia"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .obsidian: return "moon.fill"
+        case .paper: return "sun.max.fill"
+        case .sepia: return "leaf.fill"
+        }
+    }
+
+    var swiftUIScheme: ColorScheme {
+        switch self {
+        case .obsidian: return .dark
+        case .paper, .sepia: return .light
+        }
+    }
+
+    /// Background for the NSTextView editor surface.
+    var editorBackgroundNS: NSColor {
+        switch self {
+        case .obsidian: return NSColor(calibratedRed: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)
+        case .paper:    return NSColor(calibratedRed: 0.995, green: 0.995, blue: 0.993, alpha: 1.0)
+        case .sepia:    return NSColor(calibratedRed: 0.96, green: 0.92, blue: 0.83, alpha: 1.0)
+        }
+    }
+
+    /// Primary body text color in the editor.
+    var editorTextNS: NSColor {
+        switch self {
+        case .obsidian: return NSColor(calibratedWhite: 0.88, alpha: 1.0)
+        case .paper:    return NSColor(calibratedWhite: 0.13, alpha: 1.0)
+        case .sepia:    return NSColor(calibratedRed: 0.36, green: 0.25, blue: 0.15, alpha: 1.0)
+        }
+    }
+
+    var editorCaretNS: NSColor {
+        switch self {
+        case .obsidian: return .white
+        case .paper:    return NSColor(calibratedWhite: 0.1, alpha: 1.0)
+        case .sepia:    return NSColor(calibratedRed: 0.36, green: 0.25, blue: 0.15, alpha: 1.0)
+        }
+    }
+
+    /// Window background (used for sepia tint; other themes fall back to system).
+    var windowNSColor: NSColor {
+        switch self {
+        case .obsidian: return NSColor(calibratedRed: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)
+        case .paper:    return NSColor(calibratedRed: 0.99, green: 0.99, blue: 0.99, alpha: 1.0)
+        case .sepia:    return NSColor(calibratedRed: 0.96, green: 0.92, blue: 0.83, alpha: 1.0)
+        }
+    }
+
+    /// Sidebar / toolbar chrome background. `.bar` material on non-sepia, a
+    /// warm tinted color on sepia so chrome matches the editor surface.
+    @ViewBuilder
+    var chromeBackground: some View {
+        switch self {
+        case .sepia:
+            Color(red: 0.93, green: 0.88, blue: 0.78)
+        default:
+            Rectangle().fill(.bar)
+        }
+    }
+}
+
 // MARK: - Tab Model
 
 struct TabData: Codable {
@@ -190,6 +268,13 @@ class EditorViewModel: ObservableObject {
     @Published var isSaving = false
     @Published var charCount: Int = 0
     @Published var isPinned: Bool = false
+    @Published var theme: AppTheme = {
+        if let raw = UserDefaults.standard.string(forKey: "fn.theme"),
+           let t = AppTheme(rawValue: raw) { return t }
+        return .obsidian
+    }() {
+        didSet { UserDefaults.standard.set(theme.rawValue, forKey: "fn.theme") }
+    }
     @Published var isSidebarCollapsed: Bool = UserDefaults.standard.bool(forKey: "fn.sidebarCollapsed") {
         didSet { UserDefaults.standard.set(isSidebarCollapsed, forKey: "fn.sidebarCollapsed") }
     }
@@ -1495,10 +1580,23 @@ struct EditorView: View {
     var body: some View {
         GeometryReader { geo in
             content
-                .onAppear { evaluateAutoHide(width: geo.size.width) }
+                .onAppear {
+                    evaluateAutoHide(width: geo.size.width)
+                    applyWindowTheme(vm.theme)
+                }
                 .onChange(of: geo.size.width) { _, newWidth in
                     evaluateAutoHide(width: newWidth)
                 }
+                .onChange(of: vm.theme) { _, newTheme in
+                    applyWindowTheme(newTheme)
+                }
+        }
+        .preferredColorScheme(vm.theme.swiftUIScheme)
+    }
+
+    private func applyWindowTheme(_ theme: AppTheme) {
+        NSApp.windows.forEach { win in
+            win.backgroundColor = theme.windowNSColor
         }
     }
 
@@ -1543,7 +1641,7 @@ struct EditorView: View {
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
-                        .background(.bar)
+                        .background(vm.theme.chromeBackground)
                         .task {
                             try? await Task.sleep(nanoseconds: 10_000_000_000)
                             vm.isSavingRecording = false
@@ -1667,7 +1765,7 @@ struct NotesSidebar: View {
             // Dropping a note onto the empty sidebar area moves it to root.
             .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: nil, vm: vm))
         }
-        .background(.bar)
+        .background(vm.theme.chromeBackground)
         .alert(
             "Delete folder?",
             isPresented: Binding(
@@ -1987,7 +2085,7 @@ struct TabBar: View {
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 4)
-        .background(.bar)
+        .background(vm.theme.chromeBackground)
     }
 }
 
@@ -2112,7 +2210,7 @@ struct StatusBar: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.bar)
+        .background(vm.theme.chromeBackground)
     }
 
     var statusColor: Color {
@@ -2251,12 +2349,13 @@ struct FormatToolbar: View {
             }
             .layoutPriority(1)
 
-            // Trailing: pin button (always pinned to the right edge)
+            // Trailing: theme picker + pin
+            themeButton
             pinButton
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .background(.bar)
+        .background(vm.theme.chromeBackground)
     }
 
     private var sidebarToggle: some View {
@@ -2322,6 +2421,39 @@ struct FormatToolbar: View {
             vm.recordPermissionDenied ? "Permission required — click to open Settings" :
             vm.isRecording ? "Stop Recording" : "Start Recording"
         )
+    }
+
+    private var themeButton: some View {
+        Menu {
+            ForEach(AppTheme.allCases) { t in
+                Button {
+                    vm.theme = t
+                } label: {
+                    HStack {
+                        Image(systemName: t.iconName)
+                        Text(t.displayName)
+                        if vm.theme == t {
+                            Spacer()
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: vm.theme.iconName)
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(.secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "theme" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .onHover { hoveredButton = $0 ? "theme" : nil }
+        .help("Theme: \(vm.theme.displayName)")
     }
 
     private var pinButton: some View {
@@ -2463,7 +2595,7 @@ struct RecordingInProgressView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.bar)
+        .background(vm.theme.chromeBackground)
     }
 
     private func timeString(_ s: TimeInterval) -> String {
@@ -2639,7 +2771,7 @@ struct RecordingPlayerView: View {
                     .padding(.vertical, 5)
                 }
             }
-            .background(.bar)
+            .background(vm.theme.chromeBackground)
         }
         }
         .onAppear { setupPlayer() }
@@ -2932,6 +3064,11 @@ class BlockCaretTextView: NSTextView {
         v.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.85).cgColor
         return v
     }()
+
+    /// Recolor the custom block caret to match the current theme.
+    func setCaretColor(_ color: NSColor) {
+        caretView.layer?.backgroundColor = color.withAlphaComponent(0.85).cgColor
+    }
 
     // MARK: - Drag-to-reorder state
     private var isDraggingLine = false
@@ -3635,7 +3772,7 @@ class BlockCaretTextView: NSTextView {
 struct RichTextEditor: NSViewRepresentable {
     @EnvironmentObject var vm: EditorViewModel
 
-    func makeCoordinator() -> Coordinator { Coordinator(vm: vm) }
+    func makeCoordinator() -> Coordinator { Coordinator(vm: vm, initialTheme: vm.theme) }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
@@ -3662,8 +3799,9 @@ struct RichTextEditor: NSViewRepresentable {
         textView.isRichText = true
         textView.usesFontPanel = false
         textView.usesRuler = false
-        textView.backgroundColor = NSColor(calibratedRed: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)
-        textView.insertionPointColor = .white
+        textView.backgroundColor = vm.theme.editorBackgroundNS
+        textView.insertionPointColor = vm.theme.editorCaretNS
+        textView.setCaretColor(vm.theme.editorCaretNS)
         textView.textContainerInset = NSSize(width: 40, height: 24)
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
@@ -3688,7 +3826,7 @@ struct RichTextEditor: NSViewRepresentable {
         ltrParagraph.applyReadableBodySpacing()
         textView.typingAttributes = [
             .font: defaultFont,
-            .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
+            .foregroundColor: vm.theme.editorTextNS,
             .paragraphStyle: ltrParagraph
         ]
 
@@ -3799,22 +3937,78 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        let theme = vm.theme
+        if context.coordinator.appliedTheme != theme {
+            context.coordinator.applyTheme(theme, to: textView)
+            context.coordinator.appliedTheme = theme
+        }
     }
 
     class Coordinator: NSObject, NSTextViewDelegate {
         let vm: EditorViewModel
         weak var textView: NSTextView?
+        var appliedTheme: AppTheme
 
         let bodyFont = Tokens.Typography.body()
         let h1Font = Tokens.Typography.bold(size: Tokens.Typography.h1Size)
         let h2Font = Tokens.Typography.bold(size: Tokens.Typography.h2Size)
         let h3Font = Tokens.Typography.bold(size: Tokens.Typography.h3Size)
-        let textColor = NSColor(calibratedWhite: 0.88, alpha: 1.0)
+        var textColor: NSColor
+
+        /// Recolor editor surface + swap previous body-text color on existing content.
+        func applyTheme(_ theme: AppTheme, to textView: NSTextView) {
+            let oldBody = textColor
+            let newBody = theme.editorTextNS
+            textColor = newBody
+
+            textView.backgroundColor = theme.editorBackgroundNS
+            textView.insertionPointColor = theme.editorCaretNS
+            (textView as? BlockCaretTextView)?.setCaretColor(theme.editorCaretNS)
+
+            // Update typing attributes for future typing
+            var attrs = textView.typingAttributes
+            if let fg = attrs[.foregroundColor] as? NSColor,
+               colorsMatch(fg, oldBody) {
+                attrs[.foregroundColor] = newBody
+                textView.typingAttributes = attrs
+            } else {
+                attrs[.foregroundColor] = newBody
+                textView.typingAttributes = attrs
+            }
+
+            // Recolor existing runs that match the previous body color.
+            // Leave accent-colored runs (links, etc.) untouched.
+            guard let storage = textView.textStorage else { return }
+            let full = NSRange(location: 0, length: storage.length)
+            storage.beginEditing()
+            storage.enumerateAttribute(.foregroundColor, in: full, options: []) { value, range, _ in
+                if value == nil {
+                    storage.addAttribute(.foregroundColor, value: newBody, range: range)
+                } else if let c = value as? NSColor, colorsMatch(c, oldBody) {
+                    storage.addAttribute(.foregroundColor, value: newBody, range: range)
+                }
+            }
+            storage.endEditing()
+        }
+
+        private func colorsMatch(_ a: NSColor, _ b: NSColor) -> Bool {
+            guard let ac = a.usingColorSpace(.genericRGB),
+                  let bc = b.usingColorSpace(.genericRGB) else { return false }
+            let tol: CGFloat = 0.02
+            return abs(ac.redComponent - bc.redComponent) < tol
+                && abs(ac.greenComponent - bc.greenComponent) < tol
+                && abs(ac.blueComponent - bc.blueComponent) < tol
+        }
 
         private var isProcessingMarkdown = false
         var lastSelectedRange: NSRange = NSRange(location: 0, length: 0)
 
-        init(vm: EditorViewModel) { self.vm = vm }
+        init(vm: EditorViewModel, initialTheme: AppTheme) {
+            self.vm = vm
+            self.appliedTheme = initialTheme
+            self.textColor = initialTheme.editorTextNS
+        }
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
