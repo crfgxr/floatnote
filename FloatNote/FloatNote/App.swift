@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.19.1"
+let APP_VERSION = "v1.20.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -287,6 +287,17 @@ class EditorViewModel: ObservableObject {
         return v > 0 ? CGFloat(v) : 220
     }() {
         didSet { UserDefaults.standard.set(Double(sidebarWidth), forKey: "fn.sidebarWidth") }
+    }
+    /// Whether the embedded terminal panel is shown on the right edge.
+    @Published var isTerminalVisible: Bool = UserDefaults.standard.bool(forKey: "fn.terminalVisible") {
+        didSet { UserDefaults.standard.set(isTerminalVisible, forKey: "fn.terminalVisible") }
+    }
+    /// Persisted width of the terminal panel.
+    @Published var terminalWidth: CGFloat = {
+        let v = UserDefaults.standard.double(forKey: "fn.terminalWidth")
+        return v > 0 ? CGFloat(v) : 460
+    }() {
+        didSet { UserDefaults.standard.set(Double(terminalWidth), forKey: "fn.terminalWidth") }
     }
     /// Folders tree. Flat list; notes reference folders by `folderId`.
     @Published var folders: [Folder] = []
@@ -904,7 +915,7 @@ class EditorViewModel: ObservableObject {
     func htmlToAttributedString(_ html: String) -> NSAttributedString? {
         let styledHTML = """
         <html dir="ltr"><head><style>
-        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px; color: #e0e0e0; direction: ltr; text-align: left; }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px; direction: ltr; text-align: left; }
         h1 { font-size: 28px; font-weight: 700; }
         h2 { font-size: 22px; font-weight: 600; }
         h3 { font-size: 18px; font-weight: 600; }
@@ -920,6 +931,25 @@ class EditorViewModel: ObservableObject {
                 ],
                 documentAttributes: nil
               ) else { return nil }
+
+        // Normalize baked-in body text colors. HTML exports inline per-run colors
+        // from whatever theme produced them; without this, notes saved on Obsidian
+        // render as near-invisible light-gray when re-opened on Paper/Sepia.
+        // Accent colors (headings / links, which are shades of blue) are left alone.
+        let bodyColor = theme.editorTextNS
+        let fullRange = NSRange(location: 0, length: attrStr.length)
+        attrStr.enumerateAttribute(.foregroundColor, in: fullRange, options: []) { value, range, _ in
+            let isAccent: Bool
+            if let c = (value as? NSColor)?.usingColorSpace(.genericRGB) {
+                // Accent blue family: blue dominant, red low.
+                isAccent = c.blueComponent > 0.85 && c.redComponent < 0.6
+            } else {
+                isAccent = false
+            }
+            if !isAccent {
+                attrStr.addAttribute(.foregroundColor, value: bodyColor, range: range)
+            }
+        }
 
         // Normalize legacy fonts to the new sans-serif defaults while preserving
         // bold/italic traits and heading sizes. Old notes were saved at Times 16pt;
@@ -1655,6 +1685,14 @@ struct EditorView: View {
                     RichTextEditor()
                         .environmentObject(vm)
                 }
+                if vm.isTerminalVisible {
+                    TerminalResizeHandle()
+                        .environmentObject(vm)
+                    TerminalPanel()
+                        .environmentObject(vm)
+                        .frame(width: vm.terminalWidth)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
             Divider()
             StatusBar()
@@ -1705,6 +1743,106 @@ struct SidebarResizeHandle: View {
                 .onEnded { _ in isDragging = false }
         )
     }
+}
+
+// MARK: - Terminal Panel (right side)
+
+struct TerminalResizeHandle: View {
+    @EnvironmentObject var vm: EditorViewModel
+    @State private var isDragging = false
+    @State private var isHovering = false
+    @State private var startWidth: CGFloat = 0
+
+    private let minWidth: CGFloat = 240
+    private let maxWidth: CGFloat = 1600
+    private let hitWidth: CGFloat = 10
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(
+                    isDragging ? Color.accentColor.opacity(0.7) :
+                    isHovering ? Color.accentColor.opacity(0.4) :
+                    Color.primary.opacity(0.1)
+                )
+                .frame(width: (isHovering || isDragging) ? 3 : 1)
+                .animation(.easeOut(duration: 0.12), value: isHovering)
+                .animation(.easeOut(duration: 0.12), value: isDragging)
+            Color.clear
+                .frame(width: hitWidth)
+                .contentShape(Rectangle())
+        }
+        .frame(width: hitWidth)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { value in
+                    if !isDragging {
+                        isDragging = true
+                        startWidth = vm.terminalWidth
+                    }
+                    // Drag-left → wider terminal (so subtract translation.width)
+                    let proposed = startWidth - value.translation.width
+                    let clamped = min(maxWidth, max(minWidth, proposed))
+                    if abs(clamped - vm.terminalWidth) > 0.5 {
+                        vm.terminalWidth = clamped
+                    }
+                }
+                .onEnded { _ in isDragging = false }
+        )
+    }
+}
+
+struct TerminalPanel: View {
+    @EnvironmentObject var vm: EditorViewModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Text("TERMINAL")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .kerning(0.6)
+                Spacer()
+                Button(action: {
+                    NotificationCenter.default.post(name: .floatnoteTerminalReset, object: nil)
+                }) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10))
+                        .frame(width: 22, height: 20)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Restart shell")
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.18)) { vm.isTerminalVisible = false }
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10))
+                        .frame(width: 22, height: 20)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Hide terminal")
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(vm.theme.chromeBackground)
+            Divider()
+            SwiftTermContainer()
+                .background(Color.black)
+        }
+    }
+}
+
+extension Notification.Name {
+    static let floatnoteTerminalReset = Notification.Name("floatnote.terminal.reset")
 }
 
 // MARK: - Notes Sidebar
@@ -2349,7 +2487,8 @@ struct FormatToolbar: View {
             }
             .layoutPriority(1)
 
-            // Trailing: theme picker + pin
+            // Trailing: terminal toggle + theme + pin
+            terminalButton
             themeButton
             pinButton
         }
@@ -2454,6 +2593,24 @@ struct FormatToolbar: View {
         .fixedSize()
         .onHover { hoveredButton = $0 ? "theme" : nil }
         .help("Theme: \(vm.theme.displayName)")
+    }
+
+    private var terminalButton: some View {
+        Button(action: {
+            withAnimation(.easeInOut(duration: 0.18)) { vm.isTerminalVisible.toggle() }
+        }) {
+            Image(systemName: "terminal")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(vm.isTerminalVisible ? .accentColor : .secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "terminal" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "terminal" : nil }
+        .help(vm.isTerminalVisible ? "Hide terminal" : "Show terminal")
     }
 
     private var pinButton: some View {
@@ -3205,9 +3362,10 @@ class BlockCaretTextView: NSTextView {
         ps.baseWritingDirection = .leftToRight
         ps.alignment = .left
         ps.applyReadableBodySpacing()
+        let themeBody = editorViewModel?.theme.editorTextNS ?? NSColor.textColor
         let bodyAttrs: [NSAttributedString.Key: Any] = [
             .font: bodyFont,
-            .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
+            .foregroundColor: themeBody,
             .paragraphStyle: ps
         ]
 
@@ -3686,14 +3844,16 @@ class BlockCaretTextView: NSTextView {
             storage.addAttribute(.font, value: boxFont, range: boxRange)
             if contentRange.length > 0 {
                 storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: contentRange)
-                storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.45, alpha: 1.0), range: contentRange)
+                let muted = (editorViewModel?.theme.editorTextNS ?? NSColor.textColor).withAlphaComponent(0.55)
+                storage.addAttribute(.foregroundColor, value: muted, range: contentRange)
             }
         } else if char == "☑" {
             storage.replaceCharacters(in: boxRange, with: "☐")
             storage.addAttribute(.font, value: boxFont, range: boxRange)
             if contentRange.length > 0 {
                 storage.removeAttribute(.strikethroughStyle, range: contentRange)
-                storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: contentRange)
+                let body = editorViewModel?.theme.editorTextNS ?? NSColor.textColor
+                storage.addAttribute(.foregroundColor, value: body, range: contentRange)
             }
         }
 
@@ -3866,8 +4026,19 @@ struct RichTextEditor: NSViewRepresentable {
                     ltr.applyReadableBodySpacing()
                     // Apply LTR paragraph style to all lines
                     fixed.addAttribute(.paragraphStyle, value: ltr, range: fullRange)
-                    // Apply text color to all
-                    fixed.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.88, alpha: 1.0), range: fullRange)
+                    // Apply theme body color to every non-accent run (preserve headings/links).
+                    let bodyColor = vm.theme.editorTextNS
+                    fixed.enumerateAttribute(.foregroundColor, in: fullRange, options: []) { value, range, _ in
+                        let isAccent: Bool
+                        if let c = (value as? NSColor)?.usingColorSpace(.genericRGB) {
+                            isAccent = c.blueComponent > 0.85 && c.redComponent < 0.6
+                        } else {
+                            isAccent = false
+                        }
+                        if !isAccent {
+                            fixed.addAttribute(.foregroundColor, value: bodyColor, range: range)
+                        }
+                    }
                 }
                 textView.textStorage?.setAttributedString(fixed)
                 // Apply checklist styling and hanging indent to all lines
@@ -3890,7 +4061,7 @@ struct RichTextEditor: NSViewRepresentable {
                             let cRange = NSRange(location: cStart, length: max(0, lEnd - cStart))
                             if cRange.length > 0 {
                                 storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: cRange)
-                                storage.addAttribute(.foregroundColor, value: NSColor(calibratedWhite: 0.45, alpha: 1.0), range: cRange)
+                                storage.addAttribute(.foregroundColor, value: vm.theme.editorTextNS.withAlphaComponent(0.55), range: cRange)
                             }
                         }
                         // Enlarge checkbox glyphs (☐/☑) so they read as proper boxes.
@@ -3918,7 +4089,7 @@ struct RichTextEditor: NSViewRepresentable {
                 let defaultFont = Tokens.Typography.body()
                 textView.typingAttributes = [
                     .font: defaultFont,
-                    .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
+                    .foregroundColor: self.vm.theme.editorTextNS,
                     .paragraphStyle: defaultParagraph
                 ]
                 // Sync coordinator's lastSelectedRange so toolbar buttons work
