@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>FloatNote — Midnight + Lucide icons + centered notes</title>
+<style>
+  :root {
+    --bg: #1a1816;
+    --panel: #1f1d1a;
+    --panel-2: #15130f;
+    --border: #2c2926;
+    --text: #d4cfc2;
+    --text-dim: #6e685c;
+    --accent: #c9a96e;
+    --done: #5a564d;
+    --green: #8bc34a;
+    --hover: rgba(255,255,255,0.04);
+    --selection: rgba(201,169,110,0.18);
+    --max-col: 720px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: -apple-system, "SF Pro Text", system-ui, sans-serif;
+    font-size: 13px;
+    background: #0e0c0a;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  .window {
+    display: flex; flex-direction: column;
+    height: 100vh; background: var(--bg);
+    border-radius: 10px; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .titlebar {
+    height: 36px;
+    display: flex; align-items: center; padding: 0 12px;
+    background: #16140f;
+    border-bottom: 1px solid var(--border);
+  }
+  .traffic { display: flex; gap: 8px; }
+  .traffic span { width: 12px; height: 12px; border-radius: 50%; }
+  .traffic .r { background: #ff5f57; }
+  .traffic .y { background: #febc2e; }
+  .traffic .g { background: #28c840; }
+
+  .body { display: flex; flex: 1; min-height: 0; }
+
+  /* Lucide-style line icons */
+  .icon {
+    width: 16px; height: 16px;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    flex-shrink: 0;
+    display: inline-block;
+    vertical-align: middle;
+  }
+  .icon-sm { width: 14px; height: 14px; }
+  .icon-xs { width: 12px; height: 12px; }
+
+  /* Sidebar */
+  .sidebar {
+    width: 240px; min-width: 240px;
+    background: var(--panel-2);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+  }
+  .sidebar-header {
+    padding: 12px 14px;
+    color: var(--text-dim); font-size: 10px;
+    font-weight: 600; letter-spacing: 0.6px;
+    display: flex; align-items: center;
+  }
+  .sidebar-header .spacer { flex: 1; }
+  .icon-btn {
+    width: 24px; height: 24px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 4px; cursor: pointer; color: var(--text-dim);
+  }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  .notes-list { flex: 1; overflow-y: auto; padding: 0 6px 8px; }
+  .folder, .note {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; border-radius: 5px; cursor: pointer; font-size: 12px;
+  }
+  .folder:hover, .note:hover { background: var(--hover); }
+  .note.active { background: var(--selection); }
+  .folder { color: var(--text); font-weight: 500; }
+  .indent { padding-left: 14px; }
+  .note .icon, .folder .icon { color: var(--text-dim); }
+  .note.active .icon { color: var(--accent); }
+
+  /* Editor */
+  .editor {
+    flex: 1; display: flex; flex-direction: column;
+    background: var(--bg); min-width: 0;
+  }
+  .toolbar {
+    height: 40px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 8px; gap: 2px;
+    color: var(--text-dim);
+  }
+  .tool-btn {
+    height: 28px; min-width: 28px; padding: 0 6px; border-radius: 5px;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; font-size: 12px;
+  }
+  .tool-btn:hover { background: var(--hover); color: var(--text); }
+  .tool-btn.active { color: var(--accent); }
+  .tool-divider { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+  .toolbar .spacer { flex: 1; }
+  .pt-label { font-size: 11px; padding: 0 4px; }
+
+  .editor-scroll {
+    flex: 1; overflow-y: auto;
+    position: relative;
+  }
+  .editor-body {
+    max-width: var(--max-col);
+    margin: 0 auto;
+    padding: 36px 56px 200px;
+    font-size: 14px; line-height: 1.65;
+    color: var(--text);
+  }
+  .editor-body h1 { font-size: 22px; margin: 0 0 18px; font-weight: 700; }
+  .check-line {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 2px 0;
+  }
+  .check-line .box { color: var(--text-dim); }
+  .check-line.done span { text-decoration: line-through; color: var(--done); }
+  .check-line.done .box { color: var(--done); }
+  .check-line.done .box svg { fill: var(--done); }
+  .group-title {
+    margin-top: 14px; margin-bottom: 4px;
+    font-weight: 600; color: var(--text);
+  }
+  .indent-1 { padding-left: 22px; }
+  .indent-2 { padding-left: 44px; }
+
+  /* Terminal */
+  .term-handle {
+    width: 4px; cursor: ew-resize;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+  .term-handle:hover { background: var(--accent); }
+  .terminal {
+    width: 460px; flex-shrink: 0;
+    display: flex; flex-direction: column;
+    background: #0a0908;
+  }
+  .term-header {
+    height: 34px;
+    display: flex; align-items: center; padding: 0 8px; gap: 6px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim); font-size: 10px;
+    font-weight: 600; letter-spacing: 0.6px;
+  }
+  .term-header .label { display: flex; align-items: center; gap: 6px; }
+  .term-header .spacer { flex: 1; }
+  .term-body {
+    flex: 1; overflow-y: auto; padding: 8px 10px;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 11px; line-height: 1.5;
+    color: #b8b2a4;
+  }
+  .term-line { white-space: pre-wrap; word-break: break-all; }
+  .term-line.dim { color: var(--text-dim); }
+  .term-line.warn { color: #ffb74d; }
+  .term-line.green { color: var(--green); }
+
+  /* Status bar */
+  .statusbar {
+    height: 26px; background: var(--panel-2);
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 12px; gap: 14px;
+    color: var(--text-dim); font-size: 11px;
+  }
+  .statusbar .right { margin-left: auto; }
+  .statusbar .icon { color: var(--text-dim); }
+
+  /* Center guide */
+  .center-guide {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    display: flex;
+    justify-content: center;
+  }
+  .center-guide::before {
+    content: "";
+    width: var(--max-col);
+    border-left: 1px dashed rgba(201,169,110,0.18);
+    border-right: 1px dashed rgba(201,169,110,0.18);
+  }
+  .center-label {
+    position: absolute;
+    top: 8px; right: 12px;
+    background: rgba(201,169,110,0.95);
+    color: #1a1816; padding: 3px 8px;
+    border-radius: 4px; font-size: 10px;
+    font-weight: 600;
+  }
+</style>
+</head>
+<body>
+
+<!-- Reusable Lucide-style icons -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-folder-plus" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><polyline points="14 3 14 8 19 8"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></symbol>
+    <symbol id="i-record" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor"/></symbol>
+    <symbol id="i-bold" viewBox="0 0 24 24"><path d="M7 5h6a4 4 0 0 1 0 8H7zM7 13h7a4 4 0 0 1 0 8H7z"/></symbol>
+    <symbol id="i-italic" viewBox="0 0 24 24"><line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/></symbol>
+    <symbol id="i-underline" viewBox="0 0 24 24"><path d="M6 4v8a6 6 0 0 0 12 0V4"/><line x1="4" y1="21" x2="20" y2="21"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="5" cy="6" r="1.2" fill="currentColor"/><circle cx="5" cy="12" r="1.2" fill="currentColor"/><circle cx="5" cy="18" r="1.2" fill="currentColor"/></symbol>
+    <symbol id="i-checklist" viewBox="0 0 24 24"><polyline points="3 7 5 9 9 5"/><polyline points="3 17 5 19 9 15"/><line x1="12" y1="7" x2="20" y2="7"/><line x1="12" y1="17" x2="20" y2="17"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></symbol>
+    <symbol id="i-divider" viewBox="0 0 24 24"><line x1="4" y1="12" x2="20" y2="12"/></symbol>
+    <symbol id="i-h1" viewBox="0 0 24 24"><path d="M4 5v14M12 5v14M4 12h8M16 8l3-2v13"/></symbol>
+    <symbol id="i-h2" viewBox="0 0 24 24"><path d="M4 5v14M12 5v14M4 12h8M16 9a3 3 0 0 1 6 0c0 4-6 4-6 9h6"/></symbol>
+    <symbol id="i-h3" viewBox="0 0 24 24"><path d="M4 5v14M12 5v14M4 12h8M16 8h6l-3 4a3 3 0 1 1-3 4"/></symbol>
+    <symbol id="i-aA" viewBox="0 0 24 24"><path d="M3 18l4-12 4 12M4 14h6"/><path d="M14 18l3-9 3 9M15 15h4"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="5 8 9 12 5 16"/><line x1="12" y1="17" x2="19" y2="17"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><line x1="12" y1="17" x2="12" y2="22"/><path d="M9 4h6l-1 5 4 4H6l4-4z"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><line x1="6" y1="6" x2="18" y2="18"/><line x1="6" y1="18" x2="18" y2="6"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="20 4 20 9 15 9"/><path d="M20 9a8 8 0 1 0-2 8"/></symbol>
+    <symbol id="i-check-empty" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/></symbol>
+    <symbol id="i-check-done" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3" fill="currentColor" stroke="none"/><polyline points="8 12 11 15 16 9" stroke="#1a1816" stroke-width="2"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="4 7 20 7"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></symbol>
+  </defs>
+</svg>
+
+<div class="window">
+  <div class="titlebar">
+    <div class="traffic"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+  </div>
+
+  <div class="body">
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+      <div class="sidebar-header">
+        NOTES
+        <div class="spacer"></div>
+        <div class="icon-btn"><svg class="icon icon-sm"><use href="#i-folder-plus"/></svg></div>
+        <div class="icon-btn"><svg class="icon icon-sm"><use href="#i-plus"/></svg></div>
+      </div>
+      <div class="notes-list">
+        <div class="folder"><svg class="icon icon-sm"><use href="#i-folder"/></svg>toplantı notları</div>
+        <div class="indent">
+          <div class="note"><svg class="icon icon-sm"><use href="#i-mic"/></svg>Recording 22.04 09:…</div>
+          <div class="note"><svg class="icon icon-sm"><use href="#i-mic"/></svg>21.04 dpo</div>
+          <div class="note"><svg class="icon icon-sm"><use href="#i-mic"/></svg>16april ai for comme…</div>
+          <div class="note"><svg class="icon icon-sm"><use href="#i-mic"/></svg>ritmus daily 20.04 11…</div>
+          <div class="note"><svg class="icon icon-sm"><use href="#i-mic"/></svg>15 nisan ritmus daily</div>
+          <div class="note"><svg class="icon icon-sm"><use href="#i-mic"/></svg>nergis ile tur opereto…</div>
+        </div>
+        <div class="note active"><svg class="icon icon-sm"><use href="#i-file"/></svg>backlog - agentforce</div>
+        <div class="note"><svg class="icon icon-sm"><use href="#i-file"/></svg>agentforce jira tasks</div>
+        <div class="note"><svg class="icon icon-sm"><use href="#i-file"/></svg>check-in topics</div>
+        <div class="note"><svg class="icon icon-sm"><use href="#i-file"/></svg>agentforce KPIs</div>
+        <div class="note"><svg class="icon icon-sm"><use href="#i-file"/></svg>side works notes</div>
+      </div>
+    </div>
+
+    <!-- EDITOR -->
+    <div class="editor">
+      <div class="toolbar">
+        <div class="tool-btn"><svg class="icon"><use href="#i-sidebar"/></svg></div>
+        <div class="tool-divider"></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-h1"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-h2"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-h3"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-aA"/></svg></div>
+        <div class="tool-btn pt-label">14pt</div>
+        <div class="tool-divider"></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-bold"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-italic"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-underline"/></svg></div>
+        <div class="tool-divider"></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-list"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-checklist"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-link"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-divider"/></svg></div>
+        <div class="tool-divider"></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-mic"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-record"/></svg></div>
+        <div class="spacer"></div>
+        <div class="tool-btn active"><svg class="icon"><use href="#i-terminal"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-moon"/></svg></div>
+        <div class="tool-btn"><svg class="icon"><use href="#i-pin"/></svg></div>
+      </div>
+
+      <div class="editor-scroll">
+        <div class="center-guide"></div>
+        <div class="center-label">centered column · max 720pt</div>
+
+        <div class="editor-body">
+          <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>botun içerisindeki bubble renklerini değiştireli</span></div>
+          <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>bubble her sayfada gorunmuyor web sitesindeki</span></div>
+          <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>marketing consent checkbox eklenmesi</span></div>
+
+          <div class="group-title">now</div>
+
+          <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span><b>live panel konuları</b></span></div>
+          <div class="indent-1">
+            <div class="check-line done"><svg class="icon icon-sm box" style="color:var(--accent)"><use href="#i-check-done"/></svg><span>sandbox dan erişemiyorum</span></div>
+            <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>kullanici endchat yapinca otomatik kapanmasi</span></div>
+            <div class="check-line done"><svg class="icon icon-sm box" style="color:var(--accent)"><use href="#i-check-done"/></svg><span>Daily job: delete attachments older than 3 days</span></div>
+          </div>
+
+          <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span><b>sms otp konuları</b></span></div>
+          <div class="indent-1">
+            <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>otp nin cookie de desteklenme suresi</span></div>
+            <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>verifiy limit gerekiyor</span></div>
+            <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>resend mantigi ne anlamadim</span></div>
+          </div>
+
+          <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span><b>ui/ux konuları</b></span></div>
+          <div class="indent-1">
+            <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>chat window a ben yazı yazabiliyorum bot gelmeden orada timing hatası var</span></div>
+            <div class="check-line done"><svg class="icon icon-sm box" style="color:var(--accent)"><use href="#i-check-done"/></svg><span>versiyon isimlerini kaldır</span></div>
+            <div class="check-line"><svg class="icon icon-sm box"><use href="#i-check-empty"/></svg><span>attachment yeri input type alanina girmeli</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="statusbar">
+        <span style="color: var(--green);">●</span><span>Saved</span>
+        <span class="right"><svg class="icon icon-xs"><use href="#i-trash"/></svg> &nbsp; 2.155 chars · v1.21.0</span>
+      </div>
+    </div>
+
+    <!-- TERMINAL -->
+    <div class="term-handle"></div>
+    <div class="terminal">
+      <div class="term-header">
+        <div class="label"><svg class="icon icon-sm"><use href="#i-terminal"/></svg>TERMINAL</div>
+        <div class="spacer"></div>
+        <div class="icon-btn"><svg class="icon icon-sm"><use href="#i-refresh"/></svg></div>
+        <div class="icon-btn"><svg class="icon icon-sm"><use href="#i-x"/></svg></div>
+      </div>
+      <div class="term-body">
+        <div class="term-line dim">— 13:20 — Gökçe Kılıç Gülmez — access request (×2)</div>
+        <div class="term-line dim">— 13:20 — Eray İnal — access request</div>
+        <div class="term-line green">Jira (GNTFRC)</div>
+        <div class="term-line dim">— 11:23 — GNTFRC-418: Bot retrieves wrong documents</div>
+        <div class="term-line warn">how many chatbot sessions happened 27 april</div>
+        <div class="term-line dim">601 messaging sessions were created on 27 April 2026</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

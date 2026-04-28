@@ -8,6 +8,7 @@ struct SwiftTermContainer: NSViewRepresentable {
     func makeNSView(context: Context) -> LocalProcessTerminalView {
         let term = LocalProcessTerminalView(frame: .zero)
         term.processDelegate = context.coordinator
+        term.caretViewTracksFocus = false  // always render filled block, even when unfocused
         if let mono = NSFont(name: "SF Mono", size: 12) ?? NSFont(name: "Menlo", size: 12) {
             term.font = mono
         }
@@ -37,6 +38,8 @@ struct SwiftTermContainer: NSViewRepresentable {
 
         func startShell() {
             guard let term = term else { return }
+            // Disable caret blink — steady block cursor.
+            term.terminal?.setCursorStyle(.steadyBlock)
             let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
             let home = NSHomeDirectory()
             let preferredCwd = "/Users/cagdas.agirtas/Library/CloudStorage/OneDrive-SunExpress/chatbot-files/agentforce-implementation"

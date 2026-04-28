@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.20.0"
+let APP_VERSION = "v1.21.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -114,7 +114,7 @@ enum FormatAction: Equatable {
 // MARK: - Theme
 
 enum AppTheme: String, CaseIterable, Identifiable {
-    case obsidian, paper, sepia
+    case obsidian, paper, sepia, midnight
 
     var id: String { rawValue }
 
@@ -123,6 +123,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .obsidian: return "Obsidian"
         case .paper: return "Paper"
         case .sepia: return "Sepia"
+        case .midnight: return "Midnight"
         }
     }
 
@@ -131,12 +132,13 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .obsidian: return "moon.fill"
         case .paper: return "sun.max.fill"
         case .sepia: return "leaf.fill"
+        case .midnight: return "moon.stars.fill"
         }
     }
 
     var swiftUIScheme: ColorScheme {
         switch self {
-        case .obsidian: return .dark
+        case .obsidian, .midnight: return .dark
         case .paper, .sepia: return .light
         }
     }
@@ -147,6 +149,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .obsidian: return NSColor(calibratedRed: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)
         case .paper:    return NSColor(calibratedRed: 0.995, green: 0.995, blue: 0.993, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.96, green: 0.92, blue: 0.83, alpha: 1.0)
+        case .midnight: return NSColor(calibratedRed: 0.102, green: 0.094, blue: 0.086, alpha: 1.0)
         }
     }
 
@@ -156,6 +159,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .obsidian: return NSColor(calibratedWhite: 0.88, alpha: 1.0)
         case .paper:    return NSColor(calibratedWhite: 0.13, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.36, green: 0.25, blue: 0.15, alpha: 1.0)
+        case .midnight: return NSColor(calibratedRed: 0.83, green: 0.81, blue: 0.76, alpha: 1.0)
         }
     }
 
@@ -164,6 +168,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .obsidian: return .white
         case .paper:    return NSColor(calibratedWhite: 0.1, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.36, green: 0.25, blue: 0.15, alpha: 1.0)
+        case .midnight: return NSColor(calibratedRed: 0.79, green: 0.66, blue: 0.43, alpha: 1.0)
         }
     }
 
@@ -173,6 +178,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .obsidian: return NSColor(calibratedRed: 0.11, green: 0.11, blue: 0.12, alpha: 1.0)
         case .paper:    return NSColor(calibratedRed: 0.99, green: 0.99, blue: 0.99, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.96, green: 0.92, blue: 0.83, alpha: 1.0)
+        case .midnight: return NSColor(calibratedRed: 0.102, green: 0.094, blue: 0.086, alpha: 1.0)
         }
     }
 
@@ -183,6 +189,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
         switch self {
         case .sepia:
             Color(red: 0.93, green: 0.88, blue: 0.78)
+        case .midnight:
+            Color(red: 0.082, green: 0.074, blue: 0.066)
         default:
             Rectangle().fill(.bar)
         }
@@ -654,7 +662,13 @@ class EditorViewModel: ObservableObject {
         guard sourceId != destId,
               let fromIdx = tabs.firstIndex(where: { $0.id == sourceId }),
               let toIdx = tabs.firstIndex(where: { $0.id == destId }) else { return }
+        let destFolderId = tabs[toIdx].folderId
         withAnimation(.easeInOut(duration: 0.2)) {
+            // Adopt the destination's folder so dropping on a note that lives
+            // inside a folder places the dragged note in that same folder.
+            if tabs[fromIdx].folderId != destFolderId {
+                tabs[fromIdx].folderId = destFolderId
+            }
             tabs.move(fromOffsets: IndexSet(integer: fromIdx), toOffset: toIdx > fromIdx ? toIdx + 1 : toIdx)
         }
         saveTabsLocal()
@@ -3963,6 +3977,40 @@ struct RichTextEditor: NSViewRepresentable {
         textView.insertionPointColor = vm.theme.editorCaretNS
         textView.setCaretColor(vm.theme.editorCaretNS)
         textView.textContainerInset = NSSize(width: 40, height: 24)
+
+        // Center the text column with a max readable width. Updated whenever
+        // the scroll view's frame changes (window resize, sidebar/terminal toggle).
+        scrollView.postsFrameChangedNotifications = true
+        textView.postsFrameChangedNotifications = true
+        let maxContentWidth: CGFloat = 640
+        let minSideInset: CGFloat = 24
+        let updateInset: () -> Void = { [weak scrollView, weak textView] in
+            guard let sv = scrollView, let tv = textView else { return }
+            let viewW = sv.frame.width > 0 ? sv.frame.width : sv.contentSize.width
+            guard viewW > 0 else { return }
+            let target = max(minSideInset, (viewW - maxContentWidth) / 2)
+            tv.textContainerInset = NSSize(width: target, height: tv.textContainerInset.height)
+            if let tc = tv.textContainer {
+                tc.containerSize = NSSize(width: max(1, viewW - 2*target), height: .greatestFiniteMagnitude)
+            }
+            tv.needsLayout = true
+            tv.needsDisplay = true
+        }
+        context.coordinator.frameObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: scrollView,
+            queue: .main
+        ) { _ in updateInset() }
+        context.coordinator.textFrameObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: textView,
+            queue: .main
+        ) { _ in updateInset() }
+        // Fire repeatedly during initial layout passes to catch the moment the
+        // scroll view has its real frame.
+        for delay in [0.0, 0.05, 0.2, 0.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { updateInset() }
+        }
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
@@ -4120,6 +4168,8 @@ struct RichTextEditor: NSViewRepresentable {
         let vm: EditorViewModel
         weak var textView: NSTextView?
         var appliedTheme: AppTheme
+        var frameObserver: NSObjectProtocol?
+        var textFrameObserver: NSObjectProtocol?
 
         let bodyFont = Tokens.Typography.body()
         let h1Font = Tokens.Typography.bold(size: Tokens.Typography.h1Size)
