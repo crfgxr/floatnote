@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.21.0"
+let APP_VERSION = "v1.23.3"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -246,27 +246,41 @@ struct FolderData: Codable {
     var id: String
     var name: String
     var isExpanded: Bool
+    var isTrashed: Bool? = nil  // optional for backwards-compat with older JSON
 }
 
 class Folder: Identifiable, ObservableObject {
     let id: UUID
     @Published var name: String
     @Published var isExpanded: Bool
+    @Published var isTrashed: Bool
 
-    init(id: UUID = UUID(), name: String, isExpanded: Bool = true) {
+    init(id: UUID = UUID(), name: String, isExpanded: Bool = true, isTrashed: Bool = false) {
         self.id = id
         self.name = name
         self.isExpanded = isExpanded
+        self.isTrashed = isTrashed
     }
 
     func toData() -> FolderData {
-        FolderData(id: id.uuidString, name: name, isExpanded: isExpanded)
+        FolderData(id: id.uuidString, name: name, isExpanded: isExpanded, isTrashed: isTrashed)
     }
 
     static func from(_ data: FolderData) -> Folder {
-        Folder(id: UUID(uuidString: data.id) ?? UUID(), name: data.name, isExpanded: data.isExpanded)
+        Folder(
+            id: UUID(uuidString: data.id) ?? UUID(),
+            name: data.name,
+            isExpanded: data.isExpanded,
+            isTrashed: data.isTrashed ?? false
+        )
     }
 }
+
+/// Sentinel folder ID used to mark a note as "loose-trashed" (trashed by itself,
+/// not via a containing folder). Notes in this virtual folder are rendered
+/// inside the sidebar's Trash section. The Trash itself is not stored as a
+/// `Folder` — it's synthesized at render time.
+let TRASH_FOLDER_ID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
 // MARK: - ViewModel
 
@@ -309,8 +323,14 @@ class EditorViewModel: ObservableObject {
     }
     /// Folders tree. Flat list; notes reference folders by `folderId`.
     @Published var folders: [Folder] = []
-    /// Folder pending deletion — set to show the confirmation alert.
+    /// Folder pending permanent deletion (from inside the Trash section).
     @Published var folderPendingDeletion: Folder?
+    /// Set when the user has asked to permanently empty the trash.
+    @Published var emptyTrashConfirming: Bool = false
+    /// Whether the Trash section in the sidebar is expanded.
+    @Published var isTrashExpanded: Bool = UserDefaults.standard.bool(forKey: "fn.trashExpanded") {
+        didSet { UserDefaults.standard.set(isTrashExpanded, forKey: "fn.trashExpanded") }
+    }
     /// ID of a folder that the user just created — lets the sidebar focus its title for rename.
     @Published var editingFolderId: UUID?
     /// Drop-target folder during a tab drag (nil = root).
@@ -336,6 +356,16 @@ class EditorViewModel: ObservableObject {
     let openRouterClient = OpenRouterClient()
 
     var activeTab: NoteTab? { tabs.first { $0.id == activeTabId } }
+
+    /// Notes that should appear in the top tab bar — i.e. not in the Trash and
+    /// not inside a trashed folder.
+    var visibleTabs: [NoteTab] {
+        let trashedFolderIds = Set(folders.filter { $0.isTrashed }.map { $0.id })
+        return tabs.filter { tab in
+            tab.folderId != TRASH_FOLDER_ID &&
+            !(tab.folderId.map { trashedFolderIds.contains($0) } ?? false)
+        }
+    }
     var attributedText = NSMutableAttributedString()
     var onContentLoaded: ((NSAttributedString) -> Void)?
     weak var editorCoordinator: RichTextEditor.Coordinator?
@@ -378,7 +408,20 @@ class EditorViewModel: ObservableObject {
             saveTabsLocal()
         }
 
-        let firstTab = tabs[0]
+        // On launch, prefer a note titled "backlog - agentforce" (case/whitespace
+        // insensitive). Falls back to the first non-trashed tab, then tabs[0].
+        let trashedFolderIds = Set(folders.filter { $0.isTrashed }.map { $0.id })
+        func isVisible(_ t: NoteTab) -> Bool {
+            t.folderId != TRASH_FOLDER_ID &&
+            !(t.folderId.map { trashedFolderIds.contains($0) } ?? false)
+        }
+        func normalize(_ s: String) -> String {
+            s.lowercased().trimmingCharacters(in: .whitespaces)
+        }
+        let preferredTitle = "backlog - agentforce"
+        let firstTab = tabs.first(where: { isVisible($0) && normalize($0.title).contains(preferredTitle) })
+            ?? tabs.first(where: { isVisible($0) })
+            ?? tabs[0]
         activeTabId = firstTab.id
         currentHTML = firstTab.html
         lastSavedHTML = firstTab.lastSavedHTML
@@ -532,20 +575,104 @@ class EditorViewModel: ObservableObject {
         saveFoldersLocal()
     }
 
-    /// Remove a folder. Notes inside move back to root (folderId = nil).
-    func deleteFolder(_ id: UUID) {
-        for tab in tabs where tab.folderId == id { tab.folderId = nil }
+    /// Move a folder (and its contained notes) to the Trash. Reversible via
+    /// `restoreFolder`. The folder + its notes remain on disk; only the
+    /// folder's `isTrashed` flag changes.
+    func trashFolder(_ id: UUID) {
+        guard let f = folders.first(where: { $0.id == id }) else { return }
+        f.isTrashed = true
+        folders = folders  // re-fire @Published so sidebar repartitions
+        // If the active note lives inside this folder, switch to a visible one.
+        if let active = activeTab, active.folderId == id {
+            switchToFirstVisibleTab(excluding: nil)
+        }
+        isTrashExpanded = true
+        saveFoldersLocal()
+    }
+
+    /// Restore a trashed folder (and its notes) back to the sidebar.
+    func restoreFolder(_ id: UUID) {
+        guard let f = folders.first(where: { $0.id == id }) else { return }
+        f.isTrashed = false
+        folders = folders  // re-fire @Published so sidebar repartitions
+        // Also nudge tabs so any tab views inside the (now-restored) folder rerender.
+        tabs = tabs
+        saveFoldersLocal()
+    }
+
+    /// Permanently delete a folder and ALL notes inside it. Recordings on disk
+    /// are removed. No restore after this.
+    func permanentlyDeleteFolder(_ id: UUID) {
+        let doomedTabs = tabs.filter { $0.folderId == id }
+        let doomedActive = doomedTabs.contains { $0.id == activeTabId }
+        for tab in doomedTabs {
+            deletedTabIds.insert(tab.id.uuidString.uppercased())
+            if let recPath = tab.recordingPath {
+                try? FileManager.default.removeItem(atPath: recPath)
+            }
+        }
+        tabs.removeAll { $0.folderId == id }
         folders.removeAll { $0.id == id }
+        if doomedActive { switchToFirstVisibleTab(excluding: nil) }
+        saveFoldersLocal()
+        saveTabsLocal()
+    }
+
+    /// Permanently empty the Trash: hard-delete all trashed folders, every note
+    /// inside them, and every loose-trashed note.
+    func emptyTrash() {
+        // Hard-delete loose-trashed notes (folderId == TRASH_FOLDER_ID).
+        let looseTrashed = tabs.filter { $0.folderId == TRASH_FOLDER_ID }
+        for tab in looseTrashed {
+            deletedTabIds.insert(tab.id.uuidString.uppercased())
+            if let recPath = tab.recordingPath {
+                try? FileManager.default.removeItem(atPath: recPath)
+            }
+        }
+        tabs.removeAll { $0.folderId == TRASH_FOLDER_ID }
+
+        // Hard-delete every trashed folder + its notes.
+        let trashedIds = Set(folders.filter { $0.isTrashed }.map { $0.id })
+        for tab in tabs where tab.folderId.map({ trashedIds.contains($0) }) ?? false {
+            deletedTabIds.insert(tab.id.uuidString.uppercased())
+            if let recPath = tab.recordingPath {
+                try? FileManager.default.removeItem(atPath: recPath)
+            }
+        }
+        tabs.removeAll { tab in tab.folderId.map { trashedIds.contains($0) } ?? false }
+        folders.removeAll { $0.isTrashed }
+
+        // If active tab is gone, switch to a visible one.
+        if activeTabId == nil || tabs.first(where: { $0.id == activeTabId }) == nil {
+            switchToFirstVisibleTab(excluding: nil)
+        }
         saveFoldersLocal()
         saveTabsLocal()
     }
 
     /// Move a note into a folder (or pass nil to move back to root).
+    /// Note: passing TRASH_FOLDER_ID is equivalent to `trashTab(...)`.
     func moveTab(_ tabId: UUID, toFolder folderId: UUID?) {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         guard tab.folderId != folderId else { return }
         tab.folderId = folderId
         saveTabsLocal()
+    }
+
+    /// Convenience: pick a non-trashed tab and switch to it. If none exists,
+    /// create an Untitled note so the editor always has something to show.
+    private func switchToFirstVisibleTab(excluding excludeId: UUID?) {
+        let trashedFolderIds = Set(folders.filter { $0.isTrashed }.map { $0.id })
+        let candidate = tabs.first { tab in
+            tab.id != excludeId &&
+            tab.folderId != TRASH_FOLDER_ID &&
+            !(tab.folderId.map { trashedFolderIds.contains($0) } ?? false)
+        }
+        if let target = candidate {
+            switchTab(target.id)
+        } else {
+            addTab()
+        }
     }
 
     // MARK: - Tab Management
@@ -629,8 +756,39 @@ class EditorViewModel: ObservableObject {
         status = "New note"
     }
 
-    func deleteTab(_ id: UUID) {
-        guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+    /// Move a note to Trash. Reversible via `restoreTab`.
+    func trashTab(_ id: UUID) {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        if id == recordingTabId && isRecording { return }
+        // Save dirty state on the soon-to-be-trashed active tab before switching.
+        if activeTabId == id {
+            tab.html = currentHTML
+            tab.lastSavedHTML = lastSavedHTML
+        }
+        tab.folderId = TRASH_FOLDER_ID
+        if activeTabId == id {
+            switchToFirstVisibleTab(excluding: id)
+        }
+        isTrashExpanded = true
+        saveTabsLocal()
+    }
+
+    /// Restore a trashed note: lift it back to the root. If the note's prior
+    /// containing folder has been permanently deleted we fall back to root.
+    func restoreTab(_ id: UUID) {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        // Loose-trashed → return to root. Folder-trashed notes are restored
+        // implicitly by restoring their folder.
+        if tab.folderId == TRASH_FOLDER_ID {
+            tab.folderId = nil
+            tabs = tabs  // re-fire @Published so sidebar repartitions
+            saveTabsLocal()
+        }
+    }
+
+    /// Permanently delete a note from disk. No restore after this.
+    func permanentlyDeleteTab(_ id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         if id == recordingTabId && isRecording { return }
         deletedTabIds.insert(id.uuidString.uppercased())
 
@@ -641,10 +799,8 @@ class EditorViewModel: ObservableObject {
 
         // Switch away if deleting the active tab
         if activeTabId == id {
-            let newIndex = index > 0 ? index - 1 : 1
-            let nextTab = tabs[newIndex]
             tabs.remove(at: index)
-            switchTab(nextTab.id)
+            switchToFirstVisibleTab(excluding: nil)
         } else {
             tabs.remove(at: index)
         }
@@ -1866,6 +2022,19 @@ struct NotesSidebar: View {
 
     /// Notes that are not inside any folder (rendered at the root level).
     private var rootTabs: [NoteTab] { vm.tabs.filter { $0.folderId == nil } }
+    /// Folders not currently in the Trash.
+    private var liveFolders: [Folder] { vm.folders.filter { !$0.isTrashed } }
+    /// Folders currently in the Trash.
+    private var trashedFolders: [Folder] { vm.folders.filter { $0.isTrashed } }
+    /// Notes that were trashed individually (loose) — not via their folder.
+    private var looseTrashedTabs: [NoteTab] { vm.tabs.filter { $0.folderId == TRASH_FOLDER_ID } }
+    private var trashItemCount: Int {
+        let trashedFolderIds = Set(trashedFolders.map { $0.id })
+        let inTrashedFolders = vm.tabs.filter {
+            $0.folderId.map { trashedFolderIds.contains($0) } ?? false
+        }.count
+        return trashedFolders.count + looseTrashedTabs.count + inTrashedFolders
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1901,7 +2070,7 @@ struct NotesSidebar: View {
             ScrollView {
                 LazyVStack(spacing: 2) {
                     // Folders first, each with its notes nested inside.
-                    ForEach(vm.folders) { folder in
+                    ForEach(liveFolders) { folder in
                         SidebarFolderView(folder: folder)
                             .id(folder.id)
                     }
@@ -1911,6 +2080,14 @@ struct NotesSidebar: View {
                         SidebarNoteItemView(tab: tab)
                             .id(tab.id)
                     }
+
+                    // Trash section (always pinned at the bottom).
+                    SidebarTrashSection(
+                        trashedFolders: trashedFolders,
+                        looseTrashedTabs: looseTrashedTabs,
+                        itemCount: trashItemCount
+                    )
+                    .padding(.top, 8)
                 }
                 .padding(4)
             }
@@ -1919,20 +2096,29 @@ struct NotesSidebar: View {
         }
         .background(vm.theme.chromeBackground)
         .alert(
-            "Delete folder?",
+            "Permanently delete folder?",
             isPresented: Binding(
                 get: { vm.folderPendingDeletion != nil },
                 set: { if !$0 { vm.folderPendingDeletion = nil } }
             ),
             presenting: vm.folderPendingDeletion
         ) { folder in
-            Button("Delete", role: .destructive) {
-                vm.deleteFolder(folder.id)
+            Button("Delete Permanently", role: .destructive) {
+                vm.permanentlyDeleteFolder(folder.id)
                 vm.folderPendingDeletion = nil
             }
             Button("Cancel", role: .cancel) { vm.folderPendingDeletion = nil }
         } message: { folder in
-            Text("\"\(folder.name)\" will be removed. Notes inside will move back to the root.")
+            Text("\"\(folder.name)\" and all notes inside will be permanently removed. This cannot be undone.")
+        }
+        .alert(
+            "Empty Trash?",
+            isPresented: $vm.emptyTrashConfirming
+        ) {
+            Button("Empty Trash", role: .destructive) { vm.emptyTrash() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("All notes and folders in the Trash will be permanently deleted. This cannot be undone.")
         }
     }
 }
@@ -1992,8 +2178,8 @@ struct SidebarFolderView: View {
             .contextMenu {
                 Button("Rename") { vm.editingFolderId = folder.id }
                 Divider()
-                Button("Delete Folder…", role: .destructive) {
-                    vm.folderPendingDeletion = folder
+                Button("Move Folder to Trash", role: .destructive) {
+                    vm.trashFolder(folder.id)
                 }
             }
             .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: folder.id, vm: vm))
@@ -2077,6 +2263,184 @@ struct SidebarNoteItemView: View {
             return NSItemProvider(object: tab.id.uuidString as NSString)
         }
         .onDrop(of: [.text], delegate: TabDropDelegate(tab: tab, vm: vm))
+        .contextMenu {
+            Button("Rename") { vm.editingTabId = tab.id }
+            Divider()
+            Button("Move to Trash", role: .destructive) {
+                vm.trashTab(tab.id)
+            }
+        }
+    }
+}
+
+// MARK: - Sidebar Trash Section
+
+/// Pinned section at the bottom of the sidebar that holds trashed folders and
+/// loose-trashed notes. The Trash itself is virtual — items are tagged via
+/// `Folder.isTrashed` and `NoteTab.folderId == TRASH_FOLDER_ID`.
+struct SidebarTrashSection: View {
+    @EnvironmentObject var vm: EditorViewModel
+    let trashedFolders: [Folder]
+    let looseTrashedTabs: [NoteTab]
+    let itemCount: Int
+
+    private var isEmpty: Bool { itemCount == 0 }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 4) {
+                Image(systemName: vm.isTrashExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 12)
+                    .foregroundColor(.secondary)
+                Image(systemName: isEmpty ? "trash" : "trash.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Text("Trash")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(isEmpty ? .secondary : .primary)
+                if itemCount > 0 {
+                    Text("\(itemCount)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(
+                            Capsule().fill(Color.secondary.opacity(0.18))
+                        )
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture { vm.isTrashExpanded.toggle() }
+            .contextMenu {
+                Button("Empty Trash…", role: .destructive) {
+                    vm.emptyTrashConfirming = true
+                }
+                .disabled(isEmpty)
+            }
+
+            if vm.isTrashExpanded {
+                if isEmpty {
+                    Text("Trash is empty")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary.opacity(0.7))
+                        .padding(.leading, 26)
+                        .padding(.vertical, 4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ForEach(trashedFolders) { folder in
+                        SidebarTrashedFolderView(folder: folder)
+                            .id(folder.id)
+                    }
+                    ForEach(looseTrashedTabs) { tab in
+                        SidebarTrashedNoteView(tab: tab)
+                            .padding(.leading, 16)
+                            .id(tab.id)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A folder living inside Trash. Shows its (still-attached) notes nested under it.
+struct SidebarTrashedFolderView: View {
+    @ObservedObject var folder: Folder
+    @EnvironmentObject var vm: EditorViewModel
+
+    private var tabsInFolder: [NoteTab] { vm.tabs.filter { $0.folderId == folder.id } }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 4) {
+                Button(action: { vm.toggleFolderExpanded(folder.id) }) {
+                    Image(systemName: folder.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 12)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                Image(systemName: "folder")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary.opacity(0.8))
+                Text(folder.name)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .padding(.leading, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture { vm.toggleFolderExpanded(folder.id) }
+            .contextMenu {
+                Button("Restore Folder") { vm.restoreFolder(folder.id) }
+                Divider()
+                Button("Delete Permanently…", role: .destructive) {
+                    vm.folderPendingDeletion = folder
+                }
+            }
+
+            if folder.isExpanded {
+                ForEach(tabsInFolder) { tab in
+                    SidebarTrashedNoteView(tab: tab, parentTrashedFolder: folder)
+                        .padding(.leading, 32)
+                        .id(tab.id)
+                }
+            }
+        }
+    }
+}
+
+/// A trashed note row. If it's a loose-trashed note, Restore lifts it to root;
+/// if its parent folder is trashed, Restore lifts the folder back instead.
+struct SidebarTrashedNoteView: View {
+    @ObservedObject var tab: NoteTab
+    var parentTrashedFolder: Folder? = nil
+    @EnvironmentObject var vm: EditorViewModel
+
+    var isActive: Bool { vm.activeTabId == tab.id }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if tab.recordingPath != nil {
+                Text("\u{1F3A4}").font(.system(size: 10))
+            }
+            Text(tab.title)
+                .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isActive ? Color.accentColor.opacity(0.10) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { vm.switchTab(tab.id) }
+        .contextMenu {
+            if let parent = parentTrashedFolder {
+                Button("Restore Folder \"\(parent.name)\"") {
+                    vm.restoreFolder(parent.id)
+                }
+            } else {
+                Button("Restore") { vm.restoreTab(tab.id) }
+            }
+            Divider()
+            Button("Delete Permanently", role: .destructive) {
+                vm.permanentlyDeleteTab(tab.id)
+            }
+        }
     }
 }
 
@@ -2211,7 +2575,7 @@ struct TabBar: View {
                 containerWidth = vw
             }) {
                 HStack(spacing: 0) {
-                    ForEach(vm.tabs) { tab in
+                    ForEach(vm.visibleTabs) { tab in
                         TabItemView(tab: tab)
                             .id(tab.id)
                     }
@@ -2344,14 +2708,14 @@ struct StatusBar: View {
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
             Spacer()
-            if vm.tabs.count > 1 {
-                Button(action: { vm.deleteTab(vm.activeTabId!) }) {
+            if vm.tabs.count > 1, let activeId = vm.activeTabId {
+                Button(action: { vm.trashTab(activeId) }) {
                     Image(systemName: "trash")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("Delete this notepad")
+                .help("Move this note to Trash")
             }
             Text("\(vm.charCount) chars")
                 .font(.system(size: 11, design: .monospaced))
@@ -3294,6 +3658,10 @@ class BlockCaretTextView: NSTextView {
                 NSCursor.pointingHand.set()
                 return
             }
+            if ts.attribute(.link, at: charIndex, effectiveRange: nil) != nil {
+                NSCursor.pointingHand.set()
+                return
+            }
         }
         NSCursor.iBeam.set()
     }
@@ -3310,6 +3678,41 @@ class BlockCaretTextView: NSTextView {
     override func setSelectedRange(_ charRange: NSRange, affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
         super.setSelectedRange(charRange, affinity: affinity, stillSelecting: stillSelectingFlag)
         updateCaretPosition()
+        // If the caret has moved out of a link span, strip link styling from
+        // typing attributes so further typing isn't a link.
+        if !stillSelectingFlag && charRange.length == 0 {
+            stripLinkTypingAttrsIfOutsideLink(at: charRange.location)
+        }
+    }
+
+    /// Clears `.link`, `.underlineStyle` and the blue color from typingAttributes
+    /// when the caret is no longer inside a link run.
+    private func stripLinkTypingAttrsIfOutsideLink(at pos: Int) {
+        guard let storage = textStorage else { return }
+        // The character STRICTLY inside the link is the one at index pos-1 (left of caret) AND pos (right of caret).
+        // We strip if neither side has a link attribute.
+        let leftHasLink = pos > 0 && storage.attribute(.link, at: pos - 1, effectiveRange: nil) != nil
+        let rightHasLink = pos < storage.length && storage.attribute(.link, at: pos, effectiveRange: nil) != nil
+        if !leftHasLink && !rightHasLink {
+            var attrs = typingAttributes
+            let hadLinkStyle = attrs[.link] != nil || attrs[.underlineStyle] != nil
+            // Detect link-blue foreground robustly across color spaces.
+            var hadLinkColor = false
+            if let fg = attrs[.foregroundColor] as? NSColor,
+               let rgb = fg.usingColorSpace(.sRGB) {
+                if abs(rgb.redComponent - 0.42) < 0.08,
+                   abs(rgb.greenComponent - 0.68) < 0.08,
+                   abs(rgb.blueComponent - 1.0)  < 0.08 {
+                    hadLinkColor = true
+                }
+            }
+            if hadLinkStyle || hadLinkColor {
+                attrs.removeValue(forKey: .link)
+                attrs.removeValue(forKey: .underlineStyle)
+                attrs[.foregroundColor] = editorViewModel?.theme.editorTextNS ?? NSColor.textColor
+                typingAttributes = attrs
+            }
+        }
     }
 
     /// Returns the full prefix length (leading spaces + "• "/"☐ "/"☑ ") for the line at the given position, or 0.
@@ -3360,16 +3763,60 @@ class BlockCaretTextView: NSTextView {
         updateCaretPosition()
     }
 
+    // MARK: - Copy: emit full URL for shortened links instead of the display text
+    override func copy(_ sender: Any?) {
+        guard let storage = textStorage else { super.copy(sender); return }
+        let sel = selectedRange()
+        guard sel.length > 0, sel.location >= 0, NSMaxRange(sel) <= storage.length else {
+            super.copy(sender); return
+        }
+        let attributed = storage.attributedSubstring(from: sel)
+        let mutable = NSMutableAttributedString(attributedString: attributed)
+        var hadLink = false
+        mutable.enumerateAttribute(.link, in: NSRange(location: 0, length: mutable.length), options: []) { value, range, _ in
+            guard let url = value as? URL else { return }
+            let runText = (mutable.string as NSString).substring(with: range)
+            let full = url.absoluteString
+            if runText != full {
+                hadLink = true
+                let attrs = mutable.attributes(at: range.location, effectiveRange: nil)
+                mutable.replaceCharacters(in: range, with: NSAttributedString(string: full, attributes: attrs))
+            }
+        }
+        if !hadLink { super.copy(sender); return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if let rtf = try? mutable.data(from: NSRange(location: 0, length: mutable.length),
+                                       documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+            pb.setData(rtf, forType: .rtf)
+        }
+        pb.setString(mutable.string, forType: .string)
+    }
+
     // MARK: - Backspace removes full prefix
     // MARK: - Paste: strip external formatting, apply FloatNote body style, auto-link URLs
     override func paste(_ sender: Any?) {
-        guard let pb = NSPasteboard.general.string(forType: .string), !pb.isEmpty else {
+        guard var pb = NSPasteboard.general.string(forType: .string), !pb.isEmpty else {
             super.paste(sender)
             return
         }
         guard let storage = textStorage else { return }
 
         recordUndoSnapshot()
+
+        // Strip a redundant leading list prefix if the destination line already has one.
+        let cursorPos = selectedRange().location
+        let (_, destPrefixLen) = listPrefixLen(at: cursorPos)
+        if destPrefixLen > 0 {
+            let leading = pb.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
+            let afterIndent = String(pb.dropFirst(leading.count))
+            for prefix in ["• ", "☐ ", "☑ "] {
+                if afterIndent.hasPrefix(prefix) {
+                    pb = String(afterIndent.dropFirst(prefix.count))
+                    break
+                }
+            }
+        }
 
         let bodyFont = Tokens.Typography.body()
         let ps = NSMutableParagraphStyle()
@@ -3382,21 +3829,38 @@ class BlockCaretTextView: NSTextView {
             .foregroundColor: themeBody,
             .paragraphStyle: ps
         ]
+        let linkColor = NSColor(calibratedRed: 0.42, green: 0.68, blue: 1.0, alpha: 1.0)
 
-        // Build attributed string with URLs auto-linked
-        let result = NSMutableAttributedString(string: pb, attributes: bodyAttrs)
+        // Build attributed string with URLs auto-linked; shorten the visible text for long URLs.
+        let result = NSMutableAttributedString()
+        let nsText = pb as NSString
         let urlPattern = try? NSRegularExpression(pattern: #"https?://[^\s<>\"\)\]]+"#, options: [])
-        if let matches = urlPattern?.matches(in: pb, range: NSRange(location: 0, length: (pb as NSString).length)) {
-            for match in matches {
-                let urlStr = (pb as NSString).substring(with: match.range)
-                if let url = URL(string: urlStr) {
-                    result.addAttributes([
-                        .link: url,
-                        .foregroundColor: NSColor(calibratedRed: 0.42, green: 0.68, blue: 1.0, alpha: 1.0),
-                        .underlineStyle: NSUnderlineStyle.single.rawValue
-                    ], range: match.range)
-                }
+        let matches = urlPattern?.matches(in: pb, range: NSRange(location: 0, length: nsText.length)) ?? []
+        var cursor = 0
+        for match in matches {
+            if match.range.location > cursor {
+                let pre = nsText.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+                result.append(NSAttributedString(string: pre, attributes: bodyAttrs))
             }
+            let urlStr = nsText.substring(with: match.range)
+            if let url = URL(string: urlStr) {
+                var linkAttrs = bodyAttrs
+                linkAttrs[.link] = url
+                linkAttrs[.foregroundColor] = linkColor
+                linkAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                let display = Self.shortenURLForDisplay(urlStr)
+                if display != urlStr {
+                    linkAttrs[.toolTip] = urlStr
+                }
+                result.append(NSAttributedString(string: display, attributes: linkAttrs))
+            } else {
+                result.append(NSAttributedString(string: urlStr, attributes: bodyAttrs))
+            }
+            cursor = match.range.location + match.range.length
+        }
+        if cursor < nsText.length {
+            let tail = nsText.substring(with: NSRange(location: cursor, length: nsText.length - cursor))
+            result.append(NSAttributedString(string: tail, attributes: bodyAttrs))
         }
 
         let range = selectedRange()
@@ -3404,6 +3868,20 @@ class BlockCaretTextView: NSTextView {
         setSelectedRange(NSRange(location: range.location + result.length, length: 0))
         typingAttributes = bodyAttrs
         didChangeText()
+    }
+
+    static func shortenURLForDisplay(_ s: String) -> String {
+        guard let u = URL(string: s), let host = u.host else { return s }
+        let last = u.pathComponents.last ?? ""
+        let decoded = (last.removingPercentEncoding ?? last)
+        let cleaned = (decoded == "/" || decoded == host) ? "" : decoded
+        let candidate: String = {
+            if cleaned.isEmpty { return host }
+            let fileName = cleaned.count > 40 ? String(cleaned.prefix(40)) + "…" : cleaned
+            return "\(host)/…/\(fileName)"
+        }()
+        // Don't bother shortening if the result isn't actually shorter.
+        return candidate.count < s.count ? candidate : s
     }
 
     override func deleteBackward(_ sender: Any?) {
@@ -4622,6 +5100,13 @@ struct RichTextEditor: NSViewRepresentable {
                         ])
                         storage.replaceCharacters(in: range, with: linkStr)
                         storage.endEditing()
+                        // Place caret after the link and clear link styling so
+                        // subsequent typing is plain body text.
+                        textView.setSelectedRange(NSRange(location: range.location + linkStr.length, length: 0))
+                        textView.typingAttributes = [
+                            .font: bodyFont,
+                            .foregroundColor: textColor
+                        ]
                     }
                 }
             case .divider:

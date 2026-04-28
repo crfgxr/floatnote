@@ -8,24 +8,35 @@ const path = require("path");
 const os = require("os");
 
 const TABS_PATH = path.join(os.homedir(), ".floatnote-tabs.json");
+const FOLDERS_PATH = path.join(os.homedir(), ".floatnote-folders.json");
 
 // --- Helpers ---
 
-function readTabs() {
+function readJSON(p) {
   try {
-    const data = fs.readFileSync(TABS_PATH, "utf8");
-    return JSON.parse(data);
+    return JSON.parse(fs.readFileSync(p, "utf8"));
   } catch {
     return [];
   }
 }
 
-function writeTabs(tabs) {
-  const data = JSON.stringify(tabs);
-  // Write to a temp file first, then rename (atomic write)
-  const tmpPath = TABS_PATH + ".tmp";
-  fs.writeFileSync(tmpPath, data, "utf8");
-  fs.renameSync(tmpPath, TABS_PATH);
+function writeJSON(p, value) {
+  const tmp = p + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(value), "utf8");
+  fs.renameSync(tmp, p);
+}
+
+function readTabs() { return readJSON(TABS_PATH); }
+function writeTabs(tabs) { writeJSON(TABS_PATH, tabs); }
+function readFolders() { return readJSON(FOLDERS_PATH); }
+function writeFolders(folders) { writeJSON(FOLDERS_PATH, folders); }
+
+function findFolder(folders, identifier) {
+  return (
+    folders.find((f) => f.id === identifier) ||
+    folders.find((f) => f.name.toLowerCase() === identifier.toLowerCase()) ||
+    folders.find((f) => f.name.toLowerCase().includes(identifier.toLowerCase()))
+  );
 }
 
 function stripHTML(html) {
@@ -47,7 +58,11 @@ function stripHTML(html) {
 
 // --- MCP Server ---
 
-const MCP_VERSION = "1.1.0";
+const MCP_VERSION = "1.3.0";
+
+// Sentinel folder ID for loose-trashed notes (notes moved to Trash by themselves).
+// Mirrors `TRASH_FOLDER_ID` in App.swift — must stay in sync.
+const TRASH_FOLDER_ID = "00000000-0000-0000-0000-000000000001";
 
 const server = new McpServer({
   name: "floatnote",
@@ -228,11 +243,12 @@ server.tool(
 
 server.tool(
   "delete_note",
-  "Delete a FloatNote tab by ID or title",
+  "Move a FloatNote tab to the Trash. Reversible via restore_note. Pass permanent=true to skip the Trash and hard-delete (no restore).",
   {
     identifier: z.string().describe("Tab ID (UUID) or tab title to search for"),
+    permanent: z.boolean().optional().describe("If true, hard-delete instead of moving to Trash"),
   },
-  async ({ identifier }) => {
+  async ({ identifier, permanent }) => {
     const tabs = readTabs();
     const idx = tabs.findIndex(
       (t) =>
@@ -245,14 +261,101 @@ server.tool(
       return { content: [{ type: "text", text: `Note not found: "${identifier}"` }] };
     }
 
-    const removed = tabs.splice(idx, 1)[0];
-    writeTabs(tabs);
+    if (permanent) {
+      const removed = tabs.splice(idx, 1)[0];
+      writeTabs(tabs);
+      return {
+        content: [{ type: "text", text: `Permanently deleted note "${removed.title}" (${removed.id}).` }],
+      };
+    }
 
+    tabs[idx].folderId = TRASH_FOLDER_ID;
+    writeTabs(tabs);
     return {
       content: [
         {
           type: "text",
-          text: `Deleted note "${removed.title}" (${removed.id}). Restart FloatNote to see changes.`,
+          text: `Moved note "${tabs[idx].title}" to Trash. Use restore_note to bring it back.`,
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "restore_note",
+  "Restore a trashed FloatNote tab. Loose-trashed notes return to the root.",
+  {
+    identifier: z.string().describe("Tab ID (UUID) or title"),
+  },
+  async ({ identifier }) => {
+    const tabs = readTabs();
+    const tab =
+      tabs.find((t) => t.id === identifier) ||
+      tabs.find((t) => t.title.toLowerCase() === identifier.toLowerCase()) ||
+      tabs.find((t) => t.title.toLowerCase().includes(identifier.toLowerCase()));
+
+    if (!tab) {
+      return { content: [{ type: "text", text: `Note not found: "${identifier}"` }] };
+    }
+    if (tab.folderId !== TRASH_FOLDER_ID) {
+      return { content: [{ type: "text", text: `Note "${tab.title}" is not in the Trash.` }] };
+    }
+    tab.folderId = null;
+    writeTabs(tabs);
+    return { content: [{ type: "text", text: `Restored "${tab.title}" to root.` }] };
+  }
+);
+
+server.tool(
+  "restore_folder",
+  "Restore a trashed folder (and the notes still inside it) back to the sidebar.",
+  {
+    identifier: z.string().describe("Folder ID (UUID) or name"),
+  },
+  async ({ identifier }) => {
+    const folders = readFolders();
+    const folder = findFolder(folders, identifier);
+    if (!folder) {
+      return { content: [{ type: "text", text: `Folder not found: "${identifier}"` }] };
+    }
+    if (!folder.isTrashed) {
+      return { content: [{ type: "text", text: `Folder "${folder.name}" is not in the Trash.` }] };
+    }
+    folder.isTrashed = false;
+    writeFolders(folders);
+    return { content: [{ type: "text", text: `Restored folder "${folder.name}".` }] };
+  }
+);
+
+server.tool(
+  "empty_trash",
+  "Permanently delete every trashed folder, every note inside trashed folders, and every loose-trashed note. Cannot be undone.",
+  {},
+  async () => {
+    const folders = readFolders();
+    const tabs = readTabs();
+    const trashedFolderIds = new Set(folders.filter((f) => f.isTrashed).map((f) => f.id));
+
+    const keptTabs = tabs.filter(
+      (t) => t.folderId !== TRASH_FOLDER_ID && !trashedFolderIds.has(t.folderId)
+    );
+    const removedTabCount = tabs.length - keptTabs.length;
+
+    const keptFolders = folders.filter((f) => !f.isTrashed);
+    const removedFolderCount = folders.length - keptFolders.length;
+
+    if (removedTabCount === 0 && removedFolderCount === 0) {
+      return { content: [{ type: "text", text: "Trash is already empty." }] };
+    }
+
+    writeTabs(keptTabs);
+    writeFolders(keptFolders);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Emptied Trash: removed ${removedFolderCount} folder(s) and ${removedTabCount} note(s).`,
         },
       ],
     };
@@ -287,6 +390,156 @@ server.tool(
       .join("\n\n");
 
     return { content: [{ type: "text", text: `Found ${matches.length} note(s):\n\n${results}` }] };
+  }
+);
+
+server.tool(
+  "list_folders",
+  "List all FloatNote folders. Each folder: {id (UUID), name, isExpanded}. Notes reference folders via folderId; folderId=null means the note lives at the root.",
+  {},
+  async () => {
+    const folders = readFolders();
+    const tabs = readTabs();
+    if (folders.length === 0) {
+      return { content: [{ type: "text", text: `FloatNote MCP v${MCP_VERSION} — No folders.` }] };
+    }
+    const lines = folders.map((f) => {
+      const count = tabs.filter((t) => t.folderId === f.id).length;
+      return `[${f.id}] ${f.name} (${count} note${count === 1 ? "" : "s"})`;
+    }).join("\n");
+    return { content: [{ type: "text", text: `FloatNote MCP v${MCP_VERSION}\n\n${lines}` }] };
+  }
+);
+
+server.tool(
+  "create_folder",
+  "Create a new folder in FloatNote's sidebar. Returns the folder's UUID. Notes can later be moved into it via move_note_to_folder.",
+  {
+    name: z.string().describe("Folder display name"),
+  },
+  async ({ name }) => {
+    const folders = readFolders();
+    if (folders.some((f) => f.name.toLowerCase() === name.toLowerCase())) {
+      return { content: [{ type: "text", text: `A folder named "${name}" already exists.` }] };
+    }
+    const crypto = require("crypto");
+    const id = crypto.randomUUID();
+    folders.push({ id, name, isExpanded: true });
+    writeFolders(folders);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Created folder "${name}" (${id}). Restart FloatNote to see it.`,
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "rename_folder",
+  "Rename an existing folder by ID or current name.",
+  {
+    identifier: z.string().describe("Folder ID (UUID) or current name"),
+    name: z.string().describe("New folder name"),
+  },
+  async ({ identifier, name }) => {
+    const folders = readFolders();
+    const folder = findFolder(folders, identifier);
+    if (!folder) {
+      return { content: [{ type: "text", text: `Folder not found: "${identifier}"` }] };
+    }
+    folder.name = name;
+    writeFolders(folders);
+    return { content: [{ type: "text", text: `Renamed folder to "${name}" (${folder.id}).` }] };
+  }
+);
+
+server.tool(
+  "delete_folder",
+  "Move a folder (and its notes) to the Trash. Reversible via restore_folder. Pass permanent=true to hard-delete the folder AND every note inside it.",
+  {
+    identifier: z.string().describe("Folder ID (UUID) or name"),
+    permanent: z.boolean().optional().describe("If true, hard-delete the folder and all its notes"),
+  },
+  async ({ identifier, permanent }) => {
+    const folders = readFolders();
+    const folder = findFolder(folders, identifier);
+    if (!folder) {
+      return { content: [{ type: "text", text: `Folder not found: "${identifier}"` }] };
+    }
+
+    if (permanent) {
+      const tabs = readTabs();
+      const removedCount = tabs.filter((t) => t.folderId === folder.id).length;
+      const keptTabs = tabs.filter((t) => t.folderId !== folder.id);
+      writeTabs(keptTabs);
+      const remaining = folders.filter((f) => f.id !== folder.id);
+      writeFolders(remaining);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Permanently deleted folder "${folder.name}" and ${removedCount} note(s).`,
+          },
+        ],
+      };
+    }
+
+    folder.isTrashed = true;
+    writeFolders(folders);
+    const inFolder = readTabs().filter((t) => t.folderId === folder.id).length;
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Moved folder "${folder.name}" (${inFolder} note(s)) to Trash. Use restore_folder to bring it back.`,
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "move_note_to_folder",
+  "Move a note into a folder, or pass folder=null/empty to move it back to the root.",
+  {
+    note: z.string().describe("Note ID (UUID) or title"),
+    folder: z.string().nullable().optional().describe("Folder ID (UUID), folder name, or null/empty for root"),
+  },
+  async ({ note, folder }) => {
+    const tabs = readTabs();
+    const tab =
+      tabs.find((t) => t.id === note) ||
+      tabs.find((t) => t.title.toLowerCase() === note.toLowerCase()) ||
+      tabs.find((t) => t.title.toLowerCase().includes(note.toLowerCase()));
+    if (!tab) {
+      return { content: [{ type: "text", text: `Note not found: "${note}"` }] };
+    }
+
+    let targetId = null;
+    let targetName = "root";
+    if (folder && folder.length > 0) {
+      const folders = readFolders();
+      const f = findFolder(folders, folder);
+      if (!f) {
+        return { content: [{ type: "text", text: `Folder not found: "${folder}"` }] };
+      }
+      targetId = f.id;
+      targetName = f.name;
+    }
+
+    tab.folderId = targetId;
+    writeTabs(tabs);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Moved "${tab.title}" to ${targetName}.`,
+        },
+      ],
+    };
   }
 );
 

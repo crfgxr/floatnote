@@ -81,7 +81,7 @@ enum Tokens {
         static var listLineSpacing: CGFloat { round(Tokens.currentBodySize * 0.15) }
         /// Space after a true paragraph (hard return between blocks).
         /// ≈ 1em at current body size.
-        static var paragraphSpacing: CGFloat { round(Tokens.currentBodySize * 0.85) }
+        static var paragraphSpacing: CGFloat { round(Tokens.currentBodySize * 0.25) }
         /// Space after a list item. Obsidian keeps this at 0 — list lines sit
         /// tight together; only real paragraphs get breathing room.
         static let listItemSpacing: CGFloat = 0

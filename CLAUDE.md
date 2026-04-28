@@ -17,7 +17,21 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 
 ## Key Details
 - Fully local-only app (no cloud sync)
-- Data stored at `~/.floatnote-local.html` and `~/.floatnote-tabs.json`
+- Data stored at `~/.floatnote-local.html`, `~/.floatnote-tabs.json`, `~/.floatnote-folders.json`
+- Recordings live in `~/.floatnote-recordings/`
+
+## Folders & Trash
+- Folders are a flat list in `~/.floatnote-folders.json`: `{id, name, isExpanded, isTrashed?}`
+- Notes reference folders via `folderId` (UUID string). `null` = root.
+- **Trash is virtual**, not a real folder:
+  - Trashed folder → `Folder.isTrashed = true` (its notes keep their `folderId` so they restore as a group)
+  - Loose-trashed note → `folderId = TRASH_FOLDER_ID` sentinel (`00000000-0000-0000-0000-000000000001`)
+  - The Trash sentinel UUID must stay in sync between `App.swift` and `mcp-server.js`
+- Sidebar renders a pinned Trash section at the bottom; trashed items have Restore + Delete Permanently in the context menu. No auto-purge.
+- When mutating a nested `@Published` property of a `Folder`/`NoteTab` that the sidebar partitions on (e.g. `isTrashed`, `folderId`), reassign the parent VM array (`folders = folders` / `tabs = tabs`) so `@Published` re-fires and the sidebar repartitions.
+
+## Default-Open Note
+- On launch, the app opens the first non-trashed note whose title contains "backlog - agentforce" (case/whitespace-insensitive substring), falling back to the first non-trashed tab.
 
 ## Editor Features
 - **Toolbar**: Minimal plain-style buttons with hover highlights, flexible layout (all buttons visible at any width)
