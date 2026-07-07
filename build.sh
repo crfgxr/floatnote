@@ -20,6 +20,13 @@ done
 cp Info.plist "/Applications/FloatNote.app/Contents/Info.plist"
 cp AppIcon.icns "/Applications/FloatNote.app/Contents/Resources/AppIcon.icns"
 touch "/Applications/FloatNote.app"
-codesign --force --deep --sign "FloatNote Dev" --options runtime /Applications/FloatNote.app
+# Sign with the "FloatNote Dev" identity when present; otherwise ad-hoc —
+# which is how the app has actually been running (no identity in the keychain,
+# and the old script ignored the codesign failure silently).
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "FloatNote Dev"; then
+    codesign --force --deep --sign "FloatNote Dev" --options runtime /Applications/FloatNote.app
+else
+    codesign --force --deep --sign - /Applications/FloatNote.app
+fi
 open /Applications/FloatNote.app
 echo "Done — app updated and launched."
