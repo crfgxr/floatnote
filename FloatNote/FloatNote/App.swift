@@ -498,9 +498,7 @@ class EditorViewModel: ObservableObject {
     /// `path`. Used to navigate from a terminal tab back to its note.
     func folderForTerminalPath(_ path: String) -> Folder? {
         for folder in folders where !folder.isTrashed {
-            guard let pathNote = tabs.first(where: { n in
-                n.folderId == folder.id && n.title.lowercased().contains("terminal path")
-            }) else { continue }
+            guard let pathNote = terminalPathNote(in: folder.id) else { continue }
             let plain = htmlToAttributedString(pathNote.html)?.string ?? ""
             guard let firstLine = plain
                 .split(separator: "\n", omittingEmptySubsequences: false)
@@ -545,15 +543,40 @@ class EditorViewModel: ObservableObject {
         isTerminalVisible = true
     }
 
-    /// The terminal route for a note: its folder's "terminal path" note's first
-    /// non-empty body line, with `~` expanded. Direct folder only (no ancestor
-    /// walk). Returns nil when there's no folder, no path note, or an empty path.
+    /// The "terminal path" note directly inside `folderId`, if any. Loose-trashed
+    /// notes are excluded automatically (their folderId is the Trash sentinel).
+    private func terminalPathNote(in folderId: UUID) -> NoteTab? {
+        tabs.first { $0.folderId == folderId && $0.title.lowercased().contains("terminal path") }
+    }
+
+    /// The folder whose "terminal path" note governs `folderId`'s subtree: the
+    /// TOP-MOST non-trashed ancestor (self included) that contains a "terminal
+    /// path" note. Nil when no ancestor has one. Capped at 64 hops so a corrupt
+    /// parent cycle can never hang the walk (moveFolder already rejects cycles).
+    private func terminalRouteFolder(startingAt folderId: UUID) -> Folder? {
+        var winner: Folder? = nil
+        var currentId: UUID? = folderId
+        var hops = 0
+        while let cid = currentId, hops < 64 {
+            hops += 1
+            guard let folder = folders.first(where: { $0.id == cid }) else { break }
+            if !folder.isTrashed && terminalPathNote(in: cid) != nil {
+                winner = folder
+            }
+            currentId = folder.parentId
+        }
+        return winner
+    }
+
+    /// The terminal route for a note: the TOP-MOST ancestor folder (the note's
+    /// own folder included) with a "terminal path" note; path = that note's
+    /// first non-empty body line, `~`-expanded; label = that folder's name.
+    /// Returns nil when there's no folder, no path note anywhere up the chain,
+    /// or an empty path.
     func terminalRoute(for tab: NoteTab?) -> (path: String, label: String)? {
         guard let tab, let folderId = tab.folderId,
-              let folder = folders.first(where: { $0.id == folderId }) else { return nil }
-        guard let pathNote = tabs.first(where: { n in
-            n.folderId == folderId && n.title.lowercased().contains("terminal path")
-        }) else { return nil }
+              let folder = terminalRouteFolder(startingAt: folderId),
+              let pathNote = terminalPathNote(in: folder.id) else { return nil }
         let plain = htmlToAttributedString(pathNote.html)?.string ?? ""
         guard let firstLine = plain
             .split(separator: "\n", omittingEmptySubsequences: false)
