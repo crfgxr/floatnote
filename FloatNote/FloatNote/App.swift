@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.23.3"
+let APP_VERSION = "v1.36.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -50,16 +50,92 @@ struct FloatNoteApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var vm: EditorViewModel?
     private var fileWatchTimer: Timer?
+    private var terminalKeyMonitor: Any?
+    private var terminalExitObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
         dbg("APP LAUNCHED")
 
-        // Poll tabs file for external changes (e.g. from MCP server)
+        // Poll tabs + folders files for external changes (e.g. from MCP server)
         fileWatchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let vm = self?.vm else { return }
             MainActor.assumeIsolated {
                 vm.checkExternalTabChanges()
+                vm.checkExternalFolderChanges()
+                vm.checkExternalBoardChanges()
+            }
+        }
+
+        // Terminal-scoped shortcuts: when keyboard focus is inside a terminal,
+        // Cmd+N opens a new terminal, and Shift+Enter inserts a newline in the
+        // input (so a TUI like Claude Code drops to the line below instead of
+        // submitting). With focus elsewhere those keep their defaults.
+        // Cmd+W is swallowed app-wide — it must never close the window (which
+        // would take the terminal panel with it); tabs close only via ✕ / exit.
+        terminalKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, let vm = self.vm,
+                  let key = event.charactersIgnoringModifiers?.lowercased()
+            else { return event }
+            let mods = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            if mods == [.command] && key == "w" { return nil }
+            // Cmd+F → in-note find bar. Terminals keep their own keys, and the
+            // board view has no text to search.
+            if mods == [.command] && key == "f",
+               TerminalSessions.shared.id(containing: NSApp.keyWindow?.firstResponder) == nil {
+                var handled = false
+                MainActor.assumeIsolated {
+                    guard !vm.isBoardVisible, let tv = vm.editorCoordinator?.textView else { return }
+                    tv.window?.makeFirstResponder(tv)
+                    let action = NSMenuItem()
+                    action.tag = NSTextFinder.Action.showFindInterface.rawValue
+                    tv.performTextFinderAction(action)
+                    handled = true
+                }
+                return handled ? nil : event
+            }
+            let isCmd = mods == [.command] && (key == "n" || key == "\r")
+            let isShiftEnter = mods == [.shift] && key == "\r"
+            guard isCmd || isShiftEnter,
+                  let focusedId = TerminalSessions.shared.id(containing: NSApp.keyWindow?.firstResponder)
+            else { return event }
+            MainActor.assumeIsolated {
+                if isShiftEnter {
+                    // Shift+Enter → insert a newline without submitting. Send the
+                    // Option/Meta+Return sequence (ESC + CR), which line editors
+                    // like Claude Code interpret as "newline", not "submit".
+                    TerminalSessions.shared.existing(focusedId)?.view.send(txt: "\u{1b}\r")
+                } else if key == "n" {
+                    withAnimation(.easeInOut(duration: 0.18)) { vm.addTerminal() }
+                    if let newId = vm.activeTerminalId { self.focusTerminal(newId) }
+                } else {
+                    // Cmd+Enter → line feed (Ctrl+J): newline without submitting.
+                    TerminalSessions.shared.existing(focusedId)?.view.send(txt: "\n")
+                }
+            }
+            return nil // swallow the event — fully handled
+        }
+
+        // A shell that exits on its own (user typed `exit`) closes its pane.
+        terminalExitObserver = NotificationCenter.default.addObserver(
+            forName: .floatnoteTerminalExited, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let vm = self?.vm, let id = note.object as? UUID,
+                  vm.terminalTabs.contains(where: { $0.id == id }) else { return }
+            MainActor.assumeIsolated {
+                withAnimation(.easeInOut(duration: 0.18)) { vm.closeTerminal(id) }
+            }
+        }
+    }
+
+    /// Make a terminal's view first responder once SwiftUI has (re)mounted it.
+    private func focusTerminal(_ id: UUID) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            MainActor.assumeIsolated {
+                guard let session = TerminalSessions.shared.existing(id) else { return }
+                let view = session.view
+                guard view.window != nil else { return }
+                view.window?.makeFirstResponder(view)
             }
         }
     }
@@ -114,7 +190,7 @@ enum FormatAction: Equatable {
 // MARK: - Theme
 
 enum AppTheme: String, CaseIterable, Identifiable {
-    case obsidian, paper, sepia, midnight
+    case obsidian, paper, sepia, midnight, solarized
 
     var id: String { rawValue }
 
@@ -124,6 +200,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .paper: return "Paper"
         case .sepia: return "Sepia"
         case .midnight: return "Midnight"
+        case .solarized: return "Solarized"
         }
     }
 
@@ -133,12 +210,13 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .paper: return "sun.max.fill"
         case .sepia: return "leaf.fill"
         case .midnight: return "moon.stars.fill"
+        case .solarized: return "circle.lefthalf.filled"
         }
     }
 
     var swiftUIScheme: ColorScheme {
         switch self {
-        case .obsidian, .midnight: return .dark
+        case .obsidian, .midnight, .solarized: return .dark
         case .paper, .sepia: return .light
         }
     }
@@ -150,6 +228,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .paper:    return NSColor(calibratedRed: 0.995, green: 0.995, blue: 0.993, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.96, green: 0.92, blue: 0.83, alpha: 1.0)
         case .midnight: return NSColor(calibratedRed: 0.102, green: 0.094, blue: 0.086, alpha: 1.0)
+        case .solarized: return NSColor(srgbRed: 0.0275, green: 0.2118, blue: 0.2588, alpha: 1.0) // base02 #073642
         }
     }
 
@@ -160,6 +239,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .paper:    return NSColor(calibratedWhite: 0.13, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.36, green: 0.25, blue: 0.15, alpha: 1.0)
         case .midnight: return NSColor(calibratedRed: 0.83, green: 0.81, blue: 0.76, alpha: 1.0)
+        case .solarized: return NSColor(srgbRed: 0.5137, green: 0.5804, blue: 0.5882, alpha: 1.0) // base0 #839496
         }
     }
 
@@ -169,6 +249,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .paper:    return NSColor(calibratedWhite: 0.1, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.36, green: 0.25, blue: 0.15, alpha: 1.0)
         case .midnight: return NSColor(calibratedRed: 0.79, green: 0.66, blue: 0.43, alpha: 1.0)
+        case .solarized: return NSColor(srgbRed: 0.5765, green: 0.6314, blue: 0.6314, alpha: 1.0) // base1 #93a1a1
         }
     }
 
@@ -179,6 +260,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
         case .paper:    return NSColor(calibratedRed: 0.99, green: 0.99, blue: 0.99, alpha: 1.0)
         case .sepia:    return NSColor(calibratedRed: 0.96, green: 0.92, blue: 0.83, alpha: 1.0)
         case .midnight: return NSColor(calibratedRed: 0.102, green: 0.094, blue: 0.086, alpha: 1.0)
+        case .solarized: return NSColor(srgbRed: 0.0275, green: 0.2118, blue: 0.2588, alpha: 1.0) // base02 #073642
         }
     }
 
@@ -191,6 +273,8 @@ enum AppTheme: String, CaseIterable, Identifiable {
             Color(red: 0.93, green: 0.88, blue: 0.78)
         case .midnight:
             Color(red: 0.082, green: 0.074, blue: 0.066)
+        case .solarized:
+            Color(red: 0.0, green: 0.169, blue: 0.212) // base03 #002b36 — slightly darker than the editor
         default:
             Rectangle().fill(.bar)
         }
@@ -215,10 +299,25 @@ class NoteTab: Identifiable, ObservableObject {
     var lastSavedHTML: String = ""
     var recordingPath: String? = nil
     @Published var folderId: UUID? = nil
+    /// Number of unchecked (`☐`) checklist items in this note. Drives the sidebar badge.
+    @Published var uncheckedCount: Int = 0
 
     init(id: UUID = UUID(), title: String) {
         self.id = id
         self.title = title
+    }
+
+    /// Count unchecked checkbox glyphs (`☐`) in a piece of text. Works on both the
+    /// stored HTML (which keeps `☐` literal) and the live editor's plain string.
+    static func countUnchecked(in text: String) -> Int {
+        var count = 0
+        for ch in text where ch == "☐" { count += 1 }
+        return count
+    }
+
+    /// Recompute `uncheckedCount` from this note's stored HTML.
+    func recomputeUncheckedFromHTML() {
+        uncheckedCount = NoteTab.countUnchecked(in: html)
     }
 
     func toData() -> TabData {
@@ -236,6 +335,7 @@ class NoteTab: Identifiable, ObservableObject {
         tab.html = data.html
         tab.recordingPath = data.recordingPath
         if let fid = data.folderId { tab.folderId = UUID(uuidString: fid) }
+        tab.recomputeUncheckedFromHTML()
         return tab
     }
 }
@@ -247,6 +347,7 @@ struct FolderData: Codable {
     var name: String
     var isExpanded: Bool
     var isTrashed: Bool? = nil  // optional for backwards-compat with older JSON
+    var parentId: String? = nil // optional; nil = root (back-compat with flat JSON)
 }
 
 class Folder: Identifiable, ObservableObject {
@@ -254,16 +355,20 @@ class Folder: Identifiable, ObservableObject {
     @Published var name: String
     @Published var isExpanded: Bool
     @Published var isTrashed: Bool
+    /// Parent folder for nesting. `nil` = root-level folder.
+    @Published var parentId: UUID?
 
-    init(id: UUID = UUID(), name: String, isExpanded: Bool = true, isTrashed: Bool = false) {
+    init(id: UUID = UUID(), name: String, isExpanded: Bool = true, isTrashed: Bool = false, parentId: UUID? = nil) {
         self.id = id
         self.name = name
         self.isExpanded = isExpanded
         self.isTrashed = isTrashed
+        self.parentId = parentId
     }
 
     func toData() -> FolderData {
-        FolderData(id: id.uuidString, name: name, isExpanded: isExpanded, isTrashed: isTrashed)
+        FolderData(id: id.uuidString, name: name, isExpanded: isExpanded, isTrashed: isTrashed,
+                   parentId: parentId?.uuidString)
     }
 
     static func from(_ data: FolderData) -> Folder {
@@ -271,7 +376,8 @@ class Folder: Identifiable, ObservableObject {
             id: UUID(uuidString: data.id) ?? UUID(),
             name: data.name,
             isExpanded: data.isExpanded,
-            isTrashed: data.isTrashed ?? false
+            isTrashed: data.isTrashed ?? false,
+            parentId: data.parentId.flatMap { UUID(uuidString: $0) }
         )
     }
 }
@@ -282,6 +388,14 @@ class Folder: Identifiable, ObservableObject {
 /// `Folder` — it's synthesized at render time.
 let TRASH_FOLDER_ID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
+/// One terminal in the panel's tab bar. Identified for dedup by `path` (the
+/// shell's working directory); `label` is the folder name shown on the chip.
+struct TerminalTab: Identifiable, Equatable {
+    let id: UUID
+    let path: String
+    let label: String
+}
+
 // MARK: - ViewModel
 
 @MainActor
@@ -290,6 +404,13 @@ class EditorViewModel: ObservableObject {
     @Published var isSaving = false
     @Published var charCount: Int = 0
     @Published var isPinned: Bool = false
+    /// Chrome visibility captured at pin time, restored on unpin.
+    private var prePinSidebarCollapsed: Bool?
+    private var prePinTerminalVisible: Bool?
+    /// Window frame captured at pin time, restored on unpin.
+    private var prePinWindowFrame: NSRect?
+    /// Compact floating-note size applied when pinning.
+    static let pinnedWindowSize = NSSize(width: 300, height: 600)
     @Published var theme: AppTheme = {
         if let raw = UserDefaults.standard.string(forKey: "fn.theme"),
            let t = AppTheme(rawValue: raw) { return t }
@@ -314,12 +435,226 @@ class EditorViewModel: ObservableObject {
     @Published var isTerminalVisible: Bool = UserDefaults.standard.bool(forKey: "fn.terminalVisible") {
         didSet { UserDefaults.standard.set(isTerminalVisible, forKey: "fn.terminalVisible") }
     }
+    /// Terminals shown in the panel, one visible at a time via the tab bar. Each
+    /// tab maps to a mounted SwiftTermContainer (and its shell process), kept
+    /// alive across re-renders. Hiding the panel only unmounts the view — the
+    /// shells survive (hide ≠ kill). Driven by the active note's folder route.
+    @Published var terminalTabs: [TerminalTab] = []
+    /// The currently visible terminal tab.
+    @Published var activeTerminalId: UUID?
+
+    /// Most-recently-active note per folder, so selecting a terminal tab can return
+    /// the user to where they last were in that folder (reverse of folder routing).
+    private var lastActiveNotePerFolder: [UUID: UUID] = [:]
+
     /// Persisted width of the terminal panel.
     @Published var terminalWidth: CGFloat = {
         let v = UserDefaults.standard.double(forKey: "fn.terminalWidth")
         return v > 0 ? CGFloat(v) : 460
     }() {
         didSet { UserDefaults.standard.set(Double(terminalWidth), forKey: "fn.terminalWidth") }
+    }
+
+    /// Narrowest the panel may get (also the resize-handle minimum).
+    static let minTerminalColumnWidth: CGFloat = 200
+
+    /// Current window content width, fed in by `EditorView` from its
+    /// GeometryReader. Used to keep the terminal panel inside the window.
+    var windowContentWidth: CGFloat = 0
+
+    /// Horizontal room the terminal panel may occupy: window width minus the
+    /// sidebar (when open) and the resize handles flanking the panel.
+    func availablePanelWidth() -> CGFloat {
+        let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
+        return max(0, windowContentWidth - sidebar - 10)
+    }
+
+    /// Show the panel, creating a HOME-rooted tab only if none exist.
+    func showTerminal() {
+        if terminalTabs.isEmpty {
+            let id = UUID()
+            terminalTabs.append(TerminalTab(id: id, path: NSHomeDirectory(), label: "terminal"))
+            activeTerminalId = id
+        }
+        isTerminalVisible = true
+    }
+    /// Hide the panel but keep all sessions mounted/alive (hide ≠ kill).
+    func hideTerminal() { isTerminalVisible = false }
+    func toggleTerminal() { isTerminalVisible ? hideTerminal() : showTerminal() }
+
+    /// Activate the tab for `path` if one exists, else create it. Opens the panel.
+    func switchToRoute(path: String, label: String) {
+        if let existing = terminalTabs.first(where: { $0.path == path }) {
+            activeTerminalId = existing.id
+        } else {
+            let id = UUID()
+            terminalTabs.append(TerminalTab(id: id, path: path, label: label))
+            activeTerminalId = id
+        }
+        isTerminalVisible = true
+    }
+
+    /// Reverse of `terminalRoute`: the folder whose "terminal path" note resolves to
+    /// `path`. Used to navigate from a terminal tab back to its note.
+    func folderForTerminalPath(_ path: String) -> Folder? {
+        for folder in folders where !folder.isTrashed {
+            guard let pathNote = tabs.first(where: { n in
+                n.folderId == folder.id && n.title.lowercased().contains("terminal path")
+            }) else { continue }
+            let plain = htmlToAttributedString(pathNote.html)?.string ?? ""
+            guard let firstLine = plain
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map({ $0.trimmingCharacters(in: .whitespaces) })
+                .first(where: { !$0.isEmpty }) else { continue }
+            let expanded = (firstLine as NSString).expandingTildeInPath
+            if !expanded.isEmpty && expanded == path { return folder }
+        }
+        return nil
+    }
+
+    /// The note to land on when entering `folder` via its terminal: the last note the
+    /// user had open there, else the folder's first non-"terminal path" note.
+    private func noteToActivate(forTerminalFolder folder: Folder) -> NoteTab? {
+        if let lastId = lastActiveNotePerFolder[folder.id],
+           let last = tabs.first(where: { $0.id == lastId && $0.folderId == folder.id }) {
+            return last
+        }
+        return tabs.first(where: { $0.folderId == folder.id
+            && !$0.title.lowercased().contains("terminal path") })
+    }
+
+    /// Activate a terminal tab (user tapped its chip) and, if its path maps to a
+    /// folder, navigate to the related note. The resulting note→terminal route dedups
+    /// to this same tab, so there is no ping-pong.
+    func selectTerminal(_ id: UUID) {
+        activeTerminalId = id
+        guard let tab = terminalTabs.first(where: { $0.id == id }),
+              let folder = folderForTerminalPath(tab.path),
+              let note = noteToActivate(forTerminalFolder: folder) else { return }
+        if note.id != activeTabId { switchTab(note.id) }
+    }
+
+    /// Manual "+": a fresh tab at the active note's route, else HOME.
+    func addTerminal() {
+        let route = terminalRoute(for: activeTab)
+        let id = UUID()
+        terminalTabs.append(TerminalTab(id: id,
+                                        path: route?.path ?? NSHomeDirectory(),
+                                        label: route?.label ?? "terminal"))
+        activeTerminalId = id
+        isTerminalVisible = true
+    }
+
+    /// The terminal route for a note: its folder's "terminal path" note's first
+    /// non-empty body line, with `~` expanded. Direct folder only (no ancestor
+    /// walk). Returns nil when there's no folder, no path note, or an empty path.
+    func terminalRoute(for tab: NoteTab?) -> (path: String, label: String)? {
+        guard let tab, let folderId = tab.folderId,
+              let folder = folders.first(where: { $0.id == folderId }) else { return nil }
+        guard let pathNote = tabs.first(where: { n in
+            n.folderId == folderId && n.title.lowercased().contains("terminal path")
+        }) else { return nil }
+        let plain = htmlToAttributedString(pathNote.html)?.string ?? ""
+        guard let firstLine = plain
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map({ $0.trimmingCharacters(in: .whitespaces) })
+            .first(where: { !$0.isEmpty }) else { return nil }
+        let expanded = (firstLine as NSString).expandingTildeInPath
+        guard !expanded.isEmpty else { return nil }
+        return (expanded, folder.name)
+    }
+
+    /// Drive the terminal panel from the active note: route → open + switch/create
+    /// that tab; no route → hide the panel (sessions survive).
+    func applyTerminalRouteForActiveNote() {
+        // Pinned = compact floating note: never auto-open the panel. Unpin
+        // re-applies the route for whatever note is active then.
+        if isPinned { return }
+        if let route = terminalRoute(for: activeTab) {
+            switchToRoute(path: route.path, label: route.label)
+        } else {
+            hideTerminal()
+        }
+    }
+
+    /// Close (kill) a single terminal session. Activates a neighbor; closing the
+    /// last one hides the panel.
+    func closeTerminal(_ id: UUID) {
+        // Sessions are owned by TerminalSessions (not the SwiftUI view), so the
+        // shell is killed only here on explicit close — never on hide.
+        TerminalSessions.shared.close(id)
+        guard let idx = terminalTabs.firstIndex(where: { $0.id == id }) else { return }
+        terminalTabs.remove(at: idx)
+        if activeTerminalId == id {
+            activeTerminalId = terminalTabs.isEmpty ? nil
+                : terminalTabs[min(idx, terminalTabs.count - 1)].id
+        }
+        if terminalTabs.isEmpty { isTerminalVisible = false }
+    }
+
+    // MARK: - Excalidraw boards
+
+    /// Whether the active note's Excalidraw board is shown in place of the editor.
+    /// Global view flag (not persisted); reset to false when switching notes.
+    @Published var isBoardVisible: Bool = false
+    /// Note IDs whose board currently has at least one element. Drives the toolbar
+    /// button's active/passive state. Seeded at launch, updated whenever a board saves.
+    @Published var boardContentIds: Set<UUID> = []
+    /// Observer token for board-save notifications from `ExcalidrawBoardView`.
+    private var boardSaveObserver: NSObjectProtocol?
+    /// Board-file mod-dates as last seen/written by this app — the External
+    /// File Sync pattern's capture-on-save guard, applied to boards. A file
+    /// whose date differs was written by MCP.
+    private var lastBoardModDates: [UUID: Date] = [:]
+
+    func toggleBoard() { isBoardVisible.toggle() }
+
+    /// True when the given note has a non-empty board.
+    func boardHasContent(_ id: UUID?) -> Bool {
+        guard let id else { return false }
+        return boardContentIds.contains(id)
+    }
+
+    /// Seed `boardContentIds` from disk and start listening for board saves so the
+    /// toolbar button's active/passive state stays current.
+    private func startBoardTracking() {
+        boardContentIds = ExcalidrawStore.scanContentIds()
+        lastBoardModDates = ExcalidrawStore.scanModDates()
+        boardSaveObserver = NotificationCenter.default.addObserver(
+            forName: .floatnoteBoardSaved, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let id = note.userInfo?["tabId"] as? UUID,
+                  let hasContent = note.userInfo?["hasContent"] as? Bool else { return }
+            if hasContent { self.boardContentIds.insert(id) }
+            else { self.boardContentIds.remove(id) }
+            // Capture the date of our own write so the external-change watcher
+            // doesn't treat it as a foreign (MCP) edit.
+            self.lastBoardModDates[id] = ExcalidrawStore.modDate(for: id)
+        }
+    }
+
+    /// Detect board files rewritten from outside the app (MCP `draw_on_board`):
+    /// refresh the toolbar indicator and surface the change — the active note's
+    /// board auto-opens, or reloads in place when already open. Polled by the
+    /// same 2s AppDelegate timer as the tabs/folders watchers.
+    func checkExternalBoardChanges() {
+        let current = ExcalidrawStore.scanModDates()
+        let changed = current.filter { lastBoardModDates[$0.key] != $0.value }.map(\.key)
+        let removed = Set(lastBoardModDates.keys).subtracting(current.keys)
+        guard !changed.isEmpty || !removed.isEmpty else { return }
+        lastBoardModDates = current
+        for id in removed { boardContentIds.remove(id) }
+        for id in changed {
+            if ExcalidrawStore.hasContent(for: id) { boardContentIds.insert(id) }
+            else { boardContentIds.remove(id) }
+            guard id == activeTabId else { continue }
+            if isBoardVisible {
+                NotificationCenter.default.post(name: .floatnoteBoardExternallyChanged, object: id)
+            } else {
+                isBoardVisible = true
+            }
+        }
     }
     /// Folders tree. Flat list; notes reference folders by `folderId`.
     @Published var folders: [Folder] = []
@@ -341,6 +676,8 @@ class EditorViewModel: ObservableObject {
     @Published var activeTabId: UUID?
     @Published var editingTabId: UUID?
     @Published var draggingTabId: UUID?
+    /// Folder currently being dragged in the sidebar (for folder→folder nesting).
+    @Published var draggingFolderId: UUID?
     @Published var isRecording = false
     @Published var isSavingRecording = false
     @Published var recordPermissionDenied = false
@@ -380,12 +717,18 @@ class EditorViewModel: ObservableObject {
     private var lastSavedHTML: String = ""
     private var currentHTML: String = ""
     var lastTabsModDate: Date?
+    var lastFoldersModDate: Date?
+    /// Tokens for the block-based dictation observers so they can be removed.
+    /// (The View struct can't be used as an observer; these must live here.)
+    var dictationEndToken: NSObjectProtocol?
+    var appActiveToken: NSObjectProtocol?
     private var deletedTabIds: Set<String> = []
     private var isSavingInternally = false
     private var suppressSaveAfterReload = false
 
     init() {
         loadOrCreateNote()
+        startBoardTracking()
     }
 
     private func loadOrCreateNote() {
@@ -434,6 +777,7 @@ class EditorViewModel: ObservableObject {
         }
         status = currentHTML.isEmpty ? "Ready" : "Loaded"
         lastTabsModDate = tabsFileModDate()
+        applyTerminalRouteForActiveNote()
     }
 
     private func loadTabsLocal() {
@@ -460,6 +804,11 @@ class EditorViewModel: ObservableObject {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_TABS_PATH)),
               let tabsData = try? JSONDecoder().decode([TabData].self, from: data) else { return }
 
+        // Commit any pending editor edits to currentHTML / activeTab.html BEFORE
+        // we cancel the save timer — otherwise the user's last <0.5s of typing is
+        // dropped (the timer that would have serialized it is about to be killed).
+        flushPendingHTML()
+
         // Cancel any pending save to avoid overwriting external changes
         saveTimer?.invalidate()
         saveTimer = nil
@@ -472,8 +821,11 @@ class EditorViewModel: ObservableObject {
         let existingIds = Set(tabs.map { $0.id })
         let diskIds = Set(newTabs.map { $0.id })
 
-        // Add new tabs that appeared on disk
-        for newTab in newTabs where !existingIds.contains(newTab.id) {
+        // Add new tabs that appeared on disk — but never resurrect a note the
+        // user just permanently deleted (its id may still linger in a stale
+        // on-disk copy until the next write settles).
+        for newTab in newTabs where !existingIds.contains(newTab.id)
+            && !deletedTabIds.contains(newTab.id.uuidString.uppercased()) {
             tabs.append(newTab)
         }
         // Remove tabs deleted from disk (except active)
@@ -482,11 +834,22 @@ class EditorViewModel: ObservableObject {
         // Refresh tab content from disk
         for diskTab in newTabs {
             guard let existing = tabs.first(where: { $0.id == diskTab.id }) else { continue }
+            // folderId can change externally (e.g. MCP create_note + move_note_to_folder
+            // sequence). Always sync it — for active and non-active tabs alike — so
+            // the sidebar reflects MCP-driven moves.
+            let diskFolderId = diskTab.folderId
+            if existing.folderId != diskFolderId {
+                existing.folderId = diskFolderId
+            }
             if diskTab.id == currentActiveId {
-                // Active tab: reload editor if content changed externally
-                if diskTab.html != currentHTML && !diskTab.html.isEmpty {
+                // Active tab: only adopt the disk copy if it diverged from what
+                // WE last saved (a genuine external edit to this note). Comparing
+                // against lastSavedHTML — not currentHTML — means our own unsaved
+                // in-memory edits are preserved when some *other* note changed.
+                if diskTab.html != lastSavedHTML && !diskTab.html.isEmpty {
                     currentHTML = diskTab.html
                     existing.html = diskTab.html
+                    existing.recomputeUncheckedFromHTML()
                     lastSavedHTML = diskTab.html
                     suppressSaveAfterReload = true
                     if let attrStr = htmlToAttributedString(diskTab.html) {
@@ -501,29 +864,45 @@ class EditorViewModel: ObservableObject {
                 existing.html = diskTab.html
                 existing.title = diskTab.title
                 existing.recordingPath = diskTab.recordingPath
+                existing.recomputeUncheckedFromHTML()
             }
         }
+        // Re-fire @Published since we mutated nested NoteTab properties.
+        tabs = tabs
     }
 
     func saveTabsLocal() {
         isSavingInternally = true
-        // Merge externally-added tabs (e.g. from MCP) before saving
-        if let diskData = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_TABS_PATH)),
+        // Merge externally-added tabs (e.g. from MCP) before saving — but only
+        // if the file actually changed on disk since our last save. When it's
+        // unchanged (the common keystroke-debounce path) the merge can find
+        // nothing new, so we skip the disk read + full JSON decode entirely.
+        if tabsFileModDate() != lastTabsModDate,
+           let diskData = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_TABS_PATH)),
            let diskTabs = try? JSONDecoder().decode([TabData].self, from: diskData) {
             let memoryIds = Set(tabs.map { $0.id })
+            let tabsById = Dictionary(tabs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             for dt in diskTabs {
                 guard let diskId = UUID(uuidString: dt.id),
                       !deletedTabIds.contains(dt.id.uppercased()) else { continue }
                 if !memoryIds.contains(diskId) {
                     // New tab from external source
                     tabs.append(NoteTab.from(dt))
-                } else if diskId != activeTabId,
-                          let tab = tabs.first(where: { $0.id == diskId }),
-                          tab.html != dt.html {
-                    // External edit to non-active tab — adopt disk version
-                    tab.html = dt.html
-                    tab.title = dt.title
-                    tab.recordingPath = dt.recordingPath
+                } else if let tab = tabsById[diskId] {
+                    // Always sync folderId from disk — MCP can move a note while
+                    // we hold a stale in-memory copy, and we must not clobber the
+                    // move with our save. Same for active tab.
+                    let diskFolderId = dt.folderId.flatMap { UUID(uuidString: $0) }
+                    if tab.folderId != diskFolderId {
+                        tab.folderId = diskFolderId
+                    }
+                    // Body/title/recording: don't overwrite the active tab
+                    // (user may be typing); for others, adopt the disk version.
+                    if diskId != activeTabId, tab.html != dt.html {
+                        tab.html = dt.html
+                        tab.title = dt.title
+                        tab.recordingPath = dt.recordingPath
+                    }
                 }
             }
         }
@@ -541,6 +920,7 @@ class EditorViewModel: ObservableObject {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_FOLDERS_PATH)),
               let list = try? JSONDecoder().decode([FolderData].self, from: data) else { return }
         folders = list.map { Folder.from($0) }
+        lastFoldersModDate = foldersFileModDate()
     }
 
     func saveFoldersLocal() {
@@ -551,6 +931,27 @@ class EditorViewModel: ObservableObject {
             _ = try? FileManager.default.replaceItemAt(
                 URL(fileURLWithPath: LOCAL_FOLDERS_PATH), withItemAt: tmp
             )
+        }
+        // Capture our own write's mod date so the external-change watcher
+        // doesn't treat it as a foreign edit and clobber in-memory state.
+        lastFoldersModDate = foldersFileModDate()
+    }
+
+    private func foldersFileModDate() -> Date? {
+        try? FileManager.default.attributesOfItem(atPath: LOCAL_FOLDERS_PATH)[.modificationDate] as? Date
+    }
+
+    /// Polled from the file-watch timer. If the folders file has changed on
+    /// disk since our last save (e.g. MCP server created/renamed/trashed a
+    /// folder), reload from disk so the sidebar reflects the change.
+    func checkExternalFolderChanges() {
+        let current = foldersFileModDate()
+        if let current, current != lastFoldersModDate {
+            lastFoldersModDate = current
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_FOLDERS_PATH)),
+               let list = try? JSONDecoder().decode([FolderData].self, from: data) {
+                folders = list.map { Folder.from($0) }
+            }
         }
     }
 
@@ -575,25 +976,78 @@ class EditorViewModel: ObservableObject {
         saveFoldersLocal()
     }
 
+    // MARK: - Folder nesting
+
+    /// Direct child folders of `parent` (nil = root), trash state ignored.
+    func childFolders(of parent: UUID?) -> [Folder] {
+        folders.filter { $0.parentId == parent }
+    }
+
+    /// All descendant folder IDs of `id` (children, grandchildren, …).
+    func descendantFolderIds(of id: UUID) -> Set<UUID> {
+        var result = Set<UUID>()
+        var stack = [id]
+        while let current = stack.popLast() {
+            for child in folders where child.parentId == current {
+                if result.insert(child.id).inserted { stack.append(child.id) }
+            }
+        }
+        return result
+    }
+
+    /// True if `candidate` is `ancestor` itself or nested anywhere beneath it.
+    private func isSelfOrDescendant(_ candidate: UUID, of ancestor: UUID) -> Bool {
+        candidate == ancestor || descendantFolderIds(of: ancestor).contains(candidate)
+    }
+
+    /// Move `folderId` under `newParent` (nil = root). Rejected if it would
+    /// create a cycle (dropping a folder onto itself or one of its descendants).
+    func moveFolder(_ folderId: UUID, toParent newParent: UUID?) {
+        guard let folder = folders.first(where: { $0.id == folderId }) else { return }
+        if let newParent {
+            guard !isSelfOrDescendant(newParent, of: folderId) else { return }
+            // Auto-expand the destination so the moved folder is visible.
+            folders.first(where: { $0.id == newParent })?.isExpanded = true
+        }
+        guard folder.parentId != newParent else { return }
+        folder.parentId = newParent
+        folders = folders  // re-fire @Published so the sidebar repartitions
+        saveFoldersLocal()
+    }
+
     /// Move a folder (and its contained notes) to the Trash. Reversible via
     /// `restoreFolder`. The folder + its notes remain on disk; only the
     /// folder's `isTrashed` flag changes.
     func trashFolder(_ id: UUID) {
         guard let f = folders.first(where: { $0.id == id }) else { return }
-        f.isTrashed = true
+        // Cascade: the folder and every subfolder beneath it go to Trash together.
+        let subtree = descendantFolderIds(of: id).union([id])
+        for folder in folders where subtree.contains(folder.id) {
+            folder.isTrashed = true
+        }
         folders = folders  // re-fire @Published so sidebar repartitions
-        // If the active note lives inside this folder, switch to a visible one.
-        if let active = activeTab, active.folderId == id {
+        // If the active note lives anywhere in this subtree, switch to a visible one.
+        if let active = activeTab, let fid = active.folderId, subtree.contains(fid) {
             switchToFirstVisibleTab(excluding: nil)
         }
         isTrashExpanded = true
         saveFoldersLocal()
     }
 
-    /// Restore a trashed folder (and its notes) back to the sidebar.
+    /// Restore a trashed folder subtree back to the sidebar. If its parent is no
+    /// longer present/visible, the restored root is reparented to root so it
+    /// can't become orphaned.
     func restoreFolder(_ id: UUID) {
         guard let f = folders.first(where: { $0.id == id }) else { return }
-        f.isTrashed = false
+        let subtree = descendantFolderIds(of: id).union([id])
+        for folder in folders where subtree.contains(folder.id) {
+            folder.isTrashed = false
+        }
+        // If the parent is missing or still trashed, lift this root to top level.
+        if let pid = f.parentId,
+           folders.first(where: { $0.id == pid })?.isTrashed != false {
+            f.parentId = nil
+        }
         folders = folders  // re-fire @Published so sidebar repartitions
         // Also nudge tabs so any tab views inside the (now-restored) folder rerender.
         tabs = tabs
@@ -603,16 +1057,20 @@ class EditorViewModel: ObservableObject {
     /// Permanently delete a folder and ALL notes inside it. Recordings on disk
     /// are removed. No restore after this.
     func permanentlyDeleteFolder(_ id: UUID) {
-        let doomedTabs = tabs.filter { $0.folderId == id }
+        // Cascade: this folder plus every subfolder beneath it, and all their notes.
+        let doomedFolderIds = descendantFolderIds(of: id).union([id])
+        let doomedTabs = tabs.filter { $0.folderId.map { doomedFolderIds.contains($0) } ?? false }
         let doomedActive = doomedTabs.contains { $0.id == activeTabId }
         for tab in doomedTabs {
             deletedTabIds.insert(tab.id.uuidString.uppercased())
             if let recPath = tab.recordingPath {
                 try? FileManager.default.removeItem(atPath: recPath)
             }
+            ExcalidrawStore.deleteBoard(for: tab.id)
+            boardContentIds.remove(tab.id)
         }
-        tabs.removeAll { $0.folderId == id }
-        folders.removeAll { $0.id == id }
+        tabs.removeAll { $0.folderId.map { doomedFolderIds.contains($0) } ?? false }
+        folders.removeAll { doomedFolderIds.contains($0.id) }
         if doomedActive { switchToFirstVisibleTab(excluding: nil) }
         saveFoldersLocal()
         saveTabsLocal()
@@ -628,6 +1086,8 @@ class EditorViewModel: ObservableObject {
             if let recPath = tab.recordingPath {
                 try? FileManager.default.removeItem(atPath: recPath)
             }
+            ExcalidrawStore.deleteBoard(for: tab.id)
+            boardContentIds.remove(tab.id)
         }
         tabs.removeAll { $0.folderId == TRASH_FOLDER_ID }
 
@@ -638,6 +1098,8 @@ class EditorViewModel: ObservableObject {
             if let recPath = tab.recordingPath {
                 try? FileManager.default.removeItem(atPath: recPath)
             }
+            ExcalidrawStore.deleteBoard(for: tab.id)
+            boardContentIds.remove(tab.id)
         }
         tabs.removeAll { tab in tab.folderId.map { trashedIds.contains($0) } ?? false }
         folders.removeAll { $0.isTrashed }
@@ -659,16 +1121,22 @@ class EditorViewModel: ObservableObject {
         saveTabsLocal()
     }
 
-    /// Convenience: pick a non-trashed tab and switch to it. If none exists,
-    /// create an Untitled note so the editor always has something to show.
+    /// Convenience: switch to the preferred home note ("backlog - agentforce")
+    /// if available, otherwise the first non-trashed tab. If nothing visible
+    /// remains, create an Untitled note so the editor always has something.
     private func switchToFirstVisibleTab(excluding excludeId: UUID?) {
         let trashedFolderIds = Set(folders.filter { $0.isTrashed }.map { $0.id })
-        let candidate = tabs.first { tab in
+        func isVisible(_ tab: NoteTab) -> Bool {
             tab.id != excludeId &&
             tab.folderId != TRASH_FOLDER_ID &&
             !(tab.folderId.map { trashedFolderIds.contains($0) } ?? false)
         }
-        if let target = candidate {
+        let normalizedPreferred = "backlog - agentforce"
+        let preferred = tabs.first { tab in
+            isVisible(tab) &&
+            tab.title.lowercased().trimmingCharacters(in: .whitespaces).contains(normalizedPreferred)
+        }
+        if let target = preferred ?? tabs.first(where: isVisible) {
             switchTab(target.id)
         } else {
             addTab()
@@ -693,6 +1161,9 @@ class EditorViewModel: ObservableObject {
     func switchTab(_ id: UUID) {
         guard id != activeTabId, let newTab = tabs.first(where: { $0.id == id }) else { return }
 
+        // Return to note view — avoid dropping the user onto another note's board.
+        isBoardVisible = false
+
         // Commit any active rename
         if let editId = editingTabId {
             if let tab = tabs.first(where: { $0.id == editId }) {
@@ -700,6 +1171,8 @@ class EditorViewModel: ObservableObject {
             }
             editingTabId = nil
         }
+
+        flushPendingHTML()
 
         // Save current tab's state
         if let current = activeTab {
@@ -713,6 +1186,9 @@ class EditorViewModel: ObservableObject {
         saveTabsLocal()
 
         activeTabId = id
+        if let fid = newTab.folderId, fid != TRASH_FOLDER_ID {
+            lastActiveNotePerFolder[fid] = newTab.id
+        }
         currentRecordingPath = newTab.recordingPath
         currentHTML = newTab.html
         lastSavedHTML = newTab.lastSavedHTML
@@ -735,9 +1211,11 @@ class EditorViewModel: ObservableObject {
         }
         DispatchQueue.main.async { self.isLoadingContent = false }
         status = "Loaded"
+        applyTerminalRouteForActiveNote()
     }
 
     func addTab() {
+        flushPendingHTML()
         // Save current tab
         if let current = activeTab {
             current.html = currentHTML
@@ -746,6 +1224,7 @@ class EditorViewModel: ObservableObject {
 
         let tab = NoteTab(title: "Untitled")
         tabs.append(tab)
+        isBoardVisible = false
         activeTabId = tab.id
         currentHTML = ""
         currentRecordingPath = nil
@@ -754,6 +1233,7 @@ class EditorViewModel: ObservableObject {
         onContentLoaded?(NSAttributedString(string: ""))
         saveTabsLocal()
         status = "New note"
+        applyTerminalRouteForActiveNote()
     }
 
     /// Move a note to Trash. Reversible via `restoreTab`.
@@ -762,6 +1242,7 @@ class EditorViewModel: ObservableObject {
         if id == recordingTabId && isRecording { return }
         // Save dirty state on the soon-to-be-trashed active tab before switching.
         if activeTabId == id {
+            flushPendingHTML()
             tab.html = currentHTML
             tab.lastSavedHTML = lastSavedHTML
         }
@@ -796,6 +1277,9 @@ class EditorViewModel: ObservableObject {
         if let recPath = tabs[index].recordingPath {
             try? FileManager.default.removeItem(atPath: recPath)
         }
+        // Delete the note's Excalidraw board, if any.
+        ExcalidrawStore.deleteBoard(for: id)
+        boardContentIds.remove(id)
 
         // Switch away if deleting the active tab
         if activeTabId == id {
@@ -832,23 +1316,51 @@ class EditorViewModel: ObservableObject {
 
     private var saveTimer: Timer?
 
-    func textDidChange(html: String, length: Int) {
+    /// If the debounced save timer is pending, immediately serialize the editor
+    /// state into `currentHTML` and cancel the timer. Call this before any
+    /// code path that needs the latest HTML (tab switch, save, export, trash).
+    func flushPendingHTML() {
+        guard saveTimer != nil else { return }
+        saveTimer?.invalidate()
+        saveTimer = nil
+        if let coord = editorCoordinator, let tv = coord.textView {
+            let html = coord.extractHTML(from: tv)
+            currentHTML = html
+            activeTab?.html = html
+        }
+    }
+
+    func textDidChange(html: String, length: Int, uncheckedCount: Int? = nil) {
         guard !isLoadingContent else { return }
         if suppressSaveAfterReload {
             suppressSaveAfterReload = false
             return
         }
         charCount = length
-        currentHTML = html
-        activeTab?.html = html
+        // Live badge update: reflect checked/unchecked toggles + typed checkboxes in
+        // the sidebar instantly, before the debounced save fires.
+        if let uncheckedCount { activeTab?.uncheckedCount = uncheckedCount }
         status = "Editing..."
-        // Debounce disk writes — save after 0.5s of idle
+        // Debounce disk writes — save after 0.5s of idle.
+        // HTML serialization is expensive (full-document WebKit-style serialize),
+        // so we only do it once when the timer fires, not on every keystroke.
         saveTimer?.invalidate()
         saveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.saveLocal(html: self.currentHTML)
+                let latestHTML: String
+                if let coord = self.editorCoordinator, let tv = coord.textView {
+                    latestHTML = coord.extractHTML(from: tv)
+                } else {
+                    latestHTML = self.currentHTML
+                }
+                self.currentHTML = latestHTML
+                self.activeTab?.html = latestHTML
+                self.saveLocal(html: latestHTML)
                 self.saveTabsLocal()
+                // Track what's now on disk so the external-reload path can tell a
+                // genuine foreign edit from our own unsaved in-memory edits.
+                self.lastSavedHTML = latestHTML
                 self.status = "Saved"
             }
         }
@@ -871,8 +1383,46 @@ class EditorViewModel: ObservableObject {
 
     func togglePin() {
         isPinned.toggle()
-        if let window = NSApp.windows.first(where: { $0.isKeyWindow }) ?? NSApp.windows.first {
-            window.level = isPinned ? .floating : .normal
+        let window = NSApp.windows.first(where: { $0.isKeyWindow }) ?? NSApp.windows.first
+        window?.level = isPinned ? .floating : .normal
+        if isPinned {
+            // Pinned = compact floating note: stash chrome state, then hide the
+            // sidebar and terminal panel (sessions survive — hide ≠ kill).
+            prePinSidebarCollapsed = isSidebarCollapsed
+            prePinTerminalVisible = isTerminalVisible
+            isSidebarCollapsed = true
+            hideTerminal()
+            if let window {
+                prePinWindowFrame = window.frame
+                // The pinned size is below the global 240×180 floor — lower it
+                // for the duration of the pin so setFrame isn't clamped.
+                window.minSize = NSSize(width: Self.pinnedWindowSize.width,
+                                        height: Self.pinnedWindowSize.height)
+                var frame = window.frame
+                frame.origin.y += frame.height - Self.pinnedWindowSize.height  // keep top edge put
+                frame.size = Self.pinnedWindowSize
+                window.setFrame(frame, display: true, animate: true)
+            }
+        } else {
+            if let window {
+                WindowAccessor.applyMinSize(window: window, sidebarCollapsed: isSidebarCollapsed)
+                if let frame = prePinWindowFrame {
+                    window.setFrame(frame, display: true, animate: true)
+                }
+            }
+            prePinWindowFrame = nil
+            if let collapsed = prePinSidebarCollapsed { isSidebarCollapsed = collapsed }
+            if prePinTerminalVisible == true {
+                // Prefer the current note's route (the note may have changed
+                // while pinned); fall back to re-showing the manual terminal.
+                if terminalRoute(for: activeTab) != nil {
+                    applyTerminalRouteForActiveNote()
+                } else {
+                    showTerminal()
+                }
+            }
+            prePinSidebarCollapsed = nil
+            prePinTerminalVisible = nil
         }
     }
 
@@ -985,6 +1535,8 @@ class EditorViewModel: ObservableObject {
         let tid = targetTabId ?? activeTabId
         guard let tid, let tab = tabs.first(where: { $0.id == tid }) else { return }
 
+        if tid == activeTabId { flushPendingHTML() }
+
         let newHtml = text.components(separatedBy: "\n").map { line in
             let escaped = line.replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "<", with: "&lt;")
@@ -1015,6 +1567,7 @@ class EditorViewModel: ObservableObject {
     }
 
     func saveLocalSync() {
+        flushPendingHTML()
         activeTab?.html = currentHTML
         try? currentHTML.write(toFile: LOCAL_SAVE_PATH, atomically: true, encoding: .utf8)
         saveTabsLocal()
@@ -1027,6 +1580,7 @@ class EditorViewModel: ObservableObject {
     // MARK: - Import / Export
 
     func exportNotes() {
+        flushPendingHTML()
         // Commit current editor state before exporting
         if let current = activeTab {
             current.html = currentHTML
@@ -1138,14 +1692,11 @@ class EditorViewModel: ObservableObject {
             else if originalSize >= 17 { newSize = 16 }
             else { newSize = 14 }
 
-            var replacement = NSFont.systemFont(ofSize: newSize)
-            if traits.contains(.bold) && traits.contains(.italic) {
-                replacement = NSFontManager.shared.convert(NSFont.boldSystemFont(ofSize: newSize), toHaveTrait: .italicFontMask)
-            } else if traits.contains(.bold) {
-                replacement = NSFont.boldSystemFont(ofSize: newSize)
-            } else if traits.contains(.italic) {
-                replacement = NSFontManager.shared.convert(NSFont.systemFont(ofSize: newSize), toHaveTrait: .italicFontMask)
-            }
+            // Build the replacement in the user's selected editor font family,
+            // preserving bold/italic so a font switch re-renders every run.
+            let isBold = traits.contains(.bold)
+            let isItalic = traits.contains(.italic)
+            let replacement = Tokens.Typography.editorFont(size: newSize, bold: isBold, italic: isItalic)
             attrStr.addAttribute(.font, value: replacement, range: range)
         }
 
@@ -1178,7 +1729,7 @@ class OpenRouterClient {
     private let apiKey: String
     private let models = [
         "openai/gpt-oss-120b:free",
-        "minimax/minimax-m2.5:free"
+        "openai/gpt-oss-20b:free"
     ]
 
     init?() {
@@ -1781,10 +2332,12 @@ struct EditorView: View {
         GeometryReader { geo in
             content
                 .onAppear {
+                    vm.windowContentWidth = geo.size.width
                     evaluateAutoHide(width: geo.size.width)
                     applyWindowTheme(vm.theme)
                 }
                 .onChange(of: geo.size.width) { _, newWidth in
+                    vm.windowContentWidth = newWidth
                     evaluateAutoHide(width: newWidth)
                 }
                 .onChange(of: vm.theme) { _, newTheme in
@@ -1852,16 +2405,27 @@ struct EditorView: View {
                             .id(path)
                         Divider()
                     }
-                    RichTextEditor()
-                        .environmentObject(vm)
+                    if vm.isBoardVisible, let activeId = vm.activeTabId {
+                        ExcalidrawBoardView(tabId: activeId, theme: vm.theme)
+                            .id(activeId)
+                    } else {
+                        RichTextEditor()
+                            .environmentObject(vm)
+                    }
                 }
-                if vm.isTerminalVisible {
+                if vm.isTerminalVisible && !vm.terminalTabs.isEmpty {
                     TerminalResizeHandle()
                         .environmentObject(vm)
+                }
+                if vm.isTerminalVisible && !vm.terminalTabs.isEmpty {
+                    // Fully unmount the panel on hide. Shells are kept alive by
+                    // `TerminalSessions` (not the view), so unmounting is safe and
+                    // it cleanly removes the terminal view from the window —
+                    // resigning first responder so input stays responsive. On show
+                    // the persistent session view is re-attached.
                     TerminalPanel()
                         .environmentObject(vm)
-                        .frame(width: vm.terminalWidth)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                        .frame(width: min(vm.terminalWidth, vm.availablePanelWidth()))
                 }
             }
             Divider()
@@ -1886,7 +2450,7 @@ struct SidebarResizeHandle: View {
         ZStack {
             // Hairline divider line for visual continuity
             Rectangle()
-                .fill(Color.primary.opacity(0.1))
+                .fill(Color.primary.opacity(0.25))
                 .frame(width: 1)
             // Wider invisible hit-area for easy grabbing
             Color.clear
@@ -1917,13 +2481,16 @@ struct SidebarResizeHandle: View {
 
 // MARK: - Terminal Panel (right side)
 
+/// The editor↔panel boundary handle. Dragging resizes the whole terminal panel
+/// against the editor; capped so the panel never outgrows the window.
 struct TerminalResizeHandle: View {
     @EnvironmentObject var vm: EditorViewModel
+
     @State private var isDragging = false
     @State private var isHovering = false
     @State private var startWidth: CGFloat = 0
 
-    private let minWidth: CGFloat = 240
+    private let minWidth: CGFloat = EditorViewModel.minTerminalColumnWidth
     private let maxWidth: CGFloat = 1600
     private let hitWidth: CGFloat = 10
 
@@ -1933,9 +2500,9 @@ struct TerminalResizeHandle: View {
                 .fill(
                     isDragging ? Color.accentColor.opacity(0.7) :
                     isHovering ? Color.accentColor.opacity(0.4) :
-                    Color.primary.opacity(0.1)
+                    Color.primary.opacity(0.35)
                 )
-                .frame(width: (isHovering || isDragging) ? 3 : 1)
+                .frame(width: (isHovering || isDragging) ? 3 : 2)
                 .animation(.easeOut(duration: 0.12), value: isHovering)
                 .animation(.easeOut(duration: 0.12), value: isDragging)
             Color.clear
@@ -1950,16 +2517,11 @@ struct TerminalResizeHandle: View {
         .gesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .global)
                 .onChanged { value in
-                    if !isDragging {
-                        isDragging = true
-                        startWidth = vm.terminalWidth
-                    }
-                    // Drag-left → wider terminal (so subtract translation.width)
-                    let proposed = startWidth - value.translation.width
-                    let clamped = min(maxWidth, max(minWidth, proposed))
-                    if abs(clamped - vm.terminalWidth) > 0.5 {
-                        vm.terminalWidth = clamped
-                    }
+                    if !isDragging { isDragging = true; startWidth = vm.terminalWidth }
+                    // Drag-left → wider (subtract dx); cap to the window.
+                    let dx = value.translation.width
+                    let cap = min(maxWidth, max(minWidth, vm.availablePanelWidth()))
+                    vm.terminalWidth = min(cap, max(minWidth, startWidth - dx))
                 }
                 .onEnded { _ in isDragging = false }
         )
@@ -1971,43 +2533,71 @@ struct TerminalPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "terminal")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(.secondary)
-                Text("TERMINAL")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .kerning(0.6)
-                Spacer()
-                Button(action: {
-                    NotificationCenter.default.post(name: .floatnoteTerminalReset, object: nil)
-                }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 10))
-                        .frame(width: 22, height: 20)
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Restart shell")
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.18)) { vm.isTerminalVisible = false }
-                }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10))
-                        .frame(width: 22, height: 20)
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Hide terminal")
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(vm.theme.chromeBackground)
+            tabBar
             Divider()
-            SwiftTermContainer()
-                .background(Color.black)
+            if let activeId = vm.activeTerminalId,
+               let tab = vm.terminalTabs.first(where: { $0.id == activeId }) {
+                SwiftTermContainer(id: tab.id, cwd: tab.path)
+                    .id(tab.id)
+                    .background(Color.black)
+            } else {
+                Color.black
+            }
         }
+    }
+
+    private var tabBar: some View {
+        HStack(spacing: 0) {
+            ForEach(vm.terminalTabs) { tab in
+                tabChip(tab)
+                Divider().frame(height: 20)
+            }
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.18)) { vm.addTerminal() }
+            }) {
+                Image(systemName: "plus")
+                    .font(.system(size: 11))
+                    .frame(width: 30, height: 28)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("New terminal at current route")
+            Spacer(minLength: 0)
+        }
+        .background(vm.theme.chromeBackground)
+    }
+
+    private func tabChip(_ tab: TerminalTab) -> some View {
+        let isActive = vm.activeTerminalId == tab.id
+        return HStack(spacing: 6) {
+            Image(systemName: "terminal")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(isActive ? .accentColor : .secondary)
+            Text(tab.label)
+                .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+                .foregroundColor(isActive ? .primary : .secondary)
+                .lineLimit(1)
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.18)) { vm.closeTerminal(tab.id) }
+            }) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .frame(width: 16, height: 16)
+            }
+            .buttonStyle(.plain)
+            .help("Close this terminal")
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 28)
+        .frame(maxWidth: 180)
+        .background(isActive ? Color.black : Color.clear)
+        .overlay(alignment: .top) {
+            if isActive { Rectangle().fill(Color.accentColor).frame(height: 2) }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { vm.selectTerminal(tab.id) }
+        .help(tab.path)
     }
 }
 
@@ -2022,18 +2612,25 @@ struct NotesSidebar: View {
 
     /// Notes that are not inside any folder (rendered at the root level).
     private var rootTabs: [NoteTab] { vm.tabs.filter { $0.folderId == nil } }
-    /// Folders not currently in the Trash.
-    private var liveFolders: [Folder] { vm.folders.filter { !$0.isTrashed } }
-    /// Folders currently in the Trash.
-    private var trashedFolders: [Folder] { vm.folders.filter { $0.isTrashed } }
+    /// Live (non-trashed) top-level folders. Subfolders are rendered recursively
+    /// inside their parent by `SidebarFolderView`.
+    private var liveRootFolders: [Folder] { vm.folders.filter { !$0.isTrashed && $0.parentId == nil } }
+    /// Trashed folders that are the *root* of a trashed subtree (their parent is
+    /// not itself trashed), so a cascade-trashed subtree shows as one entry.
+    private var trashedRootFolders: [Folder] {
+        vm.folders.filter { f in
+            f.isTrashed && (f.parentId == nil
+                || vm.folders.first(where: { $0.id == f.parentId })?.isTrashed != true)
+        }
+    }
     /// Notes that were trashed individually (loose) — not via their folder.
     private var looseTrashedTabs: [NoteTab] { vm.tabs.filter { $0.folderId == TRASH_FOLDER_ID } }
     private var trashItemCount: Int {
-        let trashedFolderIds = Set(trashedFolders.map { $0.id })
+        let trashedFolderIds = Set(vm.folders.filter { $0.isTrashed }.map { $0.id })
         let inTrashedFolders = vm.tabs.filter {
             $0.folderId.map { trashedFolderIds.contains($0) } ?? false
         }.count
-        return trashedFolders.count + looseTrashedTabs.count + inTrashedFolders
+        return trashedFolderIds.count + looseTrashedTabs.count + inTrashedFolders
     }
 
     var body: some View {
@@ -2069,8 +2666,8 @@ struct NotesSidebar: View {
 
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    // Folders first, each with its notes nested inside.
-                    ForEach(liveFolders) { folder in
+                    // Top-level folders first, each with its subfolders + notes nested inside.
+                    ForEach(liveRootFolders) { folder in
                         SidebarFolderView(folder: folder)
                             .id(folder.id)
                     }
@@ -2083,7 +2680,7 @@ struct NotesSidebar: View {
 
                     // Trash section (always pinned at the bottom).
                     SidebarTrashSection(
-                        trashedFolders: trashedFolders,
+                        trashedFolders: trashedRootFolders,
                         looseTrashedTabs: looseTrashedTabs,
                         itemCount: trashItemCount
                     )
@@ -2131,6 +2728,8 @@ struct SidebarFolderView: View {
     @FocusState private var isFieldFocused: Bool
 
     private var tabsInFolder: [NoteTab] { vm.tabs.filter { $0.folderId == folder.id } }
+    /// Live subfolders nested directly under this folder.
+    private var subfolders: [Folder] { vm.folders.filter { !$0.isTrashed && $0.parentId == folder.id } }
     private var isDropTarget: Bool { vm.dropTargetFolderId == folder.id }
 
     var body: some View {
@@ -2183,8 +2782,19 @@ struct SidebarFolderView: View {
                 }
             }
             .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: folder.id, vm: vm))
+            .onDrag {
+                vm.draggingFolderId = folder.id
+                vm.draggingTabId = nil
+                return NSItemProvider(object: folder.id.uuidString as NSString)
+            }
 
             if folder.isExpanded {
+                // Subfolders first (recursively), then this folder's own notes.
+                ForEach(subfolders) { sub in
+                    SidebarFolderView(folder: sub)
+                        .padding(.leading, 16)
+                        .id(sub.id)
+                }
                 ForEach(tabsInFolder) { tab in
                     SidebarNoteItemView(tab: tab)
                         .padding(.leading, 16)
@@ -2208,10 +2818,35 @@ struct FolderDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         vm.dropTargetFolderId = nil
+        // Dragging a folder → nest it under this folder (or root when folderId == nil).
+        if let dragFolder = vm.draggingFolderId {
+            vm.draggingFolderId = nil
+            vm.moveFolder(dragFolder, toParent: folderId)
+            return true
+        }
+        // Dragging a note → move it into this folder (or root).
         guard let draggingId = vm.draggingTabId else { return false }
         vm.moveTab(draggingId, toFolder: folderId)
         vm.draggingTabId = nil
         return true
+    }
+}
+
+/// Red notification pill showing a note's unchecked-checklist-item count.
+/// Counts above 99 render as "99+". Hidden by the caller when count is 0.
+struct UncheckedBadge: View {
+    let count: Int
+
+    var body: some View {
+        Text(count > 99 ? "99+" : "\(count)")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundColor(.white)
+            .monospacedDigit()
+            .padding(.horizontal, 5)
+            .frame(minWidth: 16, minHeight: 16)
+            .background(
+                Capsule().fill(Color(red: 1.0, green: 0.231, blue: 0.188))
+            )
     }
 }
 
@@ -2243,7 +2878,10 @@ struct SidebarNoteItemView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 4)
+            if tab.uncheckedCount > 0 {
+                UncheckedBadge(count: tab.uncheckedCount)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -2786,6 +3424,47 @@ struct FlowLayout: Layout {
 
 // MARK: - Body Size Picker
 
+struct FontPicker: View {
+    @EnvironmentObject var vm: EditorViewModel
+    @State private var current: String = Tokens.currentFontFamily
+
+    var body: some View {
+        Menu {
+            ForEach(Tokens.fontOptions, id: \.self) { name in
+                Button {
+                    Tokens.setFontFamily(name)
+                    current = name
+                    vm.reloadActive()  // re-render the document in the new font, live
+                } label: {
+                    HStack {
+                        // Preview each option rendered in its own font.
+                        if name == Tokens.systemFontName {
+                            Text(name).font(.system(size: 13))
+                        } else {
+                            Text(name).font(.custom(name, size: 13))
+                        }
+                        if current == name {
+                            Spacer()
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Text(current == Tokens.systemFontName ? "System" : current)
+                .font(current == Tokens.systemFontName ? .system(size: 11) : .custom(current, size: 11))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .frame(height: 22)
+                .padding(.horizontal, 6)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Editor font: \(current)")
+    }
+}
+
 struct BodySizePicker: View {
     @EnvironmentObject var vm: EditorViewModel
     @State private var currentSize: Int = Int(Tokens.currentBodySize)
@@ -2834,7 +3513,8 @@ struct FormatToolbar: View {
                         toolBtn("H1", id: "h1") { vm.performFormat(.heading1) }
                         toolBtn("H2", id: "h2") { vm.performFormat(.heading2) }
                         toolBtn("H3", id: "h3") { vm.performFormat(.heading3) }
-                        toolBtn("Aa", id: "body") { vm.performFormat(.body) }
+                        toolBtn("Body", id: "body") { vm.performFormat(.body) }
+                        FontPicker().environmentObject(vm)
                         BodySizePicker().environmentObject(vm)
                     }
 
@@ -2865,7 +3545,8 @@ struct FormatToolbar: View {
             }
             .layoutPriority(1)
 
-            // Trailing: terminal toggle + theme + pin
+            // Trailing: board toggle + terminal toggle + theme + pin
+            boardButton
             terminalButton
             themeButton
             pinButton
@@ -2973,9 +3654,35 @@ struct FormatToolbar: View {
         .help("Theme: \(vm.theme.displayName)")
     }
 
+    /// Per-note Excalidraw board toggle. Three states:
+    /// • passive (gray) — note has no diagram yet
+    /// • has content (accent) — a board exists for this note
+    /// • open (accent + filled background) — the board is currently showing
+    private var boardButton: some View {
+        let isOpen = vm.isBoardVisible
+        let hasContent = vm.boardHasContent(vm.activeTabId)
+        let tint: Color = (isOpen || hasContent) ? .accentColor : .secondary
+        return Button(action: {
+            withAnimation(.easeInOut(duration: 0.18)) { vm.toggleBoard() }
+        }) {
+            Image(systemName: "pencil.and.outline")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(tint)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(isOpen ? Color.accentColor.opacity(0.14)
+                              : (hoveredButton == "board" ? Color.primary.opacity(0.08) : Color.clear))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "board" : nil }
+        .help(isOpen ? "Back to note" : (hasContent ? "Open diagram" : "Add a diagram"))
+    }
+
     private var terminalButton: some View {
         Button(action: {
-            withAnimation(.easeInOut(duration: 0.18)) { vm.isTerminalVisible.toggle() }
+            withAnimation(.easeInOut(duration: 0.18)) { vm.toggleTerminal() }
         }) {
             Image(systemName: "terminal")
                 .font(.system(size: 11))
@@ -3018,7 +3725,10 @@ struct FormatToolbar: View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 11, weight: .medium))
-                .frame(width: 26, height: 22)
+                .fixedSize()                       // never truncate the label
+                .padding(.horizontal, 6)
+                .frame(height: 22)
+                .frame(minWidth: 26)               // short labels (H1) stay uniform; longer ones (Body) grow
                 .foregroundColor(.primary)
                 .background(
                     RoundedRectangle(cornerRadius: 3)
@@ -3033,8 +3743,12 @@ struct FormatToolbar: View {
         vm.wantsDictation.toggle()
         if vm.wantsDictation {
             startDictation()
+            // Remove any stale observers before re-registering so toggling on
+            // never accumulates duplicates.
+            if let t = vm.dictationEndToken { NotificationCenter.default.removeObserver(t); vm.dictationEndToken = nil }
+            if let t = vm.appActiveToken { NotificationCenter.default.removeObserver(t); vm.appActiveToken = nil }
             // Watch for dictation stopping (system timeout, user switched away, etc.)
-            NotificationCenter.default.addObserver(forName: NSNotification.Name("NSTextInputContextDictationDidEnd"), object: nil, queue: .main) { [weak vm] _ in
+            vm.dictationEndToken = NotificationCenter.default.addObserver(forName: NSNotification.Name("NSTextInputContextDictationDidEnd"), object: nil, queue: .main) { [weak vm] _ in
                 MainActor.assumeIsolated {
                     vm?.isDictating = false
                     // Auto-restart after a short delay if user still wants dictation
@@ -3049,7 +3763,7 @@ struct FormatToolbar: View {
                 }
             }
             // Watch for app becoming active again → restart dictation
-            NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak vm] _ in
+            vm.appActiveToken = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak vm] _ in
                 MainActor.assumeIsolated {
                     guard let vm = vm, vm.wantsDictation, !vm.isDictating else { return }
                     vm.isDictating = true
@@ -3063,8 +3777,8 @@ struct FormatToolbar: View {
             }
         } else {
             stopDictation()
-            NotificationCenter.default.removeObserver(self, name: NSNotification.Name("NSTextInputContextDictationDidEnd"), object: nil)
-            NotificationCenter.default.removeObserver(self, name: NSApplication.didBecomeActiveNotification, object: nil)
+            if let t = vm.dictationEndToken { NotificationCenter.default.removeObserver(t); vm.dictationEndToken = nil }
+            if let t = vm.appActiveToken { NotificationCenter.default.removeObserver(t); vm.appActiveToken = nil }
         }
     }
 
@@ -4451,6 +5165,8 @@ struct RichTextEditor: NSViewRepresentable {
         textView.isRichText = true
         textView.usesFontPanel = false
         textView.usesRuler = false
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
         textView.backgroundColor = vm.theme.editorBackgroundNS
         textView.insertionPointColor = vm.theme.editorCaretNS
         textView.setCaretColor(vm.theme.editorCaretNS)
@@ -4462,17 +5178,29 @@ struct RichTextEditor: NSViewRepresentable {
         textView.postsFrameChangedNotifications = true
         let maxContentWidth: CGFloat = 640
         let minSideInset: CGFloat = 24
-        let updateInset: () -> Void = { [weak scrollView, weak textView] in
-            guard let sv = scrollView, let tv = textView else { return }
+        let updateInset: () -> Void = { [weak scrollView, weak textView, weak coordinator = context.coordinator] in
+            guard let sv = scrollView, let tv = textView, let coord = coordinator else { return }
+            // Setting the inset / container size below mutates the text view's frame,
+            // which re-posts frameDidChangeNotification → this closure. Bail if we're
+            // already inside an update so the feedback loop can't spin (app hang).
+            guard !coord.isUpdatingInset else { return }
             let viewW = sv.frame.width > 0 ? sv.frame.width : sv.contentSize.width
             guard viewW > 0 else { return }
             let target = max(minSideInset, (viewW - maxContentWidth) / 2)
+            let newContainerW = max(1, viewW - 2*target)
+            // Idempotent: only write (and thus re-fire the notification) when a value
+            // actually changes.
+            let insetChanged = abs(tv.textContainerInset.width - target) > 0.5
+            let containerChanged = abs((tv.textContainer?.containerSize.width ?? 0) - newContainerW) > 0.5
+            guard insetChanged || containerChanged else { return }
+            coord.isUpdatingInset = true
             tv.textContainerInset = NSSize(width: target, height: tv.textContainerInset.height)
             if let tc = tv.textContainer {
-                tc.containerSize = NSSize(width: max(1, viewW - 2*target), height: .greatestFiniteMagnitude)
+                tc.containerSize = NSSize(width: newContainerW, height: .greatestFiniteMagnitude)
             }
             tv.needsLayout = true
             tv.needsDisplay = true
+            coord.isUpdatingInset = false
         }
         context.coordinator.frameObserver = NotificationCenter.default.addObserver(
             forName: NSView.frameDidChangeNotification,
@@ -4648,11 +5376,22 @@ struct RichTextEditor: NSViewRepresentable {
         var appliedTheme: AppTheme
         var frameObserver: NSObjectProtocol?
         var textFrameObserver: NSObjectProtocol?
+        /// Re-entrancy guard for `updateInset`: setting the text container size re-fires
+        /// `frameDidChangeNotification` on the text view, which would call `updateInset`
+        /// again. Without this flag the feedback loop can spin forever (app hang).
+        var isUpdatingInset = false
 
-        let bodyFont = Tokens.Typography.body()
-        let h1Font = Tokens.Typography.bold(size: Tokens.Typography.h1Size)
-        let h2Font = Tokens.Typography.bold(size: Tokens.Typography.h2Size)
-        let h3Font = Tokens.Typography.bold(size: Tokens.Typography.h3Size)
+        deinit {
+            if let o = frameObserver { NotificationCenter.default.removeObserver(o) }
+            if let o = textFrameObserver { NotificationCenter.default.removeObserver(o) }
+        }
+
+        // Computed (not captured) so a live font-family / body-size change is
+        // reflected by formatting operations without recreating the editor.
+        var bodyFont: NSFont { Tokens.Typography.body() }
+        var h1Font: NSFont { Tokens.Typography.bold(size: Tokens.Typography.h1Size) }
+        var h2Font: NSFont { Tokens.Typography.bold(size: Tokens.Typography.h2Size) }
+        var h3Font: NSFont { Tokens.Typography.bold(size: Tokens.Typography.h3Size) }
         var textColor: NSColor
 
         /// Recolor editor surface + swap previous body-text color on existing content.
@@ -4725,9 +5464,10 @@ struct RichTextEditor: NSViewRepresentable {
 
             applyListIndentForCurrentLine(textView: textView)
 
-            let html = extractHTML(from: textView)
+            let length = textView.textStorage?.length ?? 0
+            let unchecked = NoteTab.countUnchecked(in: textView.textStorage?.string ?? "")
             Task { @MainActor in
-                vm.textDidChange(html: html, length: textView.textStorage?.length ?? 0)
+                vm.textDidChange(html: "", length: length, uncheckedCount: unchecked)
             }
         }
 
@@ -5407,6 +6147,41 @@ struct RichTextEditor: NSViewRepresentable {
                     // Empty list item — remove indent + prefix to end the list
                     storage.replaceCharacters(in: NSRange(location: lineRange.location, length: fullPrefix.count), with: "")
                     textView.setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                    textView.didChangeText()
+                    return true
+                }
+
+                // Caret at the very start of the item's text → push this item (keeping
+                // its own ☑/☐ state + text) DOWN and insert a fresh EMPTY, always-unchecked
+                // item above. Without this the original prefix stays on the empty top line
+                // (so a ☑ item leaves a checked empty box and un-checks the text below).
+                let atContentStart = (range.length == 0 && range.location == lineRange.location + fullPrefix.count)
+                if atContentStart {
+                    let isCheckbox = (prefix == "☐ " || prefix == "☑ ")
+                    let aboveLine = NSMutableAttributedString(string: leadingSpaces, attributes: [
+                        .font: bodyFont, .foregroundColor: textColor
+                    ])
+                    if isCheckbox {
+                        // New checkbox items are always unchecked.
+                        aboveLine.append(NSAttributedString(string: "☐", attributes: [
+                            .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
+                            .foregroundColor: textColor
+                        ]))
+                        aboveLine.append(NSAttributedString(string: " ", attributes: [
+                            .font: bodyFont, .foregroundColor: textColor
+                        ]))
+                    } else {
+                        aboveLine.append(NSAttributedString(string: prefix, attributes: [
+                            .font: bodyFont, .foregroundColor: textColor
+                        ]))
+                    }
+                    aboveLine.append(NSAttributedString(string: "\n", attributes: [
+                        .font: bodyFont, .foregroundColor: textColor
+                    ]))
+                    storage.insert(aboveLine, at: lineRange.location)
+                    // Keep the caret with the moved text (now one line down).
+                    let newCaret = lineRange.location + aboveLine.length + fullPrefix.count
+                    textView.setSelectedRange(NSRange(location: newCaret, length: 0))
                     textView.didChangeText()
                     return true
                 }

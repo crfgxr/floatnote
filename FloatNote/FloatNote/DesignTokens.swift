@@ -18,7 +18,7 @@ enum Tokens {
 
     private static let bodySizeKey = "fn.bodyFontSize"
     /// Allowed body font sizes in the dropdown.
-    static let bodySizeOptions: [CGFloat] = [12, 13, 14, 15, 16, 18, 20]
+    static let bodySizeOptions: [CGFloat] = [10, 11, 12, 13, 14, 15, 16, 18, 20]
 
     /// Current body font size, read from UserDefaults (default 14pt).
     static var currentBodySize: CGFloat {
@@ -30,12 +30,57 @@ enum Tokens {
         UserDefaults.standard.set(Double(size), forKey: bodySizeKey)
     }
 
+    // MARK: - Persisted editor font family
+
+    private static let fontFamilyKey = "fn.fontFamily"
+    /// Sentinel meaning "use the built-in system font" (the original default).
+    static let systemFontName = "System"
+    /// Font families shown in the toolbar picker: the current default (System),
+    /// five popular preinstalled families, and Monaco.
+    static let fontOptions: [String] = [
+        systemFontName,        // current default
+        "Helvetica Neue",
+        "Georgia",
+        "Times New Roman",
+        "Verdana",
+        "Arial",
+        "Monaco",
+    ]
+
+    /// Currently selected editor font family (defaults to System).
+    static var currentFontFamily: String {
+        UserDefaults.standard.string(forKey: fontFamilyKey) ?? systemFontName
+    }
+    /// Setter; call `reloadActive` on the view-model afterwards to re-render.
+    static func setFontFamily(_ name: String) {
+        UserDefaults.standard.set(name, forKey: fontFamilyKey)
+    }
+
     // MARK: - Typography
     enum Typography {
-        static func body(size: CGFloat = Tokens.currentBodySize, weight: NSFont.Weight = .regular) -> NSFont {
-            NSFont.systemFont(ofSize: size, weight: weight)
+        /// Build an editor font in the currently-selected family at the given
+        /// size, applying bold/italic traits. Falls back to the system font when
+        /// the family is the System sentinel or unavailable on this machine.
+        static func editorFont(size: CGFloat, weight: NSFont.Weight = .regular,
+                               bold: Bool = false, italic: Bool = false) -> NSFont {
+            let family = Tokens.currentFontFamily
+            let fm = NSFontManager.shared
+            var base: NSFont
+            if family != Tokens.systemFontName, let named = NSFont(name: family, size: size) {
+                base = named
+                if bold { base = fm.convert(base, toHaveTrait: .boldFontMask) }
+            } else {
+                base = bold ? NSFont.boldSystemFont(ofSize: size)
+                            : NSFont.systemFont(ofSize: size, weight: weight)
+            }
+            if italic { base = fm.convert(base, toHaveTrait: .italicFontMask) }
+            return base
         }
-        static func bold(size: CGFloat) -> NSFont { NSFont.boldSystemFont(ofSize: size) }
+
+        static func body(size: CGFloat = Tokens.currentBodySize, weight: NSFont.Weight = .regular) -> NSFont {
+            editorFont(size: size, weight: weight)
+        }
+        static func bold(size: CGFloat) -> NSFont { editorFont(size: size, bold: true) }
 
         /// SF Pro Rounded variant — used for ☐/☑ checkbox glyphs so the box
         /// corners read noticeably rounder than the default system font.

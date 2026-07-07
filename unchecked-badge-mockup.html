@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>FloatNote — Unchecked badge mockup</title>
+<style>
+  :root {
+    --bg: #1e1e23;
+    --sidebar: #1a1a1f;
+    --text: #b8b8c0;
+    --text-active: #f0f0f5;
+    --accent: #7c5cff;
+    --badge: #ff3b30;
+    --folder: #8a8a96;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    color: var(--text);
+    padding: 40px;
+    display: flex;
+    gap: 48px;
+    align-items: flex-start;
+  }
+  .sidebar {
+    width: 240px;
+    background: var(--sidebar);
+    border-radius: 12px;
+    padding: 12px 8px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .section-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--folder);
+    padding: 8px 10px 4px;
+    font-weight: 600;
+  }
+  .folder {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--folder);
+    font-weight: 600;
+  }
+  .folder .chev { font-size: 9px; opacity: 0.7; }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 10px;
+    border-radius: 5px;
+    font-size: 11px;
+    cursor: default;
+    margin: 1px 0;
+  }
+  .row.indent { padding-left: 24px; }
+  .row.active {
+    background: rgba(124,92,255,0.15);
+    color: var(--text-active);
+    font-weight: 600;
+  }
+  .row .title {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+  }
+  .mic { font-size: 9px; }
+  .badge {
+    background: var(--badge);
+    color: #fff;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+  }
+  .caption {
+    color: #66666f;
+    font-size: 12px;
+    max-width: 320px;
+    line-height: 1.6;
+  }
+  .caption h2 { color: #d8d8e0; font-size: 15px; margin-bottom: 10px; font-weight: 600; }
+  .caption code { background:#2a2a32; padding:1px 5px; border-radius:4px; color:#c8c8d2; }
+  .variants { display:flex; gap:10px; margin:14px 0 6px; align-items:center; }
+</style>
+</head>
+<body>
+  <div class="sidebar">
+    <div class="section-label">Notes</div>
+
+    <div class="folder"><span class="chev">▾</span> Agentforce</div>
+    <div class="row indent active">
+      <span class="title">Backlog - Agentforce</span>
+      <span class="badge">7</span>
+    </div>
+    <div class="row indent">
+      <span class="title">Sprint 24 planning</span>
+      <span class="badge">3</span>
+    </div>
+    <div class="row indent">
+      <span class="mic">🎤</span>
+      <span class="title">Standup notes</span>
+      <span class="badge">12</span>
+    </div>
+    <div class="row indent">
+      <span class="title">terminal path</span>
+    </div>
+    <div class="row indent">
+      <span class="title">Done — release checklist</span>
+    </div>
+
+    <div class="folder"><span class="chev">▾</span> Personal</div>
+    <div class="row indent">
+      <span class="title">Groceries</span>
+      <span class="badge">2</span>
+    </div>
+    <div class="row indent">
+      <span class="title">Reading list (long title that gets cut)</span>
+      <span class="badge">99+</span>
+    </div>
+  </div>
+
+  <div class="caption">
+    <h2>Unchecked-item badge</h2>
+    <p>A red pill with a white number on each note row = count of <code>☐</code> unchecked checklist items. Hidden entirely when the count is 0 (see “terminal path” and “Done” rows).</p>
+    <div class="variants">
+      <span class="badge">1</span>
+      <span class="badge">7</span>
+      <span class="badge">42</span>
+      <span class="badge">99+</span>
+    </div>
+    <p style="margin-top:14px">Sits to the right of the title, before the row edge. Updates instantly as you check/uncheck boxes in the open note.</p>
+  </div>
+</body>
+</html>

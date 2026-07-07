@@ -13,7 +13,11 @@ let package = Package(
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
-            path: "FloatNote"
+            path: "FloatNote",
+            resources: [
+                // Bundled Excalidraw web assets (vendored offline; see vendor/excalidraw).
+                .copy("Resources/excalidraw"),
+            ]
         ),
     ]
 )
