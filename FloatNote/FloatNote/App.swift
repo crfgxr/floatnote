@@ -510,11 +510,15 @@ class EditorViewModel: ObservableObject {
         return nil
     }
 
-    /// The note to land on when entering `folder` via its terminal: the last note the
-    /// user had open there, else the folder's first non-"terminal path" note.
+    /// The note to land on when entering `folder` via its terminal: the last note
+    /// the user had open anywhere in the folder's subtree, else the folder's own
+    /// first non-"terminal path" note.
     private func noteToActivate(forTerminalFolder folder: Folder) -> NoteTab? {
         if let lastId = lastActiveNotePerFolder[folder.id],
-           let last = tabs.first(where: { $0.id == lastId && $0.folderId == folder.id }) {
+           let last = tabs.first(where: { $0.id == lastId }),
+           let lastFolderId = last.folderId,
+           lastFolderId != TRASH_FOLDER_ID,
+           isSelfOrDescendant(lastFolderId, of: folder.id) {
             return last
         }
         return tabs.first(where: { $0.folderId == folder.id
@@ -1211,6 +1215,12 @@ class EditorViewModel: ObservableObject {
         activeTabId = id
         if let fid = newTab.folderId, fid != TRASH_FOLDER_ID {
             lastActiveNotePerFolder[fid] = newTab.id
+            // Also remember the note under its terminal-route root, so tapping
+            // that terminal's chip returns to subtree notes, not just notes in
+            // the root folder itself.
+            if let routeRoot = terminalRouteFolder(startingAt: fid), routeRoot.id != fid {
+                lastActiveNotePerFolder[routeRoot.id] = newTab.id
+            }
         }
         currentRecordingPath = newTab.recordingPath
         currentHTML = newTab.html
