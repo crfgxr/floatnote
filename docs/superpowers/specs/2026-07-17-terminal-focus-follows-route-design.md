@@ -63,6 +63,18 @@ All in `EditorViewModel` (`@MainActor`), plus one deletion in `AppDelegate`:
   holds focus only until the next presentation event, matching the request
   ("unless user selects note window").
 
+## Addendum: caret hides while the editor is unfocused (v1.49.1)
+
+The editor's block caret is a custom always-on `NSView` subview of
+`BlockCaretTextView` (the system insertion point is suppressed), so it stayed
+visible while the terminal owned the keyboard — reading as "typing goes here"
+when it didn't. Fix: `becomeFirstResponder`/`resignFirstResponder` overrides
+maintain an `isEditorFocused` flag, and `updateCaretPosition()` — the single
+choke point every caret move goes through — hides the caret when there's a
+selection (existing rule) or the view isn't first responder. Clicking into the
+note or any programmatic `focusEditor()` restores it. Window-level key status
+(app in background) is out of scope.
+
 ## Verification
 
 Manual (AppKit first-responder behavior; no unit-test seam): switch to a routed
