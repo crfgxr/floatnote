@@ -469,18 +469,9 @@ class EditorViewModel: ObservableObject {
         return max(0, windowContentWidth - sidebar - 10)
     }
 
-    /// Show the panel, creating a HOME-rooted tab only if none exist.
-    func showTerminal() {
-        if terminalTabs.isEmpty {
-            let id = UUID()
-            terminalTabs.append(TerminalTab(id: id, path: NSHomeDirectory(), label: "terminal"))
-            activeTerminalId = id
-        }
-        isTerminalVisible = true
-    }
     /// Hide the panel but keep all sessions mounted/alive (hide ≠ kill).
     func hideTerminal() { isTerminalVisible = false }
-    func toggleTerminal() { isTerminalVisible ? hideTerminal() : showTerminal() }
+    func toggleTerminal() { isTerminalVisible ? hideTerminal() : applyTerminalRouteForActiveNote() }
 
     /// Activate the tab for `path` if one exists, else create it. Opens the panel.
     func switchToRoute(path: String, label: String) {
@@ -1446,13 +1437,9 @@ class EditorViewModel: ObservableObject {
             prePinWindowFrame = nil
             if let collapsed = prePinSidebarCollapsed { isSidebarCollapsed = collapsed }
             if prePinTerminalVisible == true {
-                // Prefer the current note's route (the note may have changed
-                // while pinned); fall back to re-showing the manual terminal.
-                if terminalRoute(for: activeTab) != nil {
-                    applyTerminalRouteForActiveNote()
-                } else {
-                    showTerminal()
-                }
+                // Re-apply the active note's route; a routeless note simply
+                // stays hidden (no HOME-fallback terminal — see toggleTerminal()).
+                applyTerminalRouteForActiveNote()
             }
             prePinSidebarCollapsed = nil
             prePinTerminalVisible = nil
@@ -3714,21 +3701,23 @@ struct FormatToolbar: View {
     }
 
     private var terminalButton: some View {
-        Button(action: {
+        let hasRoute = vm.terminalRoute(for: vm.activeTab) != nil
+        return Button(action: {
             withAnimation(.easeInOut(duration: 0.18)) { vm.toggleTerminal() }
         }) {
             Image(systemName: "terminal")
                 .font(.system(size: 11))
                 .frame(width: 26, height: 22)
-                .foregroundColor(vm.isTerminalVisible ? .accentColor : .secondary)
+                .foregroundColor(hasRoute ? (vm.isTerminalVisible ? .accentColor : .secondary) : Color.secondary.opacity(0.4))
                 .background(
                     RoundedRectangle(cornerRadius: 3)
                         .fill(hoveredButton == "terminal" ? Color.primary.opacity(0.08) : Color.clear)
                 )
         }
         .buttonStyle(.plain)
+        .disabled(!hasRoute)
         .onHover { hoveredButton = $0 ? "terminal" : nil }
-        .help(vm.isTerminalVisible ? "Hide terminal" : "Show terminal")
+        .help(hasRoute ? (vm.isTerminalVisible ? "Hide terminal" : "Show terminal") : "Link a folder to use the terminal")
     }
 
     private var pinButton: some View {
