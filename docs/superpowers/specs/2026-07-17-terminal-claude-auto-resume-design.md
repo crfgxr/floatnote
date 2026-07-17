@@ -13,7 +13,7 @@ Every FloatNote terminal auto-types `claude` 0.6 s after its shell starts (`Term
 - A terminal whose working directory comes from a **real route** — a folder's linked `localPath` or a note's per-note override — auto-types `claude --continue` when that directory has at least one saved Claude conversation, resuming the most recent one.
 - If the directory has **no saved conversation** (first-ever open of the project), it auto-types plain `claude`. The user never sees Claude's "No conversation found" error.
 - The **HOME fallback terminal** (the default terminal when a note has no route) always auto-types plain `claude`, unchanged.
-- The ↻ restart re-runs the decision: restarting a terminal that was mid-conversation resumes that conversation instead of losing it.
+- A shell restart re-runs the decision (via the `.floatnoteTerminalReset` notification → `restart()`; mechanism only — no UI trigger currently posts it): a terminal restarted mid-conversation resumes that conversation instead of losing it.
 
 ## Decision rule (all inside `TerminalSession.startShell()`)
 
@@ -35,7 +35,7 @@ No API changes: `TerminalSessions`, `TerminalTab`, the ViewModel, and all routin
 
 - **Conversation open elsewhere:** if the latest conversation is simultaneously active in another client (e.g. Terminal.app), `--continue` forks it — Claude Code's normal resume behavior; acceptable.
 - **Symlinks / path normalization:** the munge uses the path FloatNote launches the shell with. If Claude Code recorded a differently-normalized path, detection misses and a fresh `claude` starts — safe fallback.
-- **Restart while claude is running:** ↻ kills the shell and re-runs `startShell()`; the just-used conversation's `.jsonl` exists, so the terminal comes back with `claude --continue` and re-enters it.
+- **Restart while claude is running:** a restart kills the shell and re-runs `startShell()`; the just-used conversation's `.jsonl` exists, so the terminal comes back with `claude --continue` and re-enters it.
 
 ## Out of scope
 
