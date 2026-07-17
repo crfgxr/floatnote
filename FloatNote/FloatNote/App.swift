@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.37.0"
+let APP_VERSION = "v1.50.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
