@@ -100,15 +100,22 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
             execName: "-\(NSString(string: shell).lastPathComponent)",
             currentDirectory: dir
         )
-        // Auto-run `claude` once the login shell has finished initializing.
-        // The shell already starts in the target folder (via currentDirectory).
-        // The generation guard ensures a restart invalidates a pending send
-        // from the previous shell.
+        // Auto-run `claude` (or `claude --continue`, see claudeLaunchCommand)
+        // once the login shell has finished initializing. The shell already
+        // starts in the target folder (via currentDirectory). The generation
+        // guard ensures a restart invalidates a pending send from the
+        // previous shell. The command is decided at send time so a restart
+        // picks up whatever conversation history exists by then.
         sessionGen += 1
         let gen = sessionGen
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak term] in
             guard let self, self.sessionGen == gen else { return }
-            term?.send(txt: "claude\n")
+            let command = TerminalSession.claudeLaunchCommand(
+                dir: dir,
+                home: home,
+                projectsRoot: home + "/.claude/projects"
+            )
+            term?.send(txt: command)
         }
     }
 
