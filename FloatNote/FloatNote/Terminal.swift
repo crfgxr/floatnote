@@ -112,6 +112,36 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
         }
     }
 
+    /// Munges an absolute path into Claude Code's session-store directory
+    /// name convention: every character outside `[A-Za-z0-9]` becomes `-`.
+    /// e.g. `/Users/x/CodTemp/floatnote` → `-Users-x-CodTemp-floatnote`.
+    static func mungedClaudeProjectDirName(for path: String) -> String {
+        String(path.map { ch -> Character in
+            (ch.isASCII && (ch.isLetter || ch.isNumber)) ? ch : "-"
+        })
+    }
+
+    /// Decides the command to auto-send when a shell starts in `dir`. HOME
+    /// always gets a fresh `claude`; any other directory resumes the most
+    /// recent Claude Code conversation (`claude --continue`) if Claude
+    /// Code's session store (`projectsRoot/<munged dir>`) has at least one
+    /// saved `.jsonl` conversation for it, else starts fresh with plain
+    /// `claude`. Pure and parameterized (no `NSHomeDirectory()` /
+    /// `FileManager.default` baked in) so it can be exercised outside the
+    /// app.
+    static func claudeLaunchCommand(
+        dir: String,
+        home: String,
+        projectsRoot: String,
+        fileManager: FileManager = .default
+    ) -> String {
+        guard dir != home else { return "claude\n" }
+        let sessionDir = projectsRoot + "/" + mungedClaudeProjectDirName(for: dir)
+        let hasSession = (try? fileManager.contentsOfDirectory(atPath: sessionDir))?
+            .contains { $0.hasSuffix(".jsonl") } ?? false
+        return hasSession ? "claude --continue\n" : "claude\n"
+    }
+
     func restart() {
         expectedTermination = true
         view.process.terminate()
