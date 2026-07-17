@@ -72,8 +72,13 @@ when it didn't. Fix: `becomeFirstResponder`/`resignFirstResponder` overrides
 maintain an `isEditorFocused` flag, and `updateCaretPosition()` — the single
 choke point every caret move goes through — hides the caret when there's a
 selection (existing rule) or the view isn't first responder. Clicking into the
-note or any programmatic `focusEditor()` restores it. Window-level key status
-(app in background) is out of scope.
+note or any programmatic `focusEditor()` restores it.
+
+Extended in v1.50.1 to window-level key status: the caret also hides while the
+window isn't key (app in background). `viewDidMoveToWindow` registers
+`didBecomeKey`/`didResignKey` observers on its own window (tokens in
+`windowKeyObservers`, replaced on window moves, removed in `deinit`) that
+re-run `updateCaretPosition()`, whose gate adds `window?.isKeyWindow`.
 
 ## Verification
 
