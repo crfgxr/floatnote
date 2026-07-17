@@ -287,7 +287,7 @@ function describeElement(el, elements) {
 
 // --- MCP Server ---
 
-const MCP_VERSION = "1.4.0";
+const MCP_VERSION = "1.5.0";
 
 // Sentinel folder ID for loose-trashed notes (notes moved to Trash by themselves).
 // Mirrors `TRASH_FOLDER_ID` in App.swift — must stay in sync.
@@ -444,6 +444,47 @@ server.tool(
         {
           type: "text",
           text: `Appended to "${tabs[idx].title}". Switch tabs in FloatNote to see changes.`,
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "set_note_status",
+  "Mark a FloatNote note as busy (a job is running on it) or clear the flag. While set, the note's sidebar row shows a pulsing blue indicator with the status text on hover. Pass a status string like 'Claude working…' to set; omit status (or pass empty) to clear. Statuses expire after 30 minutes — long-running jobs should re-set periodically to stay alive. ALWAYS clear the status when the job finishes.",
+  {
+    identifier: z.string().describe("Tab ID (UUID) or tab title to search for"),
+    status: z.string().optional().describe("Busy label to show (e.g. 'Claude working…'). Omit or pass empty string to clear."),
+  },
+  async ({ identifier, status }) => {
+    const tabs = readTabs();
+    const idx = tabs.findIndex(
+      (t) =>
+        t.id === identifier ||
+        t.title.toLowerCase() === identifier.toLowerCase() ||
+        t.title.toLowerCase().includes(identifier.toLowerCase())
+    );
+
+    if (idx === -1) {
+      return { content: [{ type: "text", text: `Note not found: "${identifier}"` }] };
+    }
+
+    if (status && status.trim() !== "") {
+      tabs[idx].jobStatus = status;
+      tabs[idx].jobStatusAt = Date.now() / 1000; // epoch seconds, matches Swift's timeIntervalSince1970
+    } else {
+      tabs[idx].jobStatus = null;
+      tabs[idx].jobStatusAt = null;
+    }
+    writeTabs(tabs);
+
+    const verb = status && status.trim() !== "" ? `set to "${status}"` : "cleared";
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Status ${verb} on "${tabs[idx].title}" (${tabs[idx].id}). FloatNote picks it up within ~2s.`,
         },
       ],
     };

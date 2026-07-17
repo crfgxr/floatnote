@@ -93,6 +93,57 @@ enum Tokens {
             return base
         }
 
+        /// Text attributes for a checkbox glyph. SF Rounded contains ☑ but NOT
+        /// ☐ — the unchecked box falls back to Apple Symbols, whose thin,
+        /// square-cornered box clashes with ☑'s rounded one. The character in
+        /// the document must stay ☐ (badge counting, HTML persistence, MCP all
+        /// key off it), so for unchecked boxes we attach an NSGlyphInfo that
+        /// makes TextKit display SF Rounded's □ (U+25A1) glyph instead — its
+        /// box matches ☑'s corners, stroke and advance exactly.
+        static func checkboxAttributes(checked: Bool) -> [NSAttributedString.Key: Any] {
+            let font = rounded(size: checkboxSize, weight: .medium)
+            var attrs: [NSAttributedString.Key: Any] = [.font: font]
+            if !checked, let info = uncheckedBoxGlyphInfo(for: font) {
+                attrs[.glyphInfo] = info
+            }
+            // The box glyph is checkboxSize (≈1.35× body), so on the shared text
+            // baseline it pokes above the caps and reads as "raised" next to body
+            // text. Drop it with a baselineOffset so its optical center lines up
+            // with the body text's cap band — box, text and caret then align.
+            let off = checkboxBaselineOffset(checked: checked, font: font)
+            if off != 0 { attrs[.baselineOffset] = off }
+            return attrs
+        }
+
+        /// Vertical shift (points, negative = down) that centers the enlarged box
+        /// glyph on the body text. Derived from the actual rendered glyph's
+        /// bounding box vs the body font's cap height, so it scales with the
+        /// chosen body size/family instead of being a magic number.
+        private static func checkboxBaselineOffset(checked: Bool, font: NSFont) -> CGFloat {
+            // Unchecked renders □ (U+25A1) via glyphInfo; checked renders ☑.
+            let utf16 = Array((checked ? "☑" : "□").utf16)
+            var glyphs = [CGGlyph](repeating: 0, count: utf16.count)
+            guard CTFontGetGlyphsForCharacters(font, utf16, &glyphs, utf16.count), glyphs[0] != 0 else { return 0 }
+            let boxRect = CTFontGetBoundingRectsForGlyphs(font, .default, &glyphs, nil, 1)
+            let boxCenter = boxRect.midY               // box optical center above baseline
+            let textCenter = body().capHeight / 2      // cap-band center of body text
+            return (textCenter - boxCenter).rounded()
+        }
+
+        /// Apply checkbox glyph styling in place. Removes any stale glyphInfo
+        /// when a box becomes checked (☐→☑ keeps the old character's attributes).
+        static func styleCheckboxGlyph(_ storage: NSMutableAttributedString, range: NSRange, checked: Bool) {
+            storage.removeAttribute(.glyphInfo, range: range)
+            storage.addAttributes(checkboxAttributes(checked: checked), range: range)
+        }
+
+        private static func uncheckedBoxGlyphInfo(for font: NSFont) -> NSGlyphInfo? {
+            let utf16 = Array("□".utf16)
+            var glyphs = [CGGlyph](repeating: 0, count: utf16.count)
+            guard CTFontGetGlyphsForCharacters(font, utf16, &glyphs, utf16.count), glyphs[0] != 0 else { return nil }
+            return NSGlyphInfo(cgGlyph: glyphs[0], for: font, baseString: "☐")
+        }
+
         // Editor body + heading sizes (derived from current body size)
         static var bodySize: CGFloat { Tokens.currentBodySize }
         static var h3Size:   CGFloat { round(bodySize * 1.14) }
@@ -185,6 +236,9 @@ enum Tokens {
         static let hoverBG:    SwiftUI.Color = .primary.opacity(0.08)
         static let activeTint: SwiftUI.Color = .accentColor.opacity(0.18)
         static let divider:    SwiftUI.Color = .primary.opacity(0.10)
+        /// Amber accent for a per-note terminal-folder override (distinct from the
+        /// inherited/project state, which uses `.accentColor`).
+        static let overrideTint: SwiftUI.Color = SwiftUI.Color(red: 0.95, green: 0.64, blue: 0.20)
     }
 }
 

@@ -16,7 +16,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.50.0"
+let APP_VERSION = "v1.51.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -64,6 +64,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 vm.checkExternalTabChanges()
                 vm.checkExternalFolderChanges()
                 vm.checkExternalBoardChanges()
+                vm.sweepExpiredJobStatuses()
             }
         }
 
@@ -107,7 +108,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     TerminalSessions.shared.existing(focusedId)?.view.send(txt: "\u{1b}\r")
                 } else if key == "n" {
                     withAnimation(.easeInOut(duration: 0.18)) { vm.addTerminal() }
-                    if let newId = vm.activeTerminalId { self.focusTerminal(newId) }
                 } else {
                     // Cmd+Enter → line feed (Ctrl+J): newline without submitting.
                     TerminalSessions.shared.existing(focusedId)?.view.send(txt: "\n")
@@ -124,18 +124,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                   vm.terminalTabs.contains(where: { $0.id == id }) else { return }
             MainActor.assumeIsolated {
                 withAnimation(.easeInOut(duration: 0.18)) { vm.closeTerminal(id) }
-            }
-        }
-    }
-
-    /// Make a terminal's view first responder once SwiftUI has (re)mounted it.
-    private func focusTerminal(_ id: UUID) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            MainActor.assumeIsolated {
-                guard let session = TerminalSessions.shared.existing(id) else { return }
-                let view = session.view
-                guard view.window != nil else { return }
-                view.window?.makeFirstResponder(view)
             }
         }
     }
@@ -288,8 +276,12 @@ struct TabData: Codable {
     var title: String
     var noteGuid: String?  // legacy field, ignored
     var html: String
-    var recordingPath: String?
+    var recordingPath: String?  // legacy single pointer — kept in sync (= newest) for MCP/old readers
+    var recordingPaths: [String]? = nil  // all recordings of the note, chronological; nil in old files
     var folderId: String?  // optional — nil means "root / ungrouped"
+    var localPath: String? = nil  // optional per-note terminal-folder override; nil = inherit from folder chain
+    var jobStatus: String? = nil  // busy label while a job runs on this note ("Summarizing…", MCP-set, …); nil = idle
+    var jobStatusAt: Double? = nil  // epoch seconds the status was last set — drives the 30-min stale TTL
 }
 
 class NoteTab: Identifiable, ObservableObject {
@@ -297,10 +289,29 @@ class NoteTab: Identifiable, ObservableObject {
     @Published var title: String
     var html: String = ""
     var lastSavedHTML: String = ""
-    var recordingPath: String? = nil
+    /// All recordings of this note, chronological (newest last).
+    @Published var recordingPaths: [String] = []
     @Published var folderId: UUID? = nil
+    /// Per-note terminal-folder override. Non-nil = this note pins its own
+    /// working directory, taking precedence over its folder chain. nil = inherit.
+    @Published var localPath: String? = nil
     /// Number of unchecked (`☐`) checklist items in this note. Drives the sidebar badge.
     @Published var uncheckedCount: Int = 0
+    /// Busy label while a job (transcribe/summarize, or an external MCP-set job)
+    /// runs on this note. nil = idle. Drives the blue sidebar pulse.
+    @Published var jobStatus: String? = nil
+    var jobStatusAt: Date? = nil
+
+    /// Statuses older than this are considered stale (crashed agent, leftover
+    /// flag) and ignored/swept. Long-running MCP jobs re-set to stay alive.
+    static let jobStatusTTL: TimeInterval = 30 * 60
+
+    /// True while a non-expired job status is present.
+    var isJobActive: Bool {
+        guard jobStatus != nil else { return false }
+        guard let at = jobStatusAt else { return true }
+        return Date().timeIntervalSince(at) < NoteTab.jobStatusTTL
+    }
 
     init(id: UUID = UUID(), title: String) {
         self.id = id
@@ -325,16 +336,24 @@ class NoteTab: Identifiable, ObservableObject {
             id: id.uuidString,
             title: title,
             html: html,
-            recordingPath: recordingPath,
-            folderId: folderId?.uuidString
+            recordingPath: recordingPaths.last,
+            recordingPaths: recordingPaths,
+            folderId: folderId?.uuidString,
+            localPath: localPath,
+            jobStatus: jobStatus,
+            jobStatusAt: jobStatusAt?.timeIntervalSince1970
         )
     }
 
     static func from(_ data: TabData) -> NoteTab {
         let tab = NoteTab(id: UUID(uuidString: data.id) ?? UUID(), title: data.title)
         tab.html = data.html
-        tab.recordingPath = data.recordingPath
+        // Migrate legacy single-recording notes on the fly.
+        tab.recordingPaths = data.recordingPaths ?? data.recordingPath.map { [$0] } ?? []
         if let fid = data.folderId { tab.folderId = UUID(uuidString: fid) }
+        tab.localPath = data.localPath
+        tab.jobStatus = data.jobStatus
+        tab.jobStatusAt = data.jobStatusAt.map { Date(timeIntervalSince1970: $0) }
         tab.recomputeUncheckedFromHTML()
         return tab
     }
@@ -348,6 +367,7 @@ struct FolderData: Codable {
     var isExpanded: Bool
     var isTrashed: Bool? = nil  // optional for backwards-compat with older JSON
     var parentId: String? = nil // optional; nil = root (back-compat with flat JSON)
+    var localPath: String? = nil // optional; the linked local directory (a "project"). nil = plain folder.
 }
 
 class Folder: Identifiable, ObservableObject {
@@ -357,18 +377,24 @@ class Folder: Identifiable, ObservableObject {
     @Published var isTrashed: Bool
     /// Parent folder for nesting. `nil` = root-level folder.
     @Published var parentId: UUID?
+    /// Linked local directory. A folder with a non-nil `localPath` is a
+    /// "project": its notes inherit this path as their terminal working dir.
+    /// `nil` = plain folder (no terminal).
+    @Published var localPath: String?
 
-    init(id: UUID = UUID(), name: String, isExpanded: Bool = true, isTrashed: Bool = false, parentId: UUID? = nil) {
+    init(id: UUID = UUID(), name: String, isExpanded: Bool = true, isTrashed: Bool = false,
+         parentId: UUID? = nil, localPath: String? = nil) {
         self.id = id
         self.name = name
         self.isExpanded = isExpanded
         self.isTrashed = isTrashed
         self.parentId = parentId
+        self.localPath = localPath
     }
 
     func toData() -> FolderData {
         FolderData(id: id.uuidString, name: name, isExpanded: isExpanded, isTrashed: isTrashed,
-                   parentId: parentId?.uuidString)
+                   parentId: parentId?.uuidString, localPath: localPath)
     }
 
     static func from(_ data: FolderData) -> Folder {
@@ -377,7 +403,8 @@ class Folder: Identifiable, ObservableObject {
             name: data.name,
             isExpanded: data.isExpanded,
             isTrashed: data.isTrashed ?? false,
-            parentId: data.parentId.flatMap { UUID(uuidString: $0) }
+            parentId: data.parentId.flatMap { UUID(uuidString: $0) },
+            localPath: data.localPath
         )
     }
 }
@@ -469,6 +496,38 @@ class EditorViewModel: ObservableObject {
         return max(0, windowContentWidth - sidebar - 10)
     }
 
+    /// Make the active terminal's view first responder. Focus moves only at
+    /// discrete presentation events (note switch, chip tap, toggle, new tab) —
+    /// clicking into the editor keeps focus there until the next such event.
+    func focusActiveTerminal() {
+        guard let id = activeTerminalId else { return }
+        focusTerminal(id)
+    }
+
+    /// The panel/view may still be mounting when focus is requested (SwiftUI
+    /// needs a tick after `isTerminalVisible` flips, and sessions are created
+    /// lazily on mount), so retry briefly. Bails if the tab closed or another
+    /// terminal became active meanwhile.
+    private func focusTerminal(_ id: UUID, attempt: Int = 0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            MainActor.assumeIsolated {
+                guard self.activeTerminalId == id,
+                      self.terminalTabs.contains(where: { $0.id == id }) else { return }
+                if let session = TerminalSessions.shared.existing(id),
+                   let window = session.view.window {
+                    window.makeFirstResponder(session.view)
+                } else if attempt < 8 {
+                    self.focusTerminal(id, attempt: attempt + 1)
+                }
+            }
+        }
+    }
+
+    /// Put keyboard focus back in the note editor.
+    func focusEditor() {
+        guard let tv = editorCoordinator?.textView else { return }
+        tv.window?.makeFirstResponder(tv)
+    }
     /// Hide the panel but keep all sessions mounted/alive (hide ≠ kill).
     func hideTerminal() { isTerminalVisible = false }
     func toggleTerminal() { isTerminalVisible ? hideTerminal() : applyTerminalRouteForActiveNote() }
@@ -485,25 +544,34 @@ class EditorViewModel: ObservableObject {
         isTerminalVisible = true
     }
 
-    /// Reverse of `terminalRoute`: the folder whose "terminal path" note resolves to
-    /// `path`. Used to navigate from a terminal tab back to its note.
+    /// Expand `~`, trim whitespace; returns nil for nil/empty. Central helper so
+    /// stored paths (absolute from the picker, or `~`-form from migration) resolve
+    /// consistently everywhere.
+    private func expandedPath(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        return expanded.isEmpty ? nil : expanded
+    }
+
+    /// Where a note's terminal directory comes from.
+    enum RouteSource: Equatable { case own, inherited, none }
+
+    /// Reverse of the route: the (non-trashed) project folder whose linked
+    /// `localPath` resolves to `path`. Used to navigate from a terminal chip back
+    /// to its note. Override-only paths that match no folder return nil (the chip
+    /// then leaves the active note untouched — no ping-pong).
     func folderForTerminalPath(_ path: String) -> Folder? {
         for folder in folders where !folder.isTrashed {
-            guard let pathNote = terminalPathNote(in: folder.id) else { continue }
-            let plain = htmlToAttributedString(pathNote.html)?.string ?? ""
-            guard let firstLine = plain
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .map({ $0.trimmingCharacters(in: .whitespaces) })
-                .first(where: { !$0.isEmpty }) else { continue }
-            let expanded = (firstLine as NSString).expandingTildeInPath
-            if !expanded.isEmpty && expanded == path { return folder }
+            if let p = expandedPath(folder.localPath), p == path { return folder }
         }
         return nil
     }
 
     /// The note to land on when entering `folder` via its terminal: the last note
     /// the user had open anywhere in the folder's subtree, else the folder's own
-    /// first non-"terminal path" note.
+    /// first note.
     private func noteToActivate(forTerminalFolder folder: Folder) -> NoteTab? {
         if let lastId = lastActiveNotePerFolder[folder.id],
            let last = tabs.first(where: { $0.id == lastId }),
@@ -512,15 +580,15 @@ class EditorViewModel: ObservableObject {
            isSelfOrDescendant(lastFolderId, of: folder.id) {
             return last
         }
-        return tabs.first(where: { $0.folderId == folder.id
-            && !$0.title.lowercased().contains("terminal path") })
+        return tabs.first(where: { $0.folderId == folder.id })
     }
 
     /// Activate a terminal tab (user tapped its chip) and, if its path maps to a
-    /// folder, navigate to the related note. The resulting note→terminal route dedups
-    /// to this same tab, so there is no ping-pong.
+    /// project folder, navigate to the related note. The resulting note→terminal
+    /// route dedups to this same tab, so there is no ping-pong.
     func selectTerminal(_ id: UUID) {
         activeTerminalId = id
+        focusActiveTerminal()
         guard let tab = terminalTabs.first(where: { $0.id == id }),
               let folder = folderForTerminalPath(tab.path),
               let note = noteToActivate(forTerminalFolder: folder) else { return }
@@ -536,62 +604,105 @@ class EditorViewModel: ObservableObject {
                                         label: route?.label ?? "terminal"))
         activeTerminalId = id
         isTerminalVisible = true
+        focusActiveTerminal()
     }
 
-    /// The "terminal path" note directly inside `folderId`, if any. Loose-trashed
-    /// notes are excluded automatically (their folderId is the Trash sentinel).
-    private func terminalPathNote(in folderId: UUID) -> NoteTab? {
-        tabs.first { $0.folderId == folderId && $0.title.lowercased().contains("terminal path") }
-    }
-
-    /// The folder whose "terminal path" note governs `folderId`'s subtree: the
-    /// TOP-MOST non-trashed ancestor (self included) that contains a "terminal
-    /// path" note. Nil when no ancestor has one. Capped at 64 hops so a corrupt
-    /// parent cycle can never hang the walk (moveFolder already rejects cycles).
-    private func terminalRouteFolder(startingAt folderId: UUID) -> Folder? {
-        var winner: Folder? = nil
+    /// The nearest non-trashed ancestor folder (the note's own folder included)
+    /// with a non-empty `localPath`. Nil when none in the chain. Capped at 64
+    /// hops so a corrupt parent cycle can never hang the walk.
+    private func nearestLinkedFolder(startingAt folderId: UUID) -> Folder? {
         var currentId: UUID? = folderId
         var hops = 0
         while let cid = currentId, hops < 64 {
             hops += 1
             guard let folder = folders.first(where: { $0.id == cid }) else { break }
-            if !folder.isTrashed && terminalPathNote(in: cid) != nil {
-                winner = folder
-            }
+            if !folder.isTrashed, expandedPath(folder.localPath) != nil { return folder }
             currentId = folder.parentId
         }
-        return winner
+        return nil
     }
 
-    /// The terminal route for a note: the TOP-MOST ancestor folder (the note's
-    /// own folder included) with a "terminal path" note; path = that note's
-    /// first non-empty body line, `~`-expanded; label = that folder's name.
-    /// Returns nil when there's no folder, no path note anywhere up the chain,
-    /// or an empty path.
+    /// Resolve a note's terminal working directory, with provenance:
+    ///   1. the note's own `localPath` override (wins), else
+    ///   2. the NEAREST ancestor project folder's `localPath`, else
+    ///   3. none.
+    /// `label` is the terminal-tab label: the project folder's name when
+    /// inherited, the path's last component for an override.
+    func effectiveRoute(for tab: NoteTab?) -> (path: String, label: String, source: RouteSource) {
+        guard let tab else { return ("", "", .none) }
+        if let own = expandedPath(tab.localPath) {
+            return (own, (own as NSString).lastPathComponent, .own)
+        }
+        if let folderId = tab.folderId,
+           let folder = nearestLinkedFolder(startingAt: folderId),
+           let path = expandedPath(folder.localPath) {
+            return (path, folder.name, .inherited)
+        }
+        return ("", "", .none)
+    }
+
+    /// `effectiveRoute` for the active note — drives the toolbar folder chip.
+    var activeRoute: (path: String, label: String, source: RouteSource) {
+        effectiveRoute(for: activeTab)
+    }
+
+    /// Set the active note's own folder override, then re-resolve the terminal.
+    func setNoteFolderOverride(_ path: String) {
+        guard let tab = activeTab else { return }
+        tab.localPath = path
+        tabs = tabs
+        saveTabsLocal()
+        applyTerminalRouteForActiveNote()
+    }
+
+    /// Clear the active note's override (back to inheriting from its folder).
+    func clearNoteFolderOverride() {
+        guard let tab = activeTab else { return }
+        tab.localPath = nil
+        tabs = tabs
+        saveTabsLocal()
+        applyTerminalRouteForActiveNote()
+    }
+
+    /// Unlink whatever the active note's chip points at: its own override if it
+    /// has one, otherwise the project folder it inherits from. No-op when there's
+    /// nothing linked.
+    func unlinkActiveRoute() {
+        guard let tab = activeTab else { return }
+        if tab.localPath != nil {
+            clearNoteFolderOverride()
+        } else if let fid = tab.folderId, let folder = nearestLinkedFolder(startingAt: fid) {
+            unlinkFolder(folder.id)
+        }
+    }
+
+    /// The terminal route for a note as `(path, label)`, or nil when unrouted.
+    /// Thin wrapper over `effectiveRoute`; the rest of the terminal machinery
+    /// (switchToRoute, dedup, applyTerminalRouteForActiveNote) is unchanged.
     func terminalRoute(for tab: NoteTab?) -> (path: String, label: String)? {
-        guard let tab, let folderId = tab.folderId,
-              let folder = terminalRouteFolder(startingAt: folderId),
-              let pathNote = terminalPathNote(in: folder.id) else { return nil }
-        let plain = htmlToAttributedString(pathNote.html)?.string ?? ""
-        guard let firstLine = plain
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map({ $0.trimmingCharacters(in: .whitespaces) })
-            .first(where: { !$0.isEmpty }) else { return nil }
-        let expanded = (firstLine as NSString).expandingTildeInPath
-        guard !expanded.isEmpty else { return nil }
-        return (expanded, folder.name)
+        let r = effectiveRoute(for: tab)
+        if case .none = r.source { return nil }
+        return (r.path, r.label)
     }
 
     /// Drive the terminal panel from the active note: route → open + switch/create
     /// that tab; no route → hide the panel (sessions survive).
-    func applyTerminalRouteForActiveNote() {
+    /// `focusTerminal: false` keeps focus in the editor (new-note creation —
+    /// the user is about to type the title).
+    func applyTerminalRouteForActiveNote(focusTerminal: Bool = true) {
         // Pinned = compact floating note: never auto-open the panel. Unpin
         // re-applies the route for whatever note is active then.
         if isPinned { return }
         if let route = terminalRoute(for: activeTab) {
             switchToRoute(path: route.path, label: route.label)
+            if focusTerminal { focusActiveTerminal() }
         } else {
+            // Don't strand focus on a hidden terminal — but leave it alone when
+            // it was elsewhere (sidebar, find bar).
+            let focusWasInTerminal =
+                TerminalSessions.shared.id(containing: NSApp.keyWindow?.firstResponder) != nil
             hideTerminal()
+            if focusWasInTerminal { focusEditor() }
         }
     }
 
@@ -691,7 +802,14 @@ class EditorViewModel: ObservableObject {
     @Published var isDictating: Bool = false
     var wantsDictation: Bool = false  // user intent: keep dictation alive
     @Published var tabs: [NoteTab] = []
-    @Published var activeTabId: UUID?
+    @Published var activeTabId: UUID? {
+        // Remember the last note the user had open so cold start restores it.
+        didSet {
+            if let id = activeTabId {
+                UserDefaults.standard.set(id.uuidString, forKey: "fn.lastActiveNoteId")
+            }
+        }
+    }
     @Published var editingTabId: UUID?
     @Published var draggingTabId: UUID?
     /// Folder currently being dragged in the sidebar (for folder→folder nesting).
@@ -705,6 +823,8 @@ class EditorViewModel: ObservableObject {
     @Published var selectedLanguage: TranscriptLanguage = .turkish
     @Published var isTranscribing = false
     @Published var isSummarizing = false
+    /// True while the editor's first line is still an empty/in-progress H1
+    /// title — drives the toolbar's H1 button highlight.
 
     let recordingManager = RecordingManager()
     let deepgramClient = DeepgramClient()
@@ -759,6 +879,7 @@ class EditorViewModel: ObservableObject {
 
         loadTabsLocal()
         loadFoldersLocal()
+        migrateTerminalPathNotesIfNeeded()
 
         if tabs.isEmpty {
             let tab = NoteTab(title: "Untitled")
@@ -769,8 +890,10 @@ class EditorViewModel: ObservableObject {
             saveTabsLocal()
         }
 
-        // On launch, prefer a note titled "backlog - agentforce" (case/whitespace
-        // insensitive). Falls back to the first non-trashed tab, then tabs[0].
+        // On launch, restore the note that was open when the app last quit
+        // (fn.lastActiveNoteId, kept fresh by activeTabId.didSet). Falls back
+        // to a note titled "agentforce tasks" (case/whitespace insensitive),
+        // then the first non-trashed tab, then tabs[0].
         let trashedFolderIds = Set(folders.filter { $0.isTrashed }.map { $0.id })
         func isVisible(_ t: NoteTab) -> Bool {
             t.folderId != TRASH_FOLDER_ID &&
@@ -779,14 +902,17 @@ class EditorViewModel: ObservableObject {
         func normalize(_ s: String) -> String {
             s.lowercased().trimmingCharacters(in: .whitespaces)
         }
-        let preferredTitle = "backlog - agentforce"
-        let firstTab = tabs.first(where: { isVisible($0) && normalize($0.title).contains(preferredTitle) })
+        let lastOpenId = UserDefaults.standard.string(forKey: "fn.lastActiveNoteId")
+            .flatMap(UUID.init)
+        let preferredTitle = "agentforce tasks"
+        let firstTab = tabs.first(where: { $0.id == lastOpenId && isVisible($0) })
+            ?? tabs.first(where: { isVisible($0) && normalize($0.title).contains(preferredTitle) })
             ?? tabs.first(where: { isVisible($0) })
             ?? tabs[0]
         activeTabId = firstTab.id
         currentHTML = firstTab.html
         lastSavedHTML = firstTab.lastSavedHTML
-        currentRecordingPath = firstTab.recordingPath
+        currentRecordingPath = firstTab.recordingPaths.last
 
         if !firstTab.html.isEmpty, let attrStr = htmlToAttributedString(firstTab.html) {
             attributedText = NSMutableAttributedString(attributedString: attrStr)
@@ -859,6 +985,15 @@ class EditorViewModel: ObservableObject {
             if existing.folderId != diskFolderId {
                 existing.folderId = diskFolderId
             }
+            // Sync the per-note terminal-folder override too (MCP / external edit).
+            if existing.localPath != diskTab.localPath {
+                existing.localPath = diskTab.localPath
+            }
+            // Sync the busy label (MCP set_note_status) — active tab included.
+            if existing.jobStatus != diskTab.jobStatus {
+                existing.jobStatus = diskTab.jobStatus
+                existing.jobStatusAt = diskTab.jobStatusAt
+            }
             if diskTab.id == currentActiveId {
                 // Active tab: only adopt the disk copy if it diverged from what
                 // WE last saved (a genuine external edit to this note). Comparing
@@ -881,7 +1016,7 @@ class EditorViewModel: ObservableObject {
             } else {
                 existing.html = diskTab.html
                 existing.title = diskTab.title
-                existing.recordingPath = diskTab.recordingPath
+                existing.recordingPaths = diskTab.recordingPaths
                 existing.recomputeUncheckedFromHTML()
             }
         }
@@ -914,12 +1049,15 @@ class EditorViewModel: ObservableObject {
                     if tab.folderId != diskFolderId {
                         tab.folderId = diskFolderId
                     }
+                    if tab.localPath != dt.localPath {
+                        tab.localPath = dt.localPath
+                    }
                     // Body/title/recording: don't overwrite the active tab
                     // (user may be typing); for others, adopt the disk version.
                     if diskId != activeTabId, tab.html != dt.html {
                         tab.html = dt.html
                         tab.title = dt.title
-                        tab.recordingPath = dt.recordingPath
+                        tab.recordingPaths = dt.recordingPaths ?? dt.recordingPath.map { [$0] } ?? []
                     }
                 }
             }
@@ -992,6 +1130,51 @@ class EditorViewModel: ObservableObject {
         guard let f = folders.first(where: { $0.id == id }) else { return }
         f.isExpanded.toggle()
         saveFoldersLocal()
+    }
+
+    /// Link a folder to a local directory, making it a "project". Notes in its
+    /// subtree inherit `path` as their terminal working directory.
+    func linkFolder(_ id: UUID, to path: String) {
+        guard let f = folders.first(where: { $0.id == id }) else { return }
+        f.localPath = path
+        folders = folders  // re-fire @Published (sidebar partitions on folder props)
+        saveFoldersLocal()
+        applyTerminalRouteForActiveNote()
+    }
+
+    /// Unlink a folder's local directory — back to a plain folder (no terminal).
+    func unlinkFolder(_ id: UUID) {
+        guard let f = folders.first(where: { $0.id == id }) else { return }
+        f.localPath = nil
+        folders = folders
+        saveFoldersLocal()
+        applyTerminalRouteForActiveNote()
+    }
+
+    /// One-time migration (guarded by a UserDefaults flag): fold each legacy
+    /// "…terminal path" note into its folder's `localPath`, so existing routed
+    /// folders keep working with zero user action. The old note is left in place
+    /// as an ordinary note the user can delete.
+    private func migrateTerminalPathNotesIfNeeded() {
+        let key = "fn.projectFoldersMigrated"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        var changed = false
+        for folder in folders where !folder.isTrashed && folder.localPath == nil {
+            guard let note = tabs.first(where: {
+                $0.folderId == folder.id && $0.title.lowercased().contains("terminal path")
+            }) else { continue }
+            let plain = htmlToAttributedString(note.html)?.string ?? ""
+            guard let firstLine = plain
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map({ $0.trimmingCharacters(in: .whitespaces) })
+                .first(where: { !$0.isEmpty }) else { continue }
+            let expanded = (firstLine as NSString).expandingTildeInPath
+            guard !expanded.isEmpty else { continue }
+            folder.localPath = expanded
+            changed = true
+        }
+        if changed { folders = folders; saveFoldersLocal() }
+        UserDefaults.standard.set(true, forKey: key)
     }
 
     // MARK: - Folder nesting
@@ -1081,7 +1264,7 @@ class EditorViewModel: ObservableObject {
         let doomedActive = doomedTabs.contains { $0.id == activeTabId }
         for tab in doomedTabs {
             deletedTabIds.insert(tab.id.uuidString.uppercased())
-            if let recPath = tab.recordingPath {
+            for recPath in tab.recordingPaths {
                 try? FileManager.default.removeItem(atPath: recPath)
             }
             ExcalidrawStore.deleteBoard(for: tab.id)
@@ -1101,7 +1284,7 @@ class EditorViewModel: ObservableObject {
         let looseTrashed = tabs.filter { $0.folderId == TRASH_FOLDER_ID }
         for tab in looseTrashed {
             deletedTabIds.insert(tab.id.uuidString.uppercased())
-            if let recPath = tab.recordingPath {
+            for recPath in tab.recordingPaths {
                 try? FileManager.default.removeItem(atPath: recPath)
             }
             ExcalidrawStore.deleteBoard(for: tab.id)
@@ -1113,7 +1296,7 @@ class EditorViewModel: ObservableObject {
         let trashedIds = Set(folders.filter { $0.isTrashed }.map { $0.id })
         for tab in tabs where tab.folderId.map({ trashedIds.contains($0) }) ?? false {
             deletedTabIds.insert(tab.id.uuidString.uppercased())
-            if let recPath = tab.recordingPath {
+            for recPath in tab.recordingPaths {
                 try? FileManager.default.removeItem(atPath: recPath)
             }
             ExcalidrawStore.deleteBoard(for: tab.id)
@@ -1136,10 +1319,11 @@ class EditorViewModel: ObservableObject {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         guard tab.folderId != folderId else { return }
         tab.folderId = folderId
+        tabs = tabs  // re-fire @Published so sidebar repartitions
         saveTabsLocal()
     }
 
-    /// Convenience: switch to the preferred home note ("backlog - agentforce")
+    /// Convenience: switch to the preferred home note ("agentforce tasks")
     /// if available, otherwise the first non-trashed tab. If nothing visible
     /// remains, create an Untitled note so the editor always has something.
     private func switchToFirstVisibleTab(excluding excludeId: UUID?) {
@@ -1149,7 +1333,7 @@ class EditorViewModel: ObservableObject {
             tab.folderId != TRASH_FOLDER_ID &&
             !(tab.folderId.map { trashedFolderIds.contains($0) } ?? false)
         }
-        let normalizedPreferred = "backlog - agentforce"
+        let normalizedPreferred = "agentforce tasks"
         let preferred = tabs.first { tab in
             isVisible(tab) &&
             tab.title.lowercased().trimmingCharacters(in: .whitespaces).contains(normalizedPreferred)
@@ -1206,14 +1390,14 @@ class EditorViewModel: ObservableObject {
         activeTabId = id
         if let fid = newTab.folderId, fid != TRASH_FOLDER_ID {
             lastActiveNotePerFolder[fid] = newTab.id
-            // Also remember the note under its terminal-route root, so tapping
-            // that terminal's chip returns to subtree notes, not just notes in
-            // the root folder itself.
-            if let routeRoot = terminalRouteFolder(startingAt: fid), routeRoot.id != fid {
+            // Also remember the note under its project folder (the nearest linked
+            // ancestor it routes to), so tapping that terminal's chip returns to
+            // subtree notes, not just notes in the project folder itself.
+            if let routeRoot = nearestLinkedFolder(startingAt: fid), routeRoot.id != fid {
                 lastActiveNotePerFolder[routeRoot.id] = newTab.id
             }
         }
-        currentRecordingPath = newTab.recordingPath
+        currentRecordingPath = newTab.recordingPaths.last
         currentHTML = newTab.html
         lastSavedHTML = newTab.lastSavedHTML
 
@@ -1257,7 +1441,8 @@ class EditorViewModel: ObservableObject {
         onContentLoaded?(NSAttributedString(string: ""))
         saveTabsLocal()
         status = "New note"
-        applyTerminalRouteForActiveNote()
+        applyTerminalRouteForActiveNote(focusTerminal: false)
+        focusEditor()
     }
 
     /// Move a note to Trash. Reversible via `restoreTab`.
@@ -1271,10 +1456,10 @@ class EditorViewModel: ObservableObject {
             tab.lastSavedHTML = lastSavedHTML
         }
         tab.folderId = TRASH_FOLDER_ID
+        tabs = tabs  // re-fire @Published so sidebar repartitions
         if activeTabId == id {
             switchToFirstVisibleTab(excluding: id)
         }
-        isTrashExpanded = true
         saveTabsLocal()
     }
 
@@ -1298,7 +1483,7 @@ class EditorViewModel: ObservableObject {
         deletedTabIds.insert(id.uuidString.uppercased())
 
         // Delete associated recording file from disk
-        if let recPath = tabs[index].recordingPath {
+        for recPath in tabs[index].recordingPaths {
             try? FileManager.default.removeItem(atPath: recPath)
         }
         // Delete the note's Excalidraw board, if any.
@@ -1447,13 +1632,6 @@ class EditorViewModel: ObservableObject {
     }
 
     func startRecording() async {
-        // Create a new tab for the recording
-        let formatter = DateFormatter()
-        formatter.dateFormat = "dd.MM HH:mm"
-        let title = "Recording \(formatter.string(from: Date()))"
-        addTab()
-        activeTab?.title = title
-
         guard let tab = activeTab else { return }
 
         recordingTabId = tab.id
@@ -1489,17 +1667,57 @@ class EditorViewModel: ObservableObject {
         isSavingRecording = false
         currentRecordingPath = url.path
         if let tabId = recordingTabId, let tab = tabs.first(where: { $0.id == tabId }) {
-            tab.recordingPath = url.path
+            tab.recordingPaths.append(url.path)
+            tabs = tabs
         }
         recordingTabId = nil
         saveTabsLocal()
     }
 
-    func transcribeRecording() async {
+    /// Remove one recording from a note: deletes the .m4a from disk and drops
+    /// the entry from the note's list. Called from a row's confirmed ✕.
+    func deleteRecording(path: String, from tabId: UUID) {
+        guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
+        try? FileManager.default.removeItem(atPath: path)
+        tab.recordingPaths.removeAll { $0 == path }
+        if currentRecordingPath == path { currentRecordingPath = tab.recordingPaths.last }
+        tabs = tabs
+        saveTabsLocal()
+    }
+
+    /// Set or clear (status = nil) a note's busy label. Re-fires the sidebar and
+    /// persists immediately so the on-disk copy never diverges from memory (the
+    /// external-change merge would otherwise resurrect a cleared flag).
+    func setJobStatus(_ status: String?, for tabId: UUID?) {
+        guard let tabId, let tab = tabs.first(where: { $0.id == tabId }) else { return }
+        tab.jobStatus = status
+        tab.jobStatusAt = status == nil ? nil : Date()
+        tabs = tabs
+        saveTabsLocal()
+    }
+
+    /// Clear job statuses older than the TTL (crashed agent / leftover flag).
+    /// Called from the AppDelegate 2s timer.
+    func sweepExpiredJobStatuses() {
+        var changed = false
+        for tab in tabs where tab.jobStatus != nil && !tab.isJobActive {
+            tab.jobStatus = nil
+            tab.jobStatusAt = nil
+            changed = true
+        }
+        if changed {
+            tabs = tabs
+            saveTabsLocal()
+        }
+    }
+
+    func transcribeRecording(path: String? = nil) async {
         // Capture origin tab + path up-front so the result lands on the note the
         // user pressed the button on, even if they switch tabs while it's running.
+        // `path` targets a specific recording row; nil = the note's newest.
         let originTabId = activeTabId
-        let originPath = tabs.first(where: { $0.id == originTabId })?.recordingPath
+        let originPath = path
+            ?? tabs.first(where: { $0.id == originTabId })?.recordingPaths.last
             ?? currentRecordingPath
         dbg("transcribe: CALLED, originTab=\(originTabId?.uuidString ?? "nil") path=\(originPath ?? "nil")")
         guard let path = originPath, let client = deepgramClient else {
@@ -1509,6 +1727,8 @@ class EditorViewModel: ObservableObject {
         let fileURL = URL(fileURLWithPath: path)
         isTranscribing = true
         status = "Transcribing…"
+        setJobStatus("Transcribing…", for: originTabId)
+        defer { setJobStatus(nil, for: originTabId) }
         guard let result = await client.transcribe(fileURL: fileURL, language: selectedLanguage, includeSummary: false) else {
             isTranscribing = false
             status = "Transcription failed"
@@ -1519,9 +1739,10 @@ class EditorViewModel: ObservableObject {
         insertTextIntoEditor(result.transcript, targetTabId: originTabId)
     }
 
-    func summarizeRecording() async {
+    func summarizeRecording(path: String? = nil) async {
         let originTabId = activeTabId
-        let originPath = tabs.first(where: { $0.id == originTabId })?.recordingPath
+        let originPath = path
+            ?? tabs.first(where: { $0.id == originTabId })?.recordingPaths.last
             ?? currentRecordingPath
         guard let path = originPath, let deepgram = deepgramClient, let router = openRouterClient else {
             dbg("summarize: guard failed — path=\(originPath ?? "nil") deepgram=\(deepgramClient != nil) router=\(openRouterClient != nil)")
@@ -1530,6 +1751,8 @@ class EditorViewModel: ObservableObject {
         let fileURL = URL(fileURLWithPath: path)
         isSummarizing = true
         status = "Transcribing…"
+        setJobStatus("Summarizing…", for: originTabId)
+        defer { setJobStatus(nil, for: originTabId) }
 
         // Step 1: Transcribe audio via Deepgram
         guard let result = await deepgram.transcribe(fileURL: fileURL, language: selectedLanguage, includeSummary: false) else {
@@ -1641,7 +1864,7 @@ class EditorViewModel: ObservableObject {
             for td in imported {
                 let tab = NoteTab(title: td.title)
                 tab.html = td.html
-                tab.recordingPath = td.recordingPath
+                tab.recordingPaths = td.recordingPaths ?? td.recordingPath.map { [$0] } ?? []
                 tabs.append(tab)
             }
 
@@ -2420,9 +2643,9 @@ struct EditorView: View {
                             vm.isSavingRecording = false
                         }
                         Divider()
-                    } else if let path = vm.activeTab?.recordingPath {
-                        RecordingPlayerView(fileURL: URL(fileURLWithPath: path))
-                            .id(path)
+                    } else if let tab = vm.activeTab, !tab.recordingPaths.isEmpty {
+                        RecordingsListView(tab: tab)
+                            .id(tab.id)
                         Divider()
                     }
                     if vm.isBoardVisible, let activeId = vm.activeTabId {
@@ -2623,6 +2846,9 @@ struct TerminalPanel: View {
 
 extension Notification.Name {
     static let floatnoteTerminalReset = Notification.Name("floatnote.terminal.reset")
+    /// Posted (object = recording path String) when a recording row starts
+    /// playing, so every other row pauses — one audio at a time.
+    static let floatnoteRowPlaybackStarted = Notification.Name("floatnote.recording.rowPlaybackStarted")
 }
 
 // MARK: - Notes Sidebar
@@ -2780,6 +3006,12 @@ struct SidebarFolderView: View {
                         .foregroundColor(.primary)
                         .lineLimit(1)
                 }
+                if let lp = folder.localPath {
+                    Image(systemName: "link")
+                        .font(.system(size: 9))
+                        .foregroundColor(.accentColor)
+                        .help((lp as NSString).abbreviatingWithTildeInPath)
+                }
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 10)
@@ -2797,6 +3029,13 @@ struct SidebarFolderView: View {
             .contextMenu {
                 Button("Rename") { vm.editingFolderId = folder.id }
                 Divider()
+                if folder.localPath == nil {
+                    Button("Link Local Folder…") { pickFolderForLink() }
+                } else {
+                    Button("Change Folder…") { pickFolderForLink() }
+                    Button("Unlink Folder") { vm.unlinkFolder(folder.id) }
+                }
+                Divider()
                 Button("Move Folder to Trash", role: .destructive) {
                     vm.trashFolder(folder.id)
                 }
@@ -2812,16 +3051,31 @@ struct SidebarFolderView: View {
                 // Subfolders first (recursively), then this folder's own notes.
                 ForEach(subfolders) { sub in
                     SidebarFolderView(folder: sub)
-                        .padding(.leading, 16)
+                        .padding(.leading, 24)
                         .id(sub.id)
                 }
                 ForEach(tabsInFolder) { tab in
                     SidebarNoteItemView(tab: tab)
-                        .padding(.leading, 16)
+                        .padding(.leading, 24)
                         .id(tab.id)
                 }
             }
         }
+        // Gap after an expanded folder's children so they don't visually bleed
+        // into whatever renders next (root notes, sibling folders, parent notes).
+        .padding(.bottom, folder.isExpanded && !(subfolders.isEmpty && tabsInFolder.isEmpty) ? 6 : 0)
+    }
+
+    /// Native folder picker → link (or re-link) this folder to a local directory.
+    private func pickFolderForLink() {
+        let panel = NSOpenPanel()
+        panel.title = "Link a local folder to “\(folder.name)”"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if let cur = folder.localPath { panel.directoryURL = URL(fileURLWithPath: cur) }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        vm.linkFolder(folder.id, to: url.path)
     }
 }
 
@@ -2877,10 +3131,16 @@ struct SidebarNoteItemView: View {
 
     var isActive: Bool { vm.activeTabId == tab.id }
     var isDragging: Bool { vm.draggingTabId == tab.id }
+    var isRecordingHere: Bool { vm.isRecording && vm.recordingTabId == tab.id }
+    var isJobRunningHere: Bool { !isRecordingHere && tab.isJobActive }
 
     var body: some View {
         HStack(spacing: 6) {
-            if tab.recordingPath != nil {
+            if isRecordingHere {
+                PulseDot(color: .red)
+            } else if isJobRunningHere {
+                PulseDot(color: .accentColor)
+            } else if !tab.recordingPaths.isEmpty {
                 Text("\u{1F3A4}")
                     .font(.system(size: 10))
             }
@@ -2894,9 +3154,13 @@ struct SidebarNoteItemView: View {
             } else {
                 Text(tab.title)
                     .font(.system(size: 12, weight: isActive ? .semibold : .regular))
-                    .foregroundColor(isActive ? .primary : .secondary)
+                    .foregroundColor(
+                        isRecordingHere ? .red :
+                        (isJobRunningHere ? .accentColor : (isActive ? .primary : .secondary))
+                    )
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .help(isJobRunningHere ? (tab.jobStatus ?? "") : "")
             }
             Spacer(minLength: 4)
             if tab.uncheckedCount > 0 {
@@ -2928,6 +3192,26 @@ struct SidebarNoteItemView: View {
                 vm.trashTab(tab.id)
             }
         }
+    }
+}
+
+/// Pulsing dot shown in a sidebar note row while something live is happening
+/// there (red = recording, accent = job running). Leaving the hierarchy
+/// (recording/job ended) kills the animation.
+struct PulseDot: View {
+    let color: Color
+    @State private var dimmed = false
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 7, height: 7)
+            .opacity(dimmed ? 0.25 : 1.0)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    dimmed = true
+                }
+            }
     }
 }
 
@@ -3067,7 +3351,7 @@ struct SidebarTrashedNoteView: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            if tab.recordingPath != nil {
+            if !tab.recordingPaths.isEmpty {
                 Text("\u{1F3A4}").font(.system(size: 10))
             }
             Text(tab.title)
@@ -3287,7 +3571,7 @@ struct TabItemView: View {
                     .onAppear { isFieldFocused = true }
             } else {
                 HStack(spacing: 3) {
-                    if tab.recordingPath != nil {
+                    if !tab.recordingPaths.isEmpty {
                         Text("\u{1F3A4}")
                             .font(.system(size: 9))
                     }
@@ -3565,11 +3849,12 @@ struct FormatToolbar: View {
             }
             .layoutPriority(1)
 
-            // Trailing: board toggle + terminal toggle + theme + pin
+            // Trailing: board toggle + terminal toggle + theme + pin + folder chip
             boardButton
             terminalButton
             themeButton
             pinButton
+            folderChip
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
@@ -3736,6 +4021,85 @@ struct FormatToolbar: View {
         .help(vm.isPinned ? "Unpin from top" : "Pin to top")
     }
 
+    /// The note's terminal-folder chip. Shows the effective directory's name
+    /// (accent = inherited from a project folder, amber = this note's own
+    /// override, gray "Set folder…" = none). Click → native folder picker sets
+    /// the note's own path; the ✕ (override only) clears it back to inheriting.
+    private var folderChip: some View {
+        let route = vm.activeRoute
+        let dirName = route.path.isEmpty ? "" : (route.path as NSString).lastPathComponent
+        return HStack(spacing: 1) {
+            Button(action: { pickNoteFolder() }) {
+                HStack(spacing: 4) {
+                    Image(systemName: route.source == .none ? "folder.badge.plus" : "link")
+                        .font(.system(size: 10))
+                    Text(route.source == .none ? "Set folder…" : dirName)
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundColor(chipColor(route.source))
+                .padding(.horizontal, 7)
+                .frame(height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "folder" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+            }
+            .buttonStyle(.plain)
+            .onHover { hoveredButton = $0 ? "folder" : nil }
+            .help(chipHelp(route))
+            .contextMenu {
+                Button(route.source == .none ? "Link Folder…" : "Change Folder…") { pickNoteFolder() }
+                if route.source == .own {
+                    Button("Unlink — inherit folder's directory") { vm.clearNoteFolderOverride() }
+                } else if route.source == .inherited {
+                    Button("Unlink Folder “\(route.label)”") { vm.unlinkActiveRoute() }
+                }
+            }
+
+            if route.source == .own {
+                Button(action: { vm.clearNoteFolderOverride() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(Tokens.SUI.overrideTint)
+                        .frame(width: 15, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("Clear override — inherit the folder's directory")
+            }
+        }
+        .fixedSize()
+    }
+
+    private func chipColor(_ source: EditorViewModel.RouteSource) -> Color {
+        switch source {
+        case .own:       return Tokens.SUI.overrideTint
+        case .inherited: return .accentColor
+        case .none:      return .secondary
+        }
+    }
+
+    private func chipHelp(_ route: (path: String, label: String, source: EditorViewModel.RouteSource)) -> String {
+        let tilde = route.path.isEmpty ? "" : (route.path as NSString).abbreviatingWithTildeInPath
+        switch route.source {
+        case .own:       return "This note's folder: \(tilde)  ·  ✕ to inherit"
+        case .inherited: return "Terminal folder (from “\(route.label)”): \(tilde)"
+        case .none:      return "Link a local folder to this note"
+        }
+    }
+
+    private func pickNoteFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a folder for this note"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        let cur = vm.activeRoute.path
+        if !cur.isEmpty { panel.directoryURL = URL(fileURLWithPath: cur) }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        vm.setNoteFolderOverride(url.path)
+    }
+
     func thinDivider() -> some View {
         Rectangle()
             .fill(Color.primary.opacity(0.1))
@@ -3743,7 +4107,7 @@ struct FormatToolbar: View {
             .padding(.horizontal, 4)
     }
 
-    func toolBtn(_ title: String, id: String, action: @escaping () -> Void) -> some View {
+    func toolBtn(_ title: String, id: String, isSelected: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 11, weight: .medium))
@@ -3751,10 +4115,10 @@ struct FormatToolbar: View {
                 .padding(.horizontal, 6)
                 .frame(height: 22)
                 .frame(minWidth: 26)               // short labels (H1) stay uniform; longer ones (Body) grow
-                .foregroundColor(.primary)
+                .foregroundColor(isSelected ? Color.accentColor : .primary)
                 .background(
                     RoundedRectangle(cornerRadius: 3)
-                        .fill(hoveredButton == id ? Color.primary.opacity(0.08) : Color.clear)
+                        .fill(isSelected ? Color.accentColor.opacity(0.15) : (hoveredButton == id ? Color.primary.opacity(0.08) : Color.clear))
                 )
         }
         .buttonStyle(.plain)
@@ -3876,6 +4240,225 @@ struct RecordingInProgressView: View {
 }
 
 // MARK: - Recording Player View
+
+/// Stacked per-recording rows above the editor — one slim row per recording of
+/// the active note. A row can expand into the full waveform player
+/// (`RecordingPlayerView`) for scrub/cut editing; only one row expands at a time.
+struct RecordingsListView: View {
+    @ObservedObject var tab: NoteTab
+    @EnvironmentObject var vm: EditorViewModel
+    @State private var expandedPath: String? = nil
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(tab.recordingPaths, id: \.self) { path in
+                RecordingRowView(
+                    path: path,
+                    tabId: tab.id,
+                    isExpanded: expandedPath == path,
+                    onToggleExpand: {
+                        expandedPath = (expandedPath == path) ? nil : path
+                    }
+                )
+                if expandedPath == path {
+                    RecordingPlayerView(fileURL: URL(fileURLWithPath: path))
+                        .id(path)
+                }
+                if path != tab.recordingPaths.last {
+                    Divider().opacity(0.5)
+                }
+            }
+        }
+        .background(vm.theme.chromeBackground)
+    }
+}
+
+/// One slim recording row: play/pause + seek + timestamp label (derived from
+/// the filename), per-row Transcript/Summary, and a confirmed delete. While the
+/// row is expanded into the full player its own controls hide (the full player
+/// takes over) leaving just the label + collapse + delete.
+struct RecordingRowView: View {
+    let path: String
+    let tabId: UUID
+    let isExpanded: Bool
+    let onToggleExpand: () -> Void
+
+    @EnvironmentObject var vm: EditorViewModel
+    @State private var player: AVPlayer?
+    @State private var isPlaying = false
+    @State private var currentTime: Double = 0
+    @State private var duration: Double = 1
+    @State private var timeObserver: Any?
+    @State private var endObserver: Any?
+    @State private var pauseObserver: Any?
+    @State private var confirmingDelete = false
+
+    /// "16.07-11.26-2.m4a" → "16.07 11:26 (2)"
+    private var label: String {
+        let name = (path as NSString).lastPathComponent
+            .replacingOccurrences(of: ".m4a", with: "")
+        let parts = name.split(separator: "-").map(String.init)
+        guard parts.count >= 2 else { return name }
+        let time = parts[1].replacingOccurrences(of: ".", with: ":")
+        let suffix = parts.count > 2 ? " (\(parts[2]))" : ""
+        return "\(parts[0]) \(time)\(suffix)"
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onToggleExpand) {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .frame(width: 12)
+            }
+            .buttonStyle(.plain)
+            .help(isExpanded ? "Hide waveform editor" : "Show waveform editor")
+
+            Text("\u{1F3A4}").font(.system(size: 10))
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.primary)
+
+            if !isExpanded {
+                Button { togglePlay() } label: {
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.primary)
+                }
+                .buttonStyle(.plain)
+
+                Slider(value: Binding(get: { currentTime }, set: { seek(to: $0) }),
+                       in: 0...max(duration, 1))
+                    .controlSize(.mini)
+                    .frame(maxWidth: 180)
+
+                Text("\(timeString(currentTime)) / \(timeString(duration))")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.secondary)
+
+                Spacer(minLength: 4)
+
+                if vm.deepgramClient != nil {
+                    Button {
+                        Task { await vm.transcribeRecording(path: path) }
+                    } label: {
+                        Text("Transcript")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(vm.isTranscribing ? .secondary : .accentColor)
+                    .disabled(vm.isTranscribing || vm.isSummarizing)
+                    .help("Transcribe this recording")
+
+                    Button {
+                        Task { await vm.summarizeRecording(path: path) }
+                    } label: {
+                        Text("Summary")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(vm.isSummarizing ? .secondary : .accentColor)
+                    .disabled(vm.isTranscribing || vm.isSummarizing)
+                    .help("Transcribe & summarize this recording with AI")
+                }
+            } else {
+                Spacer(minLength: 4)
+            }
+
+            Button { confirmingDelete = true } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Delete this recording")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .alert("Delete this recording?", isPresented: $confirmingDelete) {
+            Button("Delete", role: .destructive) {
+                cleanup()
+                vm.deleteRecording(path: path, from: tabId)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\(label) will be removed from disk permanently.")
+        }
+        .onAppear { setupPlayer() }
+        .onDisappear { cleanup() }
+        .onChange(of: isExpanded) { expanded in
+            // The full player takes over while expanded — stop the row's audio.
+            if expanded { player?.pause(); isPlaying = false }
+        }
+    }
+
+    private func togglePlay() {
+        guard let p = player else { return }
+        if isPlaying {
+            p.pause()
+            isPlaying = false
+        } else {
+            NotificationCenter.default.post(name: .floatnoteRowPlaybackStarted, object: path)
+            if currentTime >= duration - 0.05 { p.seek(to: .zero) }
+            p.play()
+            isPlaying = true
+        }
+    }
+
+    private func seek(to t: Double) {
+        currentTime = t
+        player?.seek(to: CMTime(seconds: t, preferredTimescale: 600))
+    }
+
+    private func timeString(_ t: Double) -> String {
+        let s = Int(max(t, 0))
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    private func setupPlayer() {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let item = AVPlayerItem(url: URL(fileURLWithPath: path))
+        let p = AVPlayer(playerItem: item)
+        player = p
+        Task {
+            if let dur = try? await item.asset.load(.duration), dur.isNumeric {
+                duration = max(dur.seconds, 1)
+            }
+        }
+        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        timeObserver = p.addPeriodicTimeObserver(forInterval: interval, queue: .main) { t in
+            currentTime = t.seconds
+        }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
+        ) { _ in
+            isPlaying = false
+            currentTime = 0
+            p.seek(to: .zero)
+        }
+        pauseObserver = NotificationCenter.default.addObserver(
+            forName: .floatnoteRowPlaybackStarted, object: nil, queue: .main
+        ) { note in
+            if (note.object as? String) != path {
+                p.pause()
+                isPlaying = false
+            }
+        }
+    }
+
+    private func cleanup() {
+        if let obs = timeObserver { player?.removeTimeObserver(obs) }
+        timeObserver = nil
+        if let obs = endObserver { NotificationCenter.default.removeObserver(obs) }
+        endObserver = nil
+        if let obs = pauseObserver { NotificationCenter.default.removeObserver(obs) }
+        pauseObserver = nil
+        player?.pause()
+        player = nil
+        isPlaying = false
+    }
+}
 
 struct RecordingPlayerView: View {
     let fileURL: URL
@@ -3999,7 +4582,7 @@ struct RecordingPlayerView: View {
 
                         Button {
                             dbg("TRANSCRIPT BUTTON TAPPED")
-                            Task { await vm.transcribeRecording() }
+                            Task { await vm.transcribeRecording(path: fileURL.path) }
                         } label: {
                             HStack(spacing: 4) {
                                 if vm.isTranscribing {
@@ -4019,7 +4602,7 @@ struct RecordingPlayerView: View {
                         .disabled(vm.isTranscribing || vm.isSummarizing)
 
                         Button {
-                            Task { await vm.summarizeRecording() }
+                            Task { await vm.summarizeRecording(path: fileURL.path) }
                         } label: {
                             HStack(spacing: 4) {
                                 if vm.isSummarizing {
@@ -4370,6 +4953,20 @@ class BlockCaretTextView: NSTextView {
         addSubview(dragInsertionLine)
         DispatchQueue.main.async { self.updateCaretPosition() }
 
+        // The caret also hides while the window isn't key (app in background):
+        // re-evaluate visibility on key-status changes of our own window.
+        windowKeyObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        windowKeyObservers = []
+        if let win = window {
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+                windowKeyObservers.append(NotificationCenter.default.addObserver(
+                    forName: name, object: win, queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.updateCaretPosition() }
+                })
+            }
+        }
+
         // Track mouse movement for cursor changes over list prefixes
         let trackingArea = NSTrackingArea(
             rect: .zero,
@@ -4406,9 +5003,91 @@ class BlockCaretTextView: NSTextView {
         // Hide system caret
     }
 
+    /// The block caret is a custom always-on subview, so unlike the system
+    /// insertion point it must be hidden explicitly while keyboard focus is
+    /// elsewhere (e.g. the terminal panel) — a visible caret there reads as
+    /// "typing goes here" when it doesn't.
+    private var isEditorFocused = false
+    private var windowKeyObservers: [NSObjectProtocol] = []
+
+    deinit {
+        windowKeyObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok { isEditorFocused = true; updateCaretPosition() }
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        if ok { isEditorFocused = false; updateCaretPosition() }
+        return ok
+    }
+
     override func didChangeText() {
         super.didChangeText()
         updateCaretPosition()
+        // Placeholder covers the whole first lines, not just the edited glyph
+        // range — force a full redraw when emptiness flips either way.
+        if string.isEmpty != placeholderWasVisible {
+            placeholderWasVisible = string.isEmpty
+            needsDisplay = true
+        }
+        // AppKit resets typing attributes to its stock defaults when the
+        // document is cleared — re-pin the body style so the next character
+        // types with the chosen editor font, not the fallback.
+        if string.isEmpty {
+            typingAttributes = bodyLineTypingAttributes()
+            updateCaretPosition()
+        }
+    }
+
+    // MARK: - Empty-note placeholder
+
+    private var placeholderWasVisible = false
+
+    func bodyLineTypingAttributes() -> [NSAttributedString.Key: Any] {
+        let p = NSMutableParagraphStyle()
+        p.baseWritingDirection = .leftToRight
+        p.alignment = .left
+        p.applyReadableBodySpacing()
+        return [
+            .font: Tokens.Typography.body(),
+            .foregroundColor: editorViewModel?.theme.editorTextNS ?? NSColor.textColor,
+            .paragraphStyle: p
+        ]
+    }
+
+    /// The insertion line of an EMPTY document, in text-container coordinates.
+    /// AppKit sizes this extra line fragment from typingAttributes; the ghost
+    /// prompt and the caret must both center within it or they drift apart
+    /// vertically.
+    private func emptyDocLineRect() -> NSRect {
+        if let lm = layoutManager, lm.extraLineFragmentRect.height > 0 {
+            return lm.extraLineFragmentRect
+        }
+        let f = (typingAttributes[.font] as? NSFont) ?? Tokens.Typography.body()
+        let h = layoutManager?.defaultLineHeight(for: f) ?? ceil(f.ascender - f.descender)
+        return NSRect(x: 0, y: 0, width: 0, height: h)
+    }
+
+    /// Evernote-style ghost text on an empty note: a writing prompt.
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty else { return }
+        let x = textContainerInset.width + (textContainer?.lineFragmentPadding ?? 5)
+        // Derive from the theme's text color (not a dynamic system color) so
+        // the ghost text always contrasts with the themed editor background.
+        let ghost = editorViewModel?.theme.editorTextNS.withAlphaComponent(0.3) ?? NSColor.tertiaryLabelColor
+        let promptLine = NSAttributedString(
+            string: "Start writing…",
+            attributes: [.font: Tokens.Typography.body(), .foregroundColor: ghost])
+        let lineRect = emptyDocLineRect()
+        let y = textContainerInset.height + lineRect.minY
+            + (lineRect.height - promptLine.size().height) / 2
+        promptLine.draw(at: NSPoint(x: x, y: y))
     }
 
     override func setSelectedRange(_ charRange: NSRange, affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
@@ -4601,6 +5280,45 @@ class BlockCaretTextView: NSTextView {
 
         let range = selectedRange()
         storage.replaceCharacters(in: range, with: result)
+
+        // Re-apply checkbox glyph styling to any pasted ☐/☑ list prefixes.
+        // Formatting was stripped above, so the boxes arrived as plain body-font
+        // characters. Without this an unchecked ☐ falls back to Apple Symbols'
+        // thin, square box (wrong style) at body size (wrong size) instead of
+        // SF Rounded's matching box at checkboxSize. Mirrors the document-load
+        // loop — walk the affected lines and style any line-leading box.
+        let insertedEnd = min(range.location + result.length, (storage.string as NSString).length)
+        let bodyText = editorViewModel?.theme.editorTextNS ?? NSColor.textColor
+        var scan = (storage.string as NSString).lineRange(for: NSRange(location: range.location, length: 0)).location
+        while scan < insertedEnd {
+            let ns = storage.string as NSString
+            let lr = ns.lineRange(for: NSRange(location: scan, length: 0))
+            let ls = ns.substring(with: lr)
+            let leading = ls.prefix(while: { $0 == " " || $0 == "\u{00a0}" })
+            let afterIndent = String(ls.dropFirst(leading.count))
+            if afterIndent.hasPrefix("☐") || afterIndent.hasPrefix("☑") {
+                let checked = afterIndent.hasPrefix("☑")
+                let boxStart = lr.location + leading.count
+                if boxStart < ns.length {
+                    Tokens.Typography.styleCheckboxGlyph(storage, range: NSRange(location: boxStart, length: 1), checked: checked)
+                    // Checked items get struck-through, muted content — match load.
+                    if checked {
+                        let cStart = boxStart + 2
+                        var lEnd = lr.location + lr.length
+                        if lEnd > cStart && ns.substring(with: NSRange(location: lEnd - 1, length: 1)) == "\n" { lEnd -= 1 }
+                        let cRange = NSRange(location: cStart, length: max(0, lEnd - cStart))
+                        if cRange.length > 0 {
+                            storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: cRange)
+                            storage.addAttribute(.foregroundColor, value: bodyText.withAlphaComponent(0.55), range: cRange)
+                        }
+                    }
+                }
+            }
+            let next = lr.location + lr.length
+            if next <= scan { break }
+            scan = next
+        }
+
         setSelectedRange(NSRange(location: range.location + result.length, length: 0))
         typingAttributes = bodyAttrs
         didChangeText()
@@ -5064,12 +5782,11 @@ class BlockCaretTextView: NSTextView {
 
         recordUndoSnapshot()
 
-        let boxFont = Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium)
         let boxRange = NSRange(location: charIndex, length: 1)
 
         if char == "☐" {
             storage.replaceCharacters(in: boxRange, with: "☑")
-            storage.addAttribute(.font, value: boxFont, range: boxRange)
+            Tokens.Typography.styleCheckboxGlyph(storage, range: boxRange, checked: true)
             if contentRange.length > 0 {
                 storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: contentRange)
                 let muted = (editorViewModel?.theme.editorTextNS ?? NSColor.textColor).withAlphaComponent(0.55)
@@ -5077,7 +5794,7 @@ class BlockCaretTextView: NSTextView {
             }
         } else if char == "☑" {
             storage.replaceCharacters(in: boxRange, with: "☐")
-            storage.addAttribute(.font, value: boxFont, range: boxRange)
+            Tokens.Typography.styleCheckboxGlyph(storage, range: boxRange, checked: false)
             if contentRange.length > 0 {
                 storage.removeAttribute(.strikethroughStyle, range: contentRange)
                 let body = editorViewModel?.theme.editorTextNS ?? NSColor.textColor
@@ -5110,8 +5827,51 @@ class BlockCaretTextView: NSTextView {
         }
     }
 
+    /// Font the caret sizes itself to: the glyph adjacent to the caret in the
+    /// document, or — on an empty line/doc — the current typing attributes (which
+    /// may be the H1 title line). Falls back to Body. Keeps the block caret's
+    /// height matched to the text at the caret, so it's tall on H1/H2/H3 lines
+    /// instead of always body-height.
+    private func caretFont() -> NSFont {
+        if let storage = textStorage, storage.length > 0 {
+            let ns = storage.string as NSString
+            let loc = min(selectedRange().location, storage.length)
+            // Probe the glyph left of the caret (what you just typed / are
+            // extending). Skip when it's a newline (caret at line start) — then
+            // fall back to typing attributes for the line you're on.
+            let probe = loc > 0 ? loc - 1 : 0
+            if ns.character(at: probe) != 0x0A,
+               let f = storage.attribute(.font, at: probe, effectiveRange: nil) as? NSFont {
+                return f
+            }
+            return (typingAttributes[.font] as? NSFont) ?? Tokens.Typography.body()
+        }
+        // Empty document: match the visible "Start writing…" placeholder (body
+        // size) rather than the H1 typingAttributes pre-armed for the first
+        // character typed — that only takes over once something is actually typed.
+        return Tokens.Typography.body()
+    }
+
     func updateCaretPosition() {
-        caretView.isHidden = selectedRange().length > 0
+        caretView.isHidden = selectedRange().length > 0 || !isEditorFocused
+            || !(window?.isKeyWindow ?? false)
+
+        // Empty doc: the insertion line is the extra line fragment, which is
+        // H1-tall while the title line is armed — but the body-sized caret must
+        // center in the SAME rect the ghost "Start writing…" prompt centers in
+        // (emptyDocLineRect, shared with draw(_:)), or the two visibly misalign.
+        if string.isEmpty {
+            let baseFont = caretFont()
+            let h = ceil(baseFont.ascender - baseFont.descender)
+            let lineRect = emptyDocLineRect()
+            moveCaretTo(NSRect(
+                x: textContainerInset.width + (textContainer?.lineFragmentPadding ?? 5),
+                y: textContainerInset.height + lineRect.minY + (lineRect.height - h) / 2,
+                width: 2, height: h
+            ))
+            ensureCaretOnTop()
+            return
+        }
 
         // Use NSTextView's own insertion point rect — most reliable
         let charIndex = selectedRange().location
@@ -5121,21 +5881,10 @@ class BlockCaretTextView: NSTextView {
             withinSelectedCharacterRange: NSRange(location: NSNotFound, length: 0),
             in: textContainer!,
             rectCount: &rectCount
-        ), rectCount > 0 else {
-            // Fallback for empty doc
-            let baseFont = Tokens.Typography.body()
-            let h = ceil(baseFont.ascender - baseFont.descender)
-            moveCaretTo(NSRect(
-                x: textContainerInset.width + (textContainer?.lineFragmentPadding ?? 5),
-                y: textContainerInset.height,
-                width: 2, height: h
-            ))
-            ensureCaretOnTop()
-            return
-        }
+        ), rectCount > 0 else { return }
 
         let rect = rects[0]
-        let baseFont = Tokens.Typography.body()
+        let baseFont = caretFont()
         let h = ceil(baseFont.ascender - baseFont.descender)
         let y = rect.origin.y + textContainerInset.height + (rect.height - h) / 2
 
@@ -5157,6 +5906,54 @@ class BlockCaretTextView: NSTextView {
 
 // MARK: - Rich Text Editor (NSTextView WYSIWYG)
 
+/// NSTextStorage whose attribute fixing keeps the SF Rounded font on unchecked
+/// ☐ glyphs. SF Rounded has no ☐, so stock font fixing swaps in Apple Symbols
+/// (a thin, square-cornered box) — which also breaks the NSGlyphInfo that maps
+/// ☐ to SF Rounded's □ glyph, because glyphInfo is honored only while the font
+/// attribute matches the font it was created with. After the stock fixing pass
+/// we re-pin the rounded font on every ☐ that carries the glyphInfo substitution.
+final class CheckboxTextStorage: NSTextStorage {
+    private let backing = NSMutableAttributedString()
+
+    override var string: String { backing.string }
+
+    override func attributes(at location: Int, effectiveRange range: NSRangePointer?) -> [NSAttributedString.Key: Any] {
+        backing.attributes(at: location, effectiveRange: range)
+    }
+
+    override func replaceCharacters(in range: NSRange, with str: String) {
+        beginEditing()
+        backing.replaceCharacters(in: range, with: str)
+        edited(.editedCharacters, range: range, changeInLength: (str as NSString).length - range.length)
+        endEditing()
+    }
+
+    override func setAttributes(_ attrs: [NSAttributedString.Key: Any]?, range: NSRange) {
+        beginEditing()
+        backing.setAttributes(attrs, range: range)
+        edited(.editedAttributes, range: range, changeInLength: 0)
+        endEditing()
+    }
+
+    override func fixAttributes(in range: NSRange) {
+        super.fixAttributes(in: range)
+        let ns = backing.string as NSString
+        var i = range.location
+        let end = NSMaxRange(range)
+        while i < end {
+            if ns.character(at: i) == 0x2610 { // ☐
+                let attrs = backing.attributes(at: i, effectiveRange: nil)
+                if attrs[.glyphInfo] != nil, let f = attrs[.font] as? NSFont {
+                    backing.addAttribute(.font,
+                                         value: Tokens.Typography.rounded(size: f.pointSize, weight: .medium),
+                                         range: NSRange(location: i, length: 1))
+                }
+            }
+            i += 1
+        }
+    }
+}
+
 struct RichTextEditor: NSViewRepresentable {
     @EnvironmentObject var vm: EditorViewModel
 
@@ -5175,7 +5972,7 @@ struct RichTextEditor: NSViewRepresentable {
         let layoutManager = NSLayoutManager()
         layoutManager.addTextContainer(textContainer)
 
-        let textStorage = NSTextStorage()
+        let textStorage = CheckboxTextStorage()
         textStorage.addLayoutManager(layoutManager)
 
         let textView = BlockCaretTextView(frame: NSRect(origin: .zero, size: contentSize), textContainer: textContainer)
@@ -5344,7 +6141,7 @@ struct RichTextEditor: NSViewRepresentable {
                         if afterIndent.hasPrefix("☐") || afterIndent.hasPrefix("☑") {
                             let boxStart = lr.location + leading.count
                             let boxRange = NSRange(location: boxStart, length: 1)
-                            storage.addAttribute(.font, value: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium), range: boxRange)
+                            Tokens.Typography.styleCheckboxGlyph(storage, range: boxRange, checked: afterIndent.hasPrefix("☑"))
                             // Slight baseline nudge so the bigger glyph sits on the text baseline.
                         }
                         let next = lr.location + lr.length
@@ -5357,17 +6154,11 @@ struct RichTextEditor: NSViewRepresentable {
                 // Move cursor to start
                 textView.setSelectedRange(NSRange(location: 0, length: 0))
                 textView.updateCaretPosition()
-                // Reset typing attributes to defaults (prevents stale styles leaking between tabs)
-                let defaultParagraph = NSMutableParagraphStyle()
-                defaultParagraph.baseWritingDirection = .leftToRight
-                defaultParagraph.alignment = .left
-                defaultParagraph.applyReadableBodySpacing()
-                let defaultFont = Tokens.Typography.body()
-                textView.typingAttributes = [
-                    .font: defaultFont,
-                    .foregroundColor: self.vm.theme.editorTextNS,
-                    .paragraphStyle: defaultParagraph
-                ]
+                // Reset typing attributes to defaults (prevents stale styles
+                // leaking between tabs). Empty notes type as Body — the note's
+                // title lives in the sidebar, not the document.
+                textView.typingAttributes = textView.bodyLineTypingAttributes()
+                textView.updateCaretPosition()  // size caret to the loaded line's font
                 // Sync coordinator's lastSelectedRange so toolbar buttons work
                 self.vm.editorCoordinator?.lastSelectedRange = NSRange(location: 0, length: 0)
             }
@@ -5389,6 +6180,11 @@ struct RichTextEditor: NSViewRepresentable {
         if context.coordinator.appliedTheme != theme {
             context.coordinator.applyTheme(theme, to: textView)
             context.coordinator.appliedTheme = theme
+        }
+        // Keep the empty-note placeholder in sync with tab switches: the
+        // ghost "Title" line shows on any empty note.
+        if textView.string.isEmpty {
+            textView.needsDisplay = true
         }
     }
 
@@ -5622,7 +6418,7 @@ struct RichTextEditor: NSViewRepresentable {
                     if afterIndent.hasPrefix("☐") || afterIndent.hasPrefix("☑") {
                         let boxStart = lineRange.location + leadingWS.count
                         let boxRange = NSRange(location: boxStart, length: 1)
-                        storage.addAttribute(.font, value: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium), range: boxRange)
+                        Tokens.Typography.styleCheckboxGlyph(storage, range: boxRange, checked: afterIndent.hasPrefix("☑"))
                     }
                 }
             }
@@ -5678,10 +6474,13 @@ struct RichTextEditor: NSViewRepresentable {
         }
 
         private func replaceMarkdownWithText(storage: NSTextStorage, textView: NSTextView, at lineStart: Int, len: Int, replacement: String) {
-            let attr = NSAttributedString(string: replacement, attributes: [
+            let attr = NSMutableAttributedString(string: replacement, attributes: [
                 .font: bodyFont,
                 .foregroundColor: textColor
             ])
+            if replacement.hasPrefix("☐") || replacement.hasPrefix("☑") {
+                Tokens.Typography.styleCheckboxGlyph(attr, range: NSRange(location: 0, length: 1), checked: replacement.hasPrefix("☑"))
+            }
             storage.replaceCharacters(in: NSRange(location: lineStart, length: len), with: attr)
             textView.setSelectedRange(NSRange(location: lineStart + replacement.count, length: 0))
         }
@@ -6010,10 +6809,9 @@ struct RichTextEditor: NSViewRepresentable {
                 let hasListPrefix = lineStr.hasPrefix("• ") || lineStr.hasPrefix("☐ ") || lineStr.hasPrefix("☑ ")
                 if isAtLineStart && hasListPrefix {
                     let newLine = NSMutableAttributedString()
-                    newLine.append(NSAttributedString(string: "☐", attributes: [
-                        .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
-                        .foregroundColor: textColor
-                    ]))
+                    var newBoxAttrs = Tokens.Typography.checkboxAttributes(checked: false)
+                    newBoxAttrs[.foregroundColor] = textColor
+                    newLine.append(NSAttributedString(string: "☐", attributes: newBoxAttrs))
                     newLine.append(NSAttributedString(string: " \n", attributes: [.font: bodyFont, .foregroundColor: textColor]))
                     storage.insert(newLine, at: lineRange.location)
                     textView.setSelectedRange(NSRange(location: lineRange.location + 2, length: 0))
@@ -6028,10 +6826,9 @@ struct RichTextEditor: NSViewRepresentable {
                 // Insert prefix at current position
                 let insertPos = min(range.location, str.length)
                 let attrPrefix = NSMutableAttributedString()
-                attrPrefix.append(NSAttributedString(string: "☐", attributes: [
-                    .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
-                    .foregroundColor: textColor
-                ]))
+                var emptyBoxAttrs = Tokens.Typography.checkboxAttributes(checked: false)
+                emptyBoxAttrs[.foregroundColor] = textColor
+                attrPrefix.append(NSAttributedString(string: "☐", attributes: emptyBoxAttrs))
                 attrPrefix.append(NSAttributedString(string: " ", attributes: [.font: bodyFont, .foregroundColor: textColor]))
                 storage.insert(attrPrefix, at: insertPos)
                 textView.setSelectedRange(NSRange(location: insertPos + 2, length: 0))
@@ -6081,11 +6878,9 @@ struct RichTextEditor: NSViewRepresentable {
                     }
                     let curStr = storage.string as NSString
                     let curLr = curStr.lineRange(for: NSRange(location: min(insertAt, max(0, curStr.length - 1)), length: 0))
-                    let boxFont = Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium)
-                    let box = NSAttributedString(string: "☐", attributes: [
-                        .font: boxFont,
-                        .foregroundColor: textColor
-                    ])
+                    var boxAttrs = Tokens.Typography.checkboxAttributes(checked: false)
+                    boxAttrs[.foregroundColor] = textColor
+                    let box = NSAttributedString(string: "☐", attributes: boxAttrs)
                     let spaceAfter = NSAttributedString(string: " ", attributes: [
                         .font: bodyFont,
                         .foregroundColor: textColor
@@ -6185,10 +6980,9 @@ struct RichTextEditor: NSViewRepresentable {
                     ])
                     if isCheckbox {
                         // New checkbox items are always unchecked.
-                        aboveLine.append(NSAttributedString(string: "☐", attributes: [
-                            .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
-                            .foregroundColor: textColor
-                        ]))
+                        var aboveBoxAttrs = Tokens.Typography.checkboxAttributes(checked: false)
+                        aboveBoxAttrs[.foregroundColor] = textColor
+                        aboveLine.append(NSAttributedString(string: "☐", attributes: aboveBoxAttrs))
                         aboveLine.append(NSAttributedString(string: " ", attributes: [
                             .font: bodyFont, .foregroundColor: textColor
                         ]))
@@ -6218,10 +7012,9 @@ struct RichTextEditor: NSViewRepresentable {
                 // If the prefix is a checkbox, use the rounded SF glyph for the box itself.
                 if continuationPrefix == "☐ " || continuationPrefix == "☑ " {
                     let boxChar = String(continuationPrefix.first!)
-                    insertion.append(NSAttributedString(string: boxChar, attributes: [
-                        .font: Tokens.Typography.rounded(size: Tokens.Typography.checkboxSize, weight: .medium),
-                        .foregroundColor: textColor
-                    ]))
+                    var contBoxAttrs = Tokens.Typography.checkboxAttributes(checked: boxChar == "☑")
+                    contBoxAttrs[.foregroundColor] = textColor
+                    insertion.append(NSAttributedString(string: boxChar, attributes: contBoxAttrs))
                     insertion.append(NSAttributedString(string: " ", attributes: [
                         .font: bodyFont, .foregroundColor: textColor
                     ]))
