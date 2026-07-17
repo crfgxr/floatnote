@@ -3,6 +3,7 @@ import AppKit
 import AVFoundation
 import AudioToolbox
 import ScreenCaptureKit
+import UserNotifications
 
 func dbg(_ msg: String) {
     let path = NSHomeDirectory() + "/.floatnote-debug.log"
@@ -16,7 +17,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.51.1"
+let APP_VERSION = "v1.52.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -47,7 +48,7 @@ struct FloatNoteApp: App {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var vm: EditorViewModel?
     private var fileWatchTimer: Timer?
     private var terminalKeyMonitor: Any?
@@ -55,6 +56,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
+
+        // Claude hook notifications: banner when a Claude session in a
+        // FloatNote terminal finishes a turn or needs input; click routes back
+        // to that terminal. One-time permission prompt (persists across
+        // rebuilds — stable signing identity).
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
         dbg("APP LAUNCHED")
 
         // Poll tabs + folders files for external changes (e.g. from MCP server)
@@ -64,6 +73,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 vm.checkExternalTabChanges()
                 vm.checkExternalFolderChanges()
                 vm.checkExternalBoardChanges()
+                vm.checkClaudeEvents()
                 vm.sweepExpiredJobStatuses()
             }
         }
@@ -125,6 +135,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 withAnimation(.easeInOut(duration: 0.18)) { vm.closeTerminal(id) }
             }
+        }
+    }
+
+    // MARK: - UNUserNotificationCenterDelegate (Claude hook notifications)
+
+    /// Show the banner even while FloatNote is frontmost ("always notify").
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler:
+                                                @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// Click → activate the app and jump to the terminal the event came from.
+    /// The tab is re-resolved by path at click time (ids can go stale); a
+    /// closed tab degrades to just activating the app.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping () -> Void) {
+        let path = response.notification.request.content.userInfo["terminalPath"] as? String
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                NSApp.activate(ignoringOtherApps: true)
+                if let path,
+                   let vm = self.vm,
+                   let tab = vm.terminalTabs.first(where: { $0.path == path }) {
+                    vm.selectTerminal(tab.id)   // chip + note navigation + focus
+                    vm.isTerminalVisible = true // chips with no folder mapping don't auto-show
+                }
+            }
+            completionHandler()
         }
     }
 
@@ -719,6 +760,54 @@ class EditorViewModel: ObservableObject {
                 : terminalTabs[min(idx, terminalTabs.count - 1)].id
         }
         if terminalTabs.isEmpty { isTerminalVisible = false }
+    }
+
+    // MARK: - Claude hook notifications
+
+    /// Spool dir the Claude Code hook writes into (one JSON file per event).
+    static let CLAUDE_EVENTS_DIR = NSHomeDirectory() + "/.floatnote-claude-events"
+
+    /// Consume Claude Code hook events (Stop / Notification) dropped by
+    /// ~/.claude/hooks/floatnote-notify.sh. Only events whose cwd matches an
+    /// OPEN terminal tab produce a banner — claude runs in external terminals
+    /// are silently dropped. Registered on the AppDelegate 2s timer.
+    func checkClaudeEvents() {
+        let dir = Self.CLAUDE_EVENTS_DIR
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir),
+              !names.isEmpty else { return }
+        for name in names where name.hasSuffix(".json") {
+            let path = dir + "/" + name
+            defer { try? FileManager.default.removeItem(atPath: path) }
+            guard let data = FileManager.default.contents(atPath: path),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let cwd = obj["cwd"] as? String, !cwd.isEmpty
+            else { continue }
+            // Ignore events that pre-date this app run by a lot (e.g. spooled
+            // while FloatNote wasn't running) — a banner about a long-finished
+            // turn is just noise.
+            if let ts = obj["ts"] as? Double,
+               Date().timeIntervalSince1970 - ts > 120 { continue }
+            let std = URL(fileURLWithPath: cwd).standardizedFileURL.path
+            guard let tab = terminalTabs.first(where: {
+                URL(fileURLWithPath: $0.path).standardizedFileURL.path == std
+            }) else { continue }
+            postClaudeNotification(event: obj["event"] as? String ?? "",
+                                   message: obj["message"] as? String ?? "",
+                                   tab: tab)
+        }
+    }
+
+    private func postClaudeNotification(event: String, message: String, tab: TerminalTab) {
+        let content = UNMutableNotificationContent()
+        content.title = tab.label
+        content.body = event == "Stop"
+            ? "Claude finished working"
+            : (message.isEmpty ? "Claude needs your input" : message)
+        content.sound = .default
+        content.userInfo = ["terminalPath": tab.path]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        dbg("claude notification: \(tab.label) [\(event)]")
     }
 
     // MARK: - Excalidraw boards
