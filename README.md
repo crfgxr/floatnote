@@ -8,6 +8,7 @@ A native macOS floating rich text editor. Fully local — no cloud sync.
 - **Checklists & bullets** — Clickable checkboxes with strikethrough, auto-continuation on Enter, drag-to-reorder, smart Home/Backspace
 - **Sidebar with folders** — Nestable folders, drag-and-drop, virtual Trash with restore, red unchecked-item badges per note
 - **Project folders + terminal** — Link a folder to a local directory and its notes get an integrated terminal panel (SwiftTerm) rooted there; keyboard focus follows the terminal, and Claude Code auto-resumes per project
+- **Claude notifications** — Native macOS banners when a Claude Code session in a FloatNote terminal finishes a turn or needs input; clicking one jumps straight to that project's terminal
 - **Excalidraw boards** — A fully offline whiteboard per note, toggled from the toolbar
 - **Opens where you left off** — Cold start restores the last-open note
 - **Themes & fonts** — Multiple editor themes (incl. Solarized), font family + body size pickers
