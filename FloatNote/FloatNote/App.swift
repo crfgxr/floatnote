@@ -17,7 +17,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.52.0"
+let APP_VERSION = "v1.54.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -903,6 +903,10 @@ class EditorViewModel: ObservableObject {
     @Published var draggingTabId: UUID?
     /// Folder currently being dragged in the sidebar (for folder→folder nesting).
     @Published var draggingFolderId: UUID?
+    /// Insertion line shown while a folder is hovered over a sibling drop zone
+    /// (the top/bottom edge of another folder's row). Nil while the hover means
+    /// "nest inside", which uses `dropTargetFolderId`'s fill instead.
+    @Published var folderInsertIndicator: FolderInsertIndicator?
     @Published var isRecording = false
     @Published var isSavingRecording = false
     @Published var recordPermissionDenied = false
@@ -1268,6 +1272,13 @@ class EditorViewModel: ObservableObject {
 
     // MARK: - Folder nesting
 
+    /// Where a dragged folder would land relative to the folder row under the
+    /// cursor: on its top edge (`below == false`) or its bottom edge.
+    struct FolderInsertIndicator: Equatable {
+        let id: UUID
+        let below: Bool
+    }
+
     /// Direct child folders of `parent` (nil = root), trash state ignored.
     func childFolders(of parent: UUID?) -> [Folder] {
         folders.filter { $0.parentId == parent }
@@ -1301,6 +1312,43 @@ class EditorViewModel: ObservableObject {
         }
         guard folder.parentId != newParent else { return }
         folder.parentId = newParent
+        folders = folders  // re-fire @Published so the sidebar repartitions
+        saveFoldersLocal()
+    }
+
+    /// Reorder `folderId` to sit immediately before (or after, when `below`)
+    /// `targetId`, adopting the target's parent. This is what makes the sidebar
+    /// reorderable: display order within a level is the relative order of
+    /// `folders`, so moving the element moves the row.
+    ///
+    /// Dropping next to a folder in a *different* parent both reparents and
+    /// positions — that's how a subfolder gets promoted to root (drop it between
+    /// two root folders) and vice versa.
+    func moveFolder(_ folderId: UUID, relativeTo targetId: UUID, below: Bool) {
+        guard folderId != targetId,
+              let dragIndex = folders.firstIndex(where: { $0.id == folderId }),
+              let target = folders.first(where: { $0.id == targetId }) else { return }
+        // Landing next to a descendant would reparent the folder under itself.
+        guard !isSelfOrDescendant(targetId, of: folderId) else { return }
+
+        let dragged = folders[dragIndex]
+        if dragged.parentId != target.parentId {
+            dragged.parentId = target.parentId
+            if let newParent = target.parentId {
+                folders.first(where: { $0.id == newParent })?.isExpanded = true
+            }
+        }
+
+        folders.remove(at: dragIndex)
+        // Recompute the target's index — removing the dragged element may have
+        // shifted it.
+        guard let targetIndex = folders.firstIndex(where: { $0.id == targetId }) else {
+            folders.append(dragged)  // unreachable in practice; keep the folder alive
+            folders = folders
+            saveFoldersLocal()
+            return
+        }
+        folders.insert(dragged, at: below ? targetIndex + 1 : targetIndex)
         folders = folders  // re-fire @Published so the sidebar repartitions
         saveFoldersLocal()
     }
@@ -3066,6 +3114,14 @@ struct SidebarFolderView: View {
     /// Live subfolders nested directly under this folder.
     private var subfolders: [Folder] { vm.folders.filter { !$0.isTrashed && $0.parentId == folder.id } }
     private var isDropTarget: Bool { vm.dropTargetFolderId == folder.id }
+    /// Measured height of the header row, used to split it into the
+    /// above / inside / below drop zones.
+    @State private var rowHeight: CGFloat = 0
+    /// Edge to draw the sibling insertion line on, if this row is the target.
+    private var insertEdge: Bool? {
+        guard let ind = vm.folderInsertIndicator, ind.id == folder.id else { return nil }
+        return ind.below
+    }
 
     var body: some View {
         VStack(spacing: 2) {
@@ -3110,6 +3166,20 @@ struct SidebarFolderView: View {
                 RoundedRectangle(cornerRadius: 6)
                     .fill(isDropTarget ? Color.accentColor.opacity(0.22) : Color.clear)
             )
+            .background(
+                GeometryReader { geo in
+                    Color.clear.onAppear { rowHeight = geo.size.height }
+                        .onChange(of: geo.size.height) { _, h in rowHeight = h }
+                }
+            )
+            // Sibling drop target: a line on the edge the folder would land on.
+            .overlay(alignment: insertEdge == true ? .bottom : .top) {
+                if insertEdge != nil {
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(height: 2)
+                }
+            }
             .contentShape(Rectangle())
             .onTapGesture(count: 2) { vm.editingFolderId = folder.id }
             .onTapGesture(count: 1) {
@@ -3129,7 +3199,7 @@ struct SidebarFolderView: View {
                     vm.trashFolder(folder.id)
                 }
             }
-            .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: folder.id, vm: vm))
+            .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: folder.id, vm: vm, rowHeight: rowHeight))
             .onDrag {
                 vm.draggingFolderId = folder.id
                 vm.draggingTabId = nil
@@ -3173,18 +3243,63 @@ struct SidebarFolderView: View {
 struct FolderDropDelegate: DropDelegate {
     let folderId: UUID?
     let vm: EditorViewModel
+    /// Height of the folder header row this delegate is attached to, used to
+    /// split it into above / inside / below zones. Zero (the sidebar's empty
+    /// area, or a row that hasn't measured yet) disables zoning.
+    var rowHeight: CGFloat = 0
 
-    func dropEntered(info: DropInfo) { vm.dropTargetFolderId = folderId }
-    func dropExited(info: DropInfo)  { if vm.dropTargetFolderId == folderId { vm.dropTargetFolderId = nil } }
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    /// Fraction of the row height at each edge that means "drop as a sibling"
+    /// rather than "nest inside".
+    private static let edgeZone: CGFloat = 0.3
+
+    /// Which of the three zones `location` falls in. Only a dragged *folder*
+    /// gets zones — a dragged note always means "move into this folder", from
+    /// any vertical position.
+    private func siblingEdge(at location: CGPoint) -> Bool? {
+        guard vm.draggingFolderId != nil, folderId != nil, rowHeight > 0 else { return nil }
+        let edge = rowHeight * Self.edgeZone
+        if location.y < edge { return false }        // above
+        if location.y > rowHeight - edge { return true }  // below
+        return nil                                   // inside
+    }
+
+    /// Paint either the nest-inside fill or the sibling insertion line — never both.
+    private func updateIndicators(at location: CGPoint) {
+        if let below = siblingEdge(at: location), let id = folderId {
+            vm.dropTargetFolderId = nil
+            vm.folderInsertIndicator = .init(id: id, below: below)
+        } else {
+            vm.dropTargetFolderId = folderId
+            vm.folderInsertIndicator = nil
+        }
+    }
+
+    private func clearIndicators() {
+        if vm.dropTargetFolderId == folderId { vm.dropTargetFolderId = nil }
+        if vm.folderInsertIndicator?.id == folderId { vm.folderInsertIndicator = nil }
+    }
+
+    func dropEntered(info: DropInfo) { updateIndicators(at: info.location) }
+    func dropExited(info: DropInfo)  { clearIndicators() }
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateIndicators(at: info.location)
+        return DropProposal(operation: .move)
+    }
     func validateDrop(info: DropInfo) -> Bool { true }
 
     func performDrop(info: DropInfo) -> Bool {
+        let edge = siblingEdge(at: info.location)
         vm.dropTargetFolderId = nil
-        // Dragging a folder → nest it under this folder (or root when folderId == nil).
+        vm.folderInsertIndicator = nil
+        // Dragging a folder → reorder next to this one, or nest it under this
+        // folder (root when folderId == nil).
         if let dragFolder = vm.draggingFolderId {
             vm.draggingFolderId = nil
-            vm.moveFolder(dragFolder, toParent: folderId)
+            if let below = edge, let targetId = folderId {
+                vm.moveFolder(dragFolder, relativeTo: targetId, below: below)
+            } else {
+                vm.moveFolder(dragFolder, toParent: folderId)
+            }
             return true
         }
         // Dragging a note → move it into this folder (or root).
