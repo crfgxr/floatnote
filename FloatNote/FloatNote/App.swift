@@ -17,7 +17,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.54.0"
+let APP_VERSION = "v1.59.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -65,6 +65,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
         dbg("APP LAUNCHED")
+
+        // Immediate delivery of Claude hook events; the timer below still
+        // sweeps the spool as a safety net.
+        if let vm { MainActor.assumeIsolated { vm.startClaudeEventWatcher() } }
 
         // Poll tabs + folders files for external changes (e.g. from MCP server)
         fileWatchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -766,6 +770,9 @@ class EditorViewModel: ObservableObject {
 
     /// Spool dir the Claude Code hook writes into (one JSON file per event).
     static let CLAUDE_EVENTS_DIR = NSHomeDirectory() + "/.floatnote-claude-events"
+    /// Directory watcher on the spool, so hook events land immediately rather
+    /// than on the next 2s tick. See `startClaudeEventWatcher()`.
+    private var claudeEventWatcher: DispatchSourceFileSystemObject?
 
     /// Consume Claude Code hook events (Stop / Notification) dropped by
     /// ~/.claude/hooks/floatnote-notify.sh. Only events whose cwd matches an
@@ -787,14 +794,46 @@ class EditorViewModel: ObservableObject {
             // turn is just noise.
             if let ts = obj["ts"] as? Double,
                Date().timeIntervalSince1970 - ts > 120 { continue }
+            let event = obj["event"] as? String ?? ""
             let std = URL(fileURLWithPath: cwd).standardizedFileURL.path
             guard let tab = terminalTabs.first(where: {
                 URL(fileURLWithPath: $0.path).standardizedFileURL.path == std
-            }) else { continue }
-            postClaudeNotification(event: obj["event"] as? String ?? "",
+            }) else {
+                dbg("claude event [\(event)] dropped — no open pane for \(std)")
+                continue
+            }
+            // Claude's last turn, for hands-free voice. Empty when the hook
+            // install predates the field, or the event carries no turn text.
+            let turnText = obj["last_assistant_message"] as? String ?? ""
+            dbg("claude event [\(event)] → pane \(tab.label) turnText=\(turnText.count)ch")
+            postClaudeNotification(event: event,
                                    message: obj["message"] as? String ?? "",
                                    tab: tab)
         }
+    }
+
+    /// Fires `checkClaudeEvents()` the moment the hook drops a file, instead of
+    /// waiting out the 2s poll — hands-free voice needs Claude to start speaking
+    /// as soon as the turn ends. The timer stays as a safety net (a watcher can
+    /// miss events if the directory is recreated).
+    func startClaudeEventWatcher() {
+        let dir = Self.CLAUDE_EVENTS_DIR
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let fd = open(dir, O_EVTONLY)
+        guard fd >= 0 else {
+            dbg("claude event watcher: cannot open \(dir)")
+            return
+        }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write], queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.checkClaudeEvents() }
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        claudeEventWatcher = source
+        dbg("claude event watcher started on \(dir)")
     }
 
     private func postClaudeNotification(event: String, message: String, tab: TerminalTab) {

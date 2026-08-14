@@ -22,10 +22,17 @@ try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+# A Stop hook that itself re-enters would spool a duplicate event (and, with
+# hands-free voice on, speak the same turn twice).
+if str(data.get("stop_hook_active", "")).lower() == "true":
+    sys.exit(0)
 evt = {
     "event": data.get("hook_event_name", ""),
     "cwd": data.get("cwd", ""),
     "message": data.get("message", ""),
+    # Claude last turn text, for hands-free voice. Absent on older hook
+    # installs and on events that carry no assistant message.
+    "last_assistant_message": data.get("last_assistant_message", ""),
     "ts": time.time(),
 }
 spool = sys.argv[1]
