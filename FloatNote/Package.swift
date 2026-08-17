@@ -5,7 +5,13 @@ let package = Package(
     name: "FloatNote",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.2.0"),
+        // Vendored fork of SwiftTerm 1.13.0 (vendor/SwiftTerm, one patch commit
+        // on top of upstream v1.13.0). The patch makes the terminal hold its
+        // scroll position when the user scrolls up — upstream never sets the
+        // Terminal.userScrolling flag its own auto-scroll logic checks — and
+        // exposes linesBelowViewport / scrollToBottom() for the scroll-back
+        // pill. Re-apply on upgrade: `git -C vendor/SwiftTerm log` has it.
+        .package(path: "../vendor/SwiftTerm"),
     ],
     targets: [
         .executableTarget(

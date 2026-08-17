@@ -11,12 +11,22 @@ final class TerminalSessions {
     static let shared = TerminalSessions()
     private var sessions: [UUID: TerminalSession] = [:]
 
+    private init() {
+        // SwiftTerm defaults to 500 lines — a few seconds of Claude Code output,
+        // after which the scrollback trims on every new line. Deep enough to
+        // scroll back through a whole turn instead. (Vendored-fork knob; see
+        // vendor-swiftterm.sh.)
+        TerminalView.defaultScrollback = 20_000
+    }
+
     /// The live session for `id`, creating (and starting its shell) on first use.
     /// `cwd` is the shell's working directory, used only on first creation; an
     /// existing session keeps the directory it was started in.
-    func session(for id: UUID, cwd: String) -> TerminalSession {
+    /// `freshClaude` forces a brand-new Claude conversation for this pane
+    /// (plain `claude`, never `--continue`) — see `TerminalSession.freshClaude`.
+    func session(for id: UUID, cwd: String, freshClaude: Bool = false) -> TerminalSession {
         if let existing = sessions[id] { return existing }
-        let s = TerminalSession(id: id, cwd: cwd)
+        let s = TerminalSession(id: id, cwd: cwd, freshClaude: freshClaude)
         sessions[id] = s
         return s
     }
@@ -44,6 +54,11 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
     let id: UUID
     let cwd: String
     let view: LocalProcessTerminalView
+    /// Always start a brand-new Claude conversation in this pane, even when the
+    /// project has saved sessions. Set for explicitly-added terminals: a second
+    /// pane on the same project would otherwise `--continue` straight into the
+    /// conversation the first pane is already running.
+    let freshClaude: Bool
     private var resetObserver: NSObjectProtocol?
     /// Bumped on each (re)start so a delayed `claude` auto-send from a prior
     /// session can never land in a newer shell.
@@ -53,13 +68,21 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
     /// `exit` — only the latter auto-closes the pane.
     private var expectedTermination = false
 
-    init(id: UUID, cwd: String) {
+    init(id: UUID, cwd: String, freshClaude: Bool = false) {
         self.id = id
         self.cwd = cwd
+        self.freshClaude = freshClaude
         self.view = LocalProcessTerminalView(frame: .zero)
         super.init()
         view.processDelegate = self
         view.caretViewTracksFocus = false  // always render filled block, even when unfocused
+        // Selection beats mouse reporting. With reporting on (SwiftTerm's
+        // default), every chunk of output runs `feedPrepare()` → `selection
+        // .active = false`, so text selected while Claude is still streaming is
+        // silently dropped and Cmd+C copies nothing. SwiftTerm's own docs flag
+        // this ("This poses a problem for selection"). Claude Code is
+        // keyboard-driven, so forwarding mouse events to it buys us little.
+        view.allowMouseReporting = false
         if let mono = NSFont(name: "SF Mono", size: 12) ?? NSFont(name: "Menlo", size: 12) {
             view.font = mono
         }
@@ -110,7 +133,7 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
         let gen = sessionGen
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak term] in
             guard let self, self.sessionGen == gen else { return }
-            let command = TerminalSession.claudeLaunchCommand(
+            let command = self.freshClaude ? "claude\n" : TerminalSession.claudeLaunchCommand(
                 dir: dir,
                 home: home,
                 projectsRoot: home + "/.claude/projects"
@@ -197,6 +220,7 @@ extension Notification.Name {
 struct SwiftTermContainer: NSViewRepresentable {
     let id: UUID
     let cwd: String
+    var freshClaude: Bool = false
 
     func makeNSView(context: Context) -> NSView {
         let container = NSView()
@@ -209,7 +233,7 @@ struct SwiftTermContainer: NSViewRepresentable {
     }
 
     private func attachTerminal(to container: NSView) {
-        let term = TerminalSessions.shared.session(for: id, cwd: cwd).view
+        let term = TerminalSessions.shared.session(for: id, cwd: cwd, freshClaude: freshClaude).view
         guard term.superview !== container else { return }
         term.removeFromSuperview()
         term.translatesAutoresizingMaskIntoConstraints = false
@@ -220,5 +244,58 @@ struct SwiftTermContainer: NSViewRepresentable {
             term.topAnchor.constraint(equalTo: container.topAnchor),
             term.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
+    }
+}
+
+// MARK: - Scroll-back pill
+
+/// "↓ N lines below" badge shown over a terminal the user has scrolled up in,
+/// the way iTerm2 signals that output is still arriving out of view. Clicking
+/// it returns to the newest output (and resumes following it, since landing on
+/// the last row clears the vendored SwiftTerm's `userScrolling` flag).
+///
+/// The count is polled rather than pushed: SwiftTerm's `TerminalViewDelegate`
+/// callbacks aren't forwarded through `LocalProcessTerminalViewDelegate`, and
+/// reading two ints four times a second is cheaper than widening the fork.
+struct TerminalScrollPill: View {
+    let terminalId: UUID
+
+    @State private var linesBelow = 0
+    private let tick = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Group {
+            if linesBelow > 0 {
+                Button(action: scrollToBottom) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 9, weight: .bold))
+                        Text(linesBelow == 1 ? "1 line below" : "\(linesBelow) lines below")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.accentColor))
+                    .shadow(color: .black.opacity(0.35), radius: 4, y: 2)
+                }
+                .buttonStyle(.plain)
+                .help("Jump to the newest output")
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .padding(.trailing, 12)
+        .padding(.bottom, 10)
+        .onReceive(tick) { _ in
+            let count = TerminalSessions.shared.existing(terminalId)?.view.linesBelowViewport ?? 0
+            if count != linesBelow {
+                withAnimation(.easeOut(duration: 0.15)) { linesBelow = count }
+            }
+        }
+    }
+
+    private func scrollToBottom() {
+        TerminalSessions.shared.existing(terminalId)?.view.scrollToBottom()
+        linesBelow = 0
     }
 }

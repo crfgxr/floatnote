@@ -1,0 +1,235 @@
+From 18f292a00fc1bc48afaff8ee31b485514930eb68 Mon Sep 17 00:00:00 2001
+From: FloatNote <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 13:19:33 +0300
+Subject: [PATCH] FloatNote patch: sticky scroll, selection stability, deeper
+ scrollback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. Set Terminal.userScrolling from scrollTo() so incoming output stops
+   yanking the viewport to the bottom. The flag is honored by
+   Terminal.scroll() but never set upstream — the view's identically-named
+   property is a different variable.
+
+2. Notify on scrollback trim (new TerminalDelegate.linesTrimmed, default
+   no-op) and shift the selection by the same amount. start/end are line-ring
+   indices, so without this the highlight walks down through the text while
+   output streams — you select a line and copy a different one.
+
+3. TerminalView.defaultScrollback, because upstream hardcodes TerminalOptions'
+   500-line default and rebuilds options on every resize.
+
+Adds linesBelowViewport / scrollToBottom() for the scroll-back pill.
+---
+ .../SwiftTerm/Apple/AppleTerminalView.swift   | 41 ++++++++++++++++++-
+ Sources/SwiftTerm/Mac/MacTerminalView.swift   | 25 +++++++----
+ Sources/SwiftTerm/SelectionService.swift      | 28 +++++++++++++
+ Sources/SwiftTerm/Terminal.swift              | 22 ++++++++++
+ 4 files changed, 108 insertions(+), 8 deletions(-)
+
+diff --git a/Sources/SwiftTerm/Apple/AppleTerminalView.swift b/Sources/SwiftTerm/Apple/AppleTerminalView.swift
+index 2b50935..d4c7cce 100644
+--- a/Sources/SwiftTerm/Apple/AppleTerminalView.swift
++++ b/Sources/SwiftTerm/Apple/AppleTerminalView.swift
+@@ -123,6 +123,15 @@ extension TerminalView {
+         return caretView?.frame ?? CGRect.zero
+     }
+     
++    /// FloatNote patch — scrollback depth for terminal views, in lines.
++    ///
++    /// Upstream takes `TerminalOptions`' 500-line default and rebuilds the
++    /// options object on every resize, so a client has no way to make it stick.
++    /// Set this before creating a view. 500 lines is a few seconds of Claude
++    /// Code output, and a scrollback that trims constantly is one you cannot
++    /// scroll back through.
++    public static var defaultScrollback = 500
++
+     func setupOptions(width: CGFloat, height: CGFloat)
+     {
+         resetCaches ()
+@@ -131,7 +140,8 @@ extension TerminalView {
+         self.cellDimension = computeFontDimensions ()
+         
+         let terminalOptions = TerminalOptions(cols: Int(width / cellDimension.width),
+-                                              rows: Int(height / cellDimension.height))
++                                              rows: Int(height / cellDimension.height),
++                                              scrollback: TerminalView.defaultScrollback)
+         
+         if terminal == nil {
+             terminal = Terminal(delegate: self, options: terminalOptions)
+@@ -1820,6 +1830,21 @@ extension TerminalView {
+                 displayBuffer.lines.count > displayBuffer.rows
+         }
+     }
++
++    /// FloatNote patch — rows of output sitting below the viewport, i.e. how far
++    /// behind the live output the user currently is. 0 means pinned to the
++    /// bottom. Drives the "N lines below ↓" pill; exposed here so clients don't
++    /// need access to the buffer internals.
++    public var linesBelowViewport: Int {
++        let displayBuffer = terminal.displayBuffer
++        guard !terminal.isDisplayBufferAlternate else { return 0 }
++        return max(0, displayBuffer.yBase - displayBuffer.yDisp)
++    }
++
++    /// FloatNote patch — scroll to the newest output and resume following it.
++    public func scrollToBottom () {
++        scrollTo(row: terminal.displayBuffer.yBase)
++    }
+     
+     public func scroll (toPosition: Double)
+     {
+@@ -1846,6 +1871,20 @@ extension TerminalView {
+     public func scrollTo (row: Int, notifyAccessibility: Bool = true)
+     {
+         let displayBuffer = terminal.displayBuffer
++        // FloatNote patch — scroll stickiness.
++        //
++        // `Terminal.scroll()` already refuses to drag the viewport down to the
++        // bottom while `Terminal.userScrolling` is set (and decrements yDisp to
++        // hold the text steady once the scrollback starts trimming), but
++        // nothing upstream ever sets that flag: the view's own `userScrolling`
++        // property is a *different* variable, touched only by
++        // `scroll(toPosition:)`. So every wheel scroll left the terminal
++        // free to snap back to the bottom on the next byte of output.
++        //
++        // Setting it here covers every scroll path — wheel, scrollbar,
++        // keyboard — because they all funnel through `scrollTo`. Landing back
++        // on the last row clears it, which is what resumes following output.
++        terminal.userScrolling = row < displayBuffer.yBase
+         if row != displayBuffer.yDisp {
+             terminal.setViewYDisp (row)
+             
+diff --git a/Sources/SwiftTerm/Mac/MacTerminalView.swift b/Sources/SwiftTerm/Mac/MacTerminalView.swift
+index 2ce2504..6ebf155 100644
+--- a/Sources/SwiftTerm/Mac/MacTerminalView.swift
++++ b/Sources/SwiftTerm/Mac/MacTerminalView.swift
+@@ -1849,6 +1849,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+         }
+     }
+     
++    /// FloatNote patch — the scrollback dropped `count` lines off the top, so
++    /// shift the selection by the same amount to keep it on the same text.
++    open func linesTrimmed(source: Terminal, count: Int) {
++        selection?.linesTrimmed(count)
++    }
++
+     open func selectionChanged(source: Terminal) {
+         #if canImport(MetalKit)
+         if metalView != nil {
+@@ -2322,13 +2328,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations,
+     
+     func ensureCaretIsVisible ()
+     {
+-        let displayBuffer = terminal.displayBuffer
+-        let realCaret = displayBuffer.y + displayBuffer.yBase
+-        let viewportEnd = displayBuffer.yDisp + displayBuffer.rows
+-        
+-        if realCaret >= viewportEnd || realCaret < displayBuffer.yDisp {
+-            scrollTo (row: displayBuffer.yBase)
+-        }
++        // FloatNote patch — scroll-on-input.
++        //
++        // Upstream only scrolls when the caret falls fully outside the viewport.
++        // That leaves a partial scroll-back broken: park a few lines up and the
++        // caret row is still technically inside the viewport, so typing does not
++        // return to the live screen and the characters appear to vanish. Every
++        // other terminal jumps to the bottom the moment you type, so do that —
++        // unconditionally, since `send` only runs on real input.
++        //
++        // This also clears `userScrolling` (see `scrollTo`), which is what lets
++        // output resume following after you start typing again.
++        scrollTo (row: terminal.displayBuffer.yBase)
+     }
+     
+     public func setTerminalIconTitle(source: Terminal, title: String) {
+diff --git a/Sources/SwiftTerm/SelectionService.swift b/Sources/SwiftTerm/SelectionService.swift
+index 227309f..955ea21 100644
+--- a/Sources/SwiftTerm/SelectionService.swift
++++ b/Sources/SwiftTerm/SelectionService.swift
+@@ -84,6 +84,34 @@ class SelectionService: CustomDebugStringConvertible {
+     public var isMultiLine: Bool {
+         return start.row != end.row
+     }
++
++    /// FloatNote patch — keep the selection on the same text when the scrollback
++    /// trims.
++    ///
++    /// `start`/`end` are indices into the line ring, so dropping `count` lines
++    /// off the top shifts every remaining line down by that much. `yDisp` is
++    /// already compensated in `Terminal.scroll()`; without the same correction
++    /// here the highlight stays on fixed row numbers and visibly walks down
++    /// through the text as output arrives. Selections that fall entirely off
++    /// the top are dropped, since the text they referred to is gone.
++    public func linesTrimmed (_ count: Int) {
++        guard count > 0, _active || hasSelectionRange else { return }
++        if end.row - count < 0 {
++            // `_active` directly, NOT `active`: the setter notifies the delegate,
++            // and this runs inside `Terminal.scroll()` with the buffer half
++            // updated. Re-entering the view's redraw from there risks losing
++            // repaints. The view redraws on the next display pass anyway.
++            _active = false
++            start = Position (col: 0, row: 0)
++            end = Position (col: 0, row: 0)
++            return
++        }
++        start = Position (col: start.col, row: max (0, start.row - count))
++        end = Position (col: end.col, row: end.row - count)
++        if let p = pivot {
++            pivot = Position (col: p.col, row: max (0, p.row - count))
++        }
++    }
+     
+     /**
+      * Starts the selection from the specific screen-relative location
+diff --git a/Sources/SwiftTerm/Terminal.swift b/Sources/SwiftTerm/Terminal.swift
+index e9ab45b..f32d2e9 100644
+--- a/Sources/SwiftTerm/Terminal.swift
++++ b/Sources/SwiftTerm/Terminal.swift
+@@ -16,6 +16,14 @@ import Foundation
+  * `Terminal` to notify of important changes on the underlying terminal
+  */
+ public protocol TerminalDelegate: AnyObject {
++    /**
++     * FloatNote patch — invoked when `count` lines were dropped off the top of
++     * the scrollback, so anything holding line-ring coordinates (notably the
++     * selection) can shift by the same amount. Has a default no-op
++     * implementation.
++     */
++    func linesTrimmed (source: Terminal, count: Int)
++
+     /**
+      * Invoked to request that the cursor be shown
+      */
+@@ -5265,6 +5273,14 @@ open class Terminal {
+                 if userScrolling {
+                     buffer.yDisp = max (buffer.yDisp - 1, 0)
+                 }
++
++                // FloatNote patch: the ring just dropped its oldest line, so
++                // every remaining line shifted down one index. yDisp is fixed up
++                // above; the selection lives in the same coordinates and needs
++                // the same correction, or the highlight walks down through the
++                // text while output streams. Notified only once the buffer is
++                // consistent — the handler must not re-enter the view's redraw.
++                tdel?.linesTrimmed (source: self, count: 1)
+             }
+         } else {
+             // scrollTop is non-zero which means no line will be going to the
+@@ -6633,6 +6649,12 @@ open class Terminal {
+ 
+ // Default implementations
+ public extension TerminalDelegate {
++    /// FloatNote patch — see the protocol declaration.
++    func linesTrimmed (source: Terminal, count: Int)
++    {
++        // Do nothing
++    }
++
+     func cursorStyleChanged (source: Terminal, newStyle: CursorStyle)
+     {
+         // Do nothing
+-- 
+2.50.1 (Apple Git-155)
+
