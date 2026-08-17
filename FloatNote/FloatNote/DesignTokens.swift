@@ -16,7 +16,9 @@ enum Tokens {
 
     // MARK: - Persisted body size
 
-    private static let bodySizeKey = "fn.bodyFontSize"
+    /// Internal (not private) so the pickers can bind to it with `@AppStorage`
+    /// and stay in sync no matter which menu changed the value.
+    static let bodySizeKey = "fn.bodyFontSize"
     /// Allowed body font sizes in the dropdown.
     static let bodySizeOptions: [CGFloat] = [10, 11, 12, 13, 14, 15, 16, 18, 20]
 
@@ -32,7 +34,8 @@ enum Tokens {
 
     // MARK: - Persisted editor font family
 
-    private static let fontFamilyKey = "fn.fontFamily"
+    /// Internal for the same reason as `bodySizeKey`.
+    static let fontFamilyKey = "fn.fontFamily"
     /// Sentinel meaning "use the built-in system font" (the original default).
     static let systemFontName = "System"
     /// Font families shown in the toolbar picker: the current default (System),
@@ -239,6 +242,12 @@ enum Tokens {
         /// Amber accent for a per-note terminal-folder override (distinct from the
         /// inherited/project state, which uses `.accentColor`).
         static let overrideTint: SwiftUI.Color = SwiftUI.Color(red: 0.95, green: 0.64, blue: 0.20)
+        /// Green for "this note's board has drawings" (closed). The open board
+        /// uses `.accentColor` instead, so the two states never collide.
+        static let boardHasContent: SwiftUI.Color = SwiftUI.Color(red: 0.22, green: 0.74, blue: 0.40)
+        /// Red for hands-free listening — deliberately the same signal the app
+        /// already uses for "the microphone is live" during recording.
+        static let handsfreeListening: SwiftUI.Color = SwiftUI.Color(red: 1.0, green: 0.231, blue: 0.188)
     }
 }
 
