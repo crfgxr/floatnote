@@ -21,12 +21,17 @@ enum HandsfreeState {
 
 /// How much of Claude's turn gets read aloud.
 enum ResponseMode: String, CaseIterable {
+    /// Opening sentence + the ask, capped. The default: a whole Claude turn is
+    /// prose written for a screen, and reading it out takes ~35 seconds to
+    /// deliver about two lines of news.
+    case brief
     case full
     case summary
     case notify
 
     var title: String {
         switch self {
+        case .brief:   return "Brief — Result + Question"
         case .full:    return "Full Response"
         case .summary: return "Summary (First + Last Sentence)"
         case .notify:  return "Notify Only"
@@ -68,7 +73,7 @@ final class HandsfreeManager: ObservableObject {
 
     @Published private(set) var responseMode: ResponseMode = {
         UserDefaults.standard.string(forKey: "fn.handsfreeResponseMode")
-            .flatMap(ResponseMode.init(rawValue:)) ?? .full
+            .flatMap(ResponseMode.init(rawValue:)) ?? .brief
     }()
 
     @Published private(set) var voiceId: String = {
@@ -236,6 +241,7 @@ final class HandsfreeManager: ObservableObject {
         }
         let body: String
         switch responseMode {
+        case .brief:   body = VoiceEngine.brief(message)
         case .full:    body = message
         case .summary: body = VoiceEngine.summarize(message)
         case .notify:  body = "Listening"
@@ -286,6 +292,17 @@ final class HandsfreeManager: ObservableObject {
             state = .idle
         }
         refreshStatus()
+    }
+
+    /// ⌘. — stop the voice immediately, whatever the recognizer is doing.
+    /// Returns false when there was nothing to stop, so the key can fall
+    /// through to its normal meaning.
+    @discardableResult
+    func stopSpeakingFromKeyboard() -> Bool {
+        guard state == .speaking else { return false }
+        dbg("handsfree: stop speaking (keyboard)")
+        stopSpeaking()
+        return true
     }
 
     /// Stop talking and go back to listening, without disabling hands-free.
@@ -374,12 +391,21 @@ final class HandsfreeManager: ObservableObject {
     /// the recognizer never transcribes TTS back word-perfectly, so requiring
     /// an exact match would cut Claude off mid-sentence.
     private func canBargeIn(_ text: String) -> Bool {
-        guard let started = VoiceEngine.shared.speechStartedAt,
-              Date().timeIntervalSince(started) > bargeInGrace else { return false }
+        guard let started = VoiceEngine.shared.speechStartedAt else {
+            dbg("handsfree: barge-in check — playback not started yet")
+            return false
+        }
+        let elapsed = Date().timeIntervalSince(started)
         let words = VoiceEngine.normalizeSpeech(text).split(separator: " ").count
-        // One word is only ever enough for "stop".
-        guard words >= 2 || VoiceEngine.isStopPhrase(text) else { return false }
-        return VoiceEngine.echoOverlap(heard: text, spoken: currentSpokenText) < 0.5
+        let overlap = VoiceEngine.echoOverlap(heard: text, spoken: currentSpokenText)
+        // A single word is enough when it shares nothing with what we're saying
+        // ("stop", "wait", "enough") — the cost of a false positive is a stopped
+        // sentence, the cost of a false negative is being talked over.
+        let loud = words >= 2 ? overlap < 0.5 : overlap == 0
+        let ok = elapsed > bargeInGrace && loud
+        dbg("handsfree: barge-in check heard=\"\(text.prefix(40))\" words=\(words) "
+            + "overlap=\(String(format: "%.2f", overlap)) elapsed=\(String(format: "%.1f", elapsed))s → \(ok)")
+        return ok
     }
 
     func clearTranscript() {

@@ -169,9 +169,74 @@ final class VoiceEngine: NSObject, AVAudioPlayerDelegate {
         s = s.replacingOccurrences(of: "(?m)^#{1,6}\\s+", with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: "[*_]{1,3}", with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: "https?://\\S+", with: "link", options: .regularExpression)
-        s = s.replacingOccurrences(of: "(?m)^\\s*[-*+]\\s+", with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: "(?m)^\\s*[-*+•]\\s+", with: "", options: .regularExpression)
+        // Markdown table rows read as a wall of punctuation.
+        s = s.replacingOccurrences(of: "(?m)^\\s*\\|.*$", with: "", options: .regularExpression)
+        // Absolute paths and file:line references: unspeakable, and never the point.
+        s = s.replacingOccurrences(of: "(?:~|\\.)?/[\\w.@~+-]+(?:/[\\w.@~+-]+)+(?::\\d+)?",
+                                   with: "the file", options: .regularExpression)
+        s = s.replacingOccurrences(of: "\\b[\\w-]+\\.(swift|js|ts|json|md|sh|py|html|css):\\d+",
+                                   with: "the file", options: .regularExpression)
         s = s.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Split into sentences, keeping their terminators.
+    static func sentences(_ text: String) -> [String] {
+        var out: [String] = []
+        var current = ""
+        for ch in text {
+            current.append(ch)
+            if ch == "." || ch == "!" || ch == "?" || ch == "\n" {
+                let t = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { out.append(t) }
+                current = ""
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { out.append(tail) }
+        return out
+    }
+
+    /// What a hands-free listener actually needs from a finished turn: what
+    /// happened, and what is being asked of them. Reading a whole Claude turn
+    /// out loud is ~35 seconds of prose written for a screen — file paths,
+    /// bullet lists and all — for two lines of actual news.
+    ///
+    /// So: the opening sentence, plus the ask (the last question, or a closing
+    /// "next step" line), capped at `maxWords` on a sentence boundary.
+    static func brief(_ text: String, maxWords: Int = 45) -> String {
+        let all = sentences(cleanForSpeech(text))
+        guard let first = all.first else { return "" }
+        var picked = [first]
+        if let question = all.dropFirst().last(where: { $0.hasSuffix("?") }) {
+            picked.append(question)
+        } else if all.count > 1, let last = all.last, isNextStep(last), last != first {
+            picked.append(last)
+        }
+        // Cap on a sentence boundary — a sentence cut mid-clause is worse than
+        // one sentence fewer.
+        var kept: [String] = []
+        var words = 0
+        for sentence in picked {
+            let n = sentence.split(separator: " ").count
+            if !kept.isEmpty && words + n > maxWords { break }
+            kept.append(sentence)
+            words += n
+        }
+        var out = kept.joined(separator: " ")
+        // A single opening sentence can still be a monster; trim it hard.
+        let flat = out.split(separator: " ")
+        if flat.count > maxWords + 15 {
+            out = flat.prefix(maxWords).joined(separator: " ") + "…"
+        }
+        return out
+    }
+
+    private static func isNextStep(_ sentence: String) -> Bool {
+        let n = normalizeSpeech(sentence)
+        return ["next", "want me", "should i", "shall i", "let me know", "tell me",
+                "do you want", "ready when"].contains { n.hasPrefix($0) || n.contains($0) }
     }
 
     /// First + last sentence, for `.summary` mode. Short text is returned whole.
