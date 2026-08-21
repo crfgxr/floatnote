@@ -117,6 +117,11 @@ final class HandsfreeManager: ObservableObject {
     /// The text currently being read aloud, for the barge-in echo filter.
     private var currentSpokenText = ""
     private var quickResponseDeadline: Date?
+    /// The pane whose Claude asked for permission. A quick response goes THERE,
+    /// not to whatever pane happens to be on screen when you answer — the
+    /// prompt can come from a background agent, and "no" landing in the wrong
+    /// terminal is worse than not answering at all.
+    private var quickResponsePaneId: UUID?
     private var listenerWired = false
 
     private init() {}
@@ -263,6 +268,7 @@ final class HandsfreeManager: ObservableObject {
             ? "Claude needs your input." : message
         awaitingQuickResponse = true
         quickResponseDeadline = Date().addingTimeInterval(60)
+        quickResponsePaneId = tab.id
         dbg("handsfree: permission prompt pane=\(tab.label)")
         speak((isActivePane ? "" : "\(tab.label): ") + prompt + " Say yes, no, or a number.")
     }
@@ -442,6 +448,7 @@ final class HandsfreeManager: ObservableObject {
     /// active *now* — navigating mid-sentence lands the text where you ended up.
     func submit(_ text: String? = nil) {
         var message = (text ?? liveTranscript).trimmingCharacters(in: .whitespacesAndNewlines)
+        message = VoiceEngine.stripTrailingSendTrigger(message)
         // "cmd clear send it" arrives here as "cmd clear".
         if case .slash(let cmd)? = VoiceEngine.parseCommand(message) { message = cmd }
         guard !message.isEmpty else {
@@ -480,13 +487,24 @@ final class HandsfreeManager: ObservableObject {
         statusText = "Interrupted"
     }
 
-    /// Answer a permission prompt by "pressing" its number key.
+    /// Answer a permission prompt by "pressing" its number key, in the pane
+    /// that asked.
     private func sendQuickResponse(_ key: String) {
-        guard let session = activeSession() else { return }
+        let paneId = quickResponsePaneId ?? vm?.activeTerminalId
+        guard let paneId, let session = TerminalSessions.shared.existing(paneId) else {
+            statusText = "That terminal is gone"
+            dbg("handsfree: quick response dropped — prompting pane closed")
+            clearTranscript()
+            awaitingQuickResponse = false
+            quickResponsePaneId = nil
+            return
+        }
         session.view.send(txt: key)
-        dbg("handsfree: quick response '\(key)' → \(activePaneLabel())")
+        let label = vm?.terminalTabs.first(where: { $0.id == paneId })?.label ?? "?"
+        dbg("handsfree: quick response '\(key)' → \(label)")
         clearTranscript()
         awaitingQuickResponse = false
+        quickResponsePaneId = nil
         state = .processing
         statusText = "Answered \(key)"
     }
@@ -599,6 +617,7 @@ final class HandsfreeManager: ObservableObject {
         if let deadline = quickResponseDeadline, Date() > deadline {
             awaitingQuickResponse = false
             quickResponseDeadline = nil
+            quickResponsePaneId = nil
         }
         let silence = Date().timeIntervalSince(lastTranscriptChange)
         if state == .listening, autoSendEnabled, !liveTranscript.isEmpty, silence >= autoSendDelay {

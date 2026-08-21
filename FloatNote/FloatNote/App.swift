@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.69.3"
+let APP_VERSION = "v1.69.5"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -57,10 +57,12 @@ struct FloatNoteApp: App {
             // Hands-free voice needs a reachable, *named* way in: the toolbar
             // has a second mic-shaped button (editor dictation) right next to
             // it, and one icon among a dozen is not a discoverable switch.
+            // No key equivalent — the menu item and the toolbar button are the
+            // two ways in, and a global chord here would collide with whatever
+            // the terminal's TUI wants that key for.
             CommandGroup(after: .toolbar) {
                 Button(handsfree.isEnabled ? "Turn Off Hands-Free Voice"
                                            : "Hands-Free Voice") { vm.toggleHandsfree() }
-                    .keyboardShortcut("m", modifiers: [.command, .shift])
             }
         }
     }
@@ -117,13 +119,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             else { return event }
             let mods = event.modifierFlags.intersection([.command, .shift, .option, .control])
             if mods == [.command] && key == "w" { return nil }
-            // Cmd+Shift+M → hands-free voice, from anywhere (editor, terminal,
-            // sidebar). The menu item carries the same shortcut; this monitor
-            // sees the key first when focus is inside a terminal.
-            if mods == [.command, .shift] && key == "m" {
-                MainActor.assumeIsolated { vm.toggleHandsfree() }
-                return nil
-            }
             // Cmd+. — the classic macOS cancel — shuts the voice up without
             // relying on the mic hearing you over its own playback.
             if mods == [.command] && key == "." {

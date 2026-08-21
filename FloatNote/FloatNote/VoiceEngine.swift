@@ -357,6 +357,26 @@ extension VoiceEngine {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Words the recognizer should expect: command triggers plus the nouns
+    /// this project is discussed in.
+    static let contextualVocabulary = [
+        "send it", "stop", "delete message", "cmd", "focus window",
+        "barge-in", "hands-free", "Claude", "Claude Code", "FloatNote",
+        "terminal", "commit", "transcript", "pane",
+    ]
+
+    /// Strip a trailing send-trigger the parser didn't act on — a bare "send",
+    /// or a "send it" that arrived after the submit was already under way.
+    /// Belt-and-braces: `parseCommand` strips the trigger it matched, this
+    /// catches the leftovers so they never reach Claude.
+    static func stripTrailingSendTrigger(_ text: String) -> String {
+        let n = normalizeSpeech(text)
+        for trigger in sendTriggers + ["send", "sent"] where n == trigger || n.hasSuffix(" " + trigger) {
+            return stripTrailing(trigger, from: text)
+        }
+        return text
+    }
+
     /// Answer to a Claude permission prompt: the key to press. Only consulted
     /// while `HandsfreeManager.awaitingQuickResponse` — "one" in the middle of
     /// a normal sentence must never pick an option.
@@ -519,6 +539,13 @@ final class SpeechListener {
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
+        // Bias the recognizer toward the vocabulary this app is spoken to in —
+        // without it "barge-in" comes back as "embarrassing" and the "send it"
+        // trigger gets lost as a bare "send".
+        req.contextualStrings = VoiceEngine.contextualVocabulary
+        // Dictated messages go to Claude as prose; punctuation makes them read
+        // like a sentence instead of a transcript.
+        req.addsPunctuation = true
         // On-device keeps a local-only app local, and lifts the ~1 minute cap
         // server-based recognition puts on a single request.
         if recognizer?.supportsOnDeviceRecognition == true { req.requiresOnDeviceRecognition = true }
