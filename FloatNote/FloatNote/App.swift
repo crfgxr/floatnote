@@ -17,7 +17,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.59.0"
+let APP_VERSION = "v1.69.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -806,6 +806,14 @@ class EditorViewModel: ObservableObject {
             // install predates the field, or the event carries no turn text.
             let turnText = obj["last_assistant_message"] as? String ?? ""
             dbg("claude event [\(event)] → pane \(tab.label) turnText=\(turnText.count)ch")
+            if event == "Stop", !turnText.isEmpty {
+                HandsfreeManager.shared.handleTurnEnd(message: turnText, tab: tab)
+            } else if event == "Notification" {
+                // Permission prompt (or "waiting for input"): read it out and
+                // take "yes" / "no" / a number as the answer.
+                HandsfreeManager.shared.handlePermissionPrompt(
+                    message: obj["message"] as? String ?? "", tab: tab)
+            }
             postClaudeNotification(event: event,
                                    message: obj["message"] as? String ?? "",
                                    tab: tab)
@@ -1810,6 +1818,8 @@ class EditorViewModel: ObservableObject {
     func startRecording() async {
         guard let tab = activeTab else { return }
 
+        // The mic is exclusive: meeting capture beats hands-free voice.
+        HandsfreeManager.shared.yieldToRecording()
         recordingTabId = tab.id
         isRecording = true
         recordingStartTime = Date()

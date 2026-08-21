@@ -1,5 +1,7 @@
 import AVFoundation
 import AppKit
+import CoreAudio
+import Speech
 
 /// Text-to-speech for hands-free voice.
 ///
@@ -182,5 +184,404 @@ final class VoiceEngine: NSObject, AVAudioPlayerDelegate {
             return trimmed
         }
         return first + ". " + last + "."
+    }
+}
+
+// MARK: - Voice commands
+
+/// A spoken instruction found in the live transcript.
+enum VoiceCommand: Equatable {
+    /// Submit what has been dictated. Payload is the message with the trigger
+    /// phrase stripped off ("add a toggle send it" → "add a toggle").
+    case sendIt(String)
+    /// Interrupt Claude — ESC to the pane.
+    case stop
+    /// Throw away the dictated message, keep listening.
+    case deleteMessage
+    /// Run a slash command: "cmd clear" → "/clear", "cmd model sonnet" → "/model sonnet".
+    case slash(String)
+    /// Switch to terminal pane N (1-based), chip + note navigation.
+    case focusPane(Int)
+}
+
+extension VoiceEngine {
+
+    /// Lowercase, drop punctuation, collapse whitespace. Command matching only —
+    /// the text actually sent to Claude keeps its original casing.
+    static func normalizeSpeech(_ text: String) -> String {
+        var s = text.lowercased()
+        s = s.replacingOccurrences(of: "[^\\p{L}\\p{N}\\s]", with: " ", options: .regularExpression)
+        s = s.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return s.trimmingCharacters(in: .whitespaces)
+    }
+
+    // Trailing triggers are matched against the END of the transcript, so a
+    // whole dictated message can carry one. Turkish aliases are included
+    // because the recognizer locale is user-selectable.
+    private static let sendTriggers = ["send it", "send it now", "send that", "sent it",
+                                       "send message", "gonder", "gönder"]
+    private static let stopTriggers = ["stop", "stop it", "stop stop", "abort", "cancel that", "dur"]
+    private static let deleteTriggers = ["delete message", "delete that", "clear message",
+                                         "clear that", "scratch that", "never mind", "nevermind", "sil"]
+    private static let focusPrefixes = ["focus window", "focus pane", "focus terminal",
+                                        "switch to window", "switch to pane"]
+    private static let slashPrefixes = ["cmd", "command", "slash"]
+    private static let numberWords: [String: Int] = [
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9,
+        "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+    ]
+
+    /// Recognize a command in `text`. Pure — no audio, no state — so the whole
+    /// table in the spec can be exercised directly.
+    static func parseCommand(_ text: String) -> VoiceCommand? {
+        let n = normalizeSpeech(text)
+        guard !n.isEmpty else { return nil }
+
+        // "…send it" wins over everything else: the rest is the message.
+        for trigger in sendTriggers where n == trigger || n.hasSuffix(" " + trigger) {
+            return .sendIt(stripTrailing(trigger, from: text))
+        }
+        // Bare-utterance commands. Deliberately NOT suffix matches — "don't
+        // stop the build" must not interrupt Claude.
+        if stopTriggers.contains(n) { return .stop }
+        if deleteTriggers.contains(n) { return .deleteMessage }
+
+        let words = n.split(separator: " ").map(String.init)
+        for prefix in focusPrefixes {
+            let p = prefix.split(separator: " ").map(String.init)
+            guard words.count == p.count + 1, Array(words.prefix(p.count)) == p,
+                  let idx = numberWords[words[p.count]] else { continue }
+            return .focusPane(idx)
+        }
+        if let first = words.first, slashPrefixes.contains(first), words.count > 1 {
+            // First word is the command, the rest are its arguments:
+            // "cmd clear" → /clear, "cmd model sonnet" → /model sonnet.
+            return .slash("/" + words.dropFirst().joined(separator: " "))
+        }
+        return nil
+    }
+
+    /// Is this whole utterance just "stop"? Used for barge-in, where a single
+    /// word is enough to mean it — everything else needs two.
+    static func isStopPhrase(_ text: String) -> Bool {
+        stopTriggers.contains(normalizeSpeech(text))
+    }
+
+    /// How much of `heard` also appears in `spoken`, 0…1. The mic picks up the
+    /// speakers (there is no echo cancellation) but the recognizer never
+    /// transcribes TTS back word-perfectly, so overlap beats equality.
+    static func echoOverlap(heard: String, spoken: String) -> Double {
+        let heardWords = normalizeSpeech(heard).split(separator: " ").map(String.init)
+        guard !heardWords.isEmpty else { return 1 }
+        let spokenWords = Set(normalizeSpeech(spoken).split(separator: " ").map(String.init))
+        guard !spokenWords.isEmpty else { return 0 }
+        let hits = heardWords.filter { spokenWords.contains($0) }.count
+        return Double(hits) / Double(heardWords.count)
+    }
+
+    /// Remove a trailing trigger phrase from the ORIGINAL text (casing and
+    /// punctuation of the message survive; the trigger and any punctuation
+    /// glued to it do not).
+    private static func stripTrailing(_ trigger: String, from text: String) -> String {
+        let words = trigger.split(separator: " ")
+            .map { NSRegularExpression.escapedPattern(for: String($0)) }
+            .joined(separator: "[^\\p{L}\\p{N}]+")
+        let pattern = "(?i)[^\\p{L}\\p{N}]*" + words + "[^\\p{L}\\p{N}]*$"
+        return text.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Answer to a Claude permission prompt: the key to press. Only consulted
+    /// while `HandsfreeManager.awaitingQuickResponse` — "one" in the middle of
+    /// a normal sentence must never pick an option.
+    static func parseQuickResponse(_ text: String) -> String? {
+        let n = normalizeSpeech(text)
+        guard !n.isEmpty else { return nil }
+        if ["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it", "evet"].contains(n) { return "1" }
+        if n.contains("always") || n.contains("don t ask") { return "2" }
+        if ["no", "nope", "no thanks", "hayir", "hayır"].contains(n) { return "3" }
+        guard let last = n.split(separator: " ").last.map(String.init),
+              let idx = numberWords[last], idx <= 9 else { return nil }
+        return String(idx)
+    }
+}
+
+// MARK: - Speech recognition
+
+/// Continuous microphone → text for hands-free voice.
+///
+/// One `AVAudioEngine` tap feeds a rolling series of
+/// `SFSpeechAudioBufferRecognitionRequest`s: the engine runs for the whole
+/// session while recognition *tasks* are cycled (each ends by itself after a
+/// pause, or is cut short once we've acted on a command), so the mic never
+/// audibly re-arms between utterances and stale audio can't be re-recognized
+/// into a second submit.
+final class SpeechListener {
+    static let shared = SpeechListener()
+
+    /// `(transcript, isFinal)` for the current task. Main queue.
+    var onTranscript: ((String, Bool) -> Void)?
+    /// 0…1 mic level, ~15fps. Main queue.
+    var onLevel: ((CGFloat) -> Void)?
+    /// The session can't continue (no recognizer, mic gone). Main queue.
+    var onUnavailable: ((String) -> Void)?
+
+    private(set) var isRunning = false
+
+    private var recognizer: SFSpeechRecognizer?
+    private var engine: AVAudioEngine?
+    private var task: SFSpeechRecognitionTask?
+    /// Bumped per task so callbacks from a cancelled task are dropped — without
+    /// this, a task cancelled right after "send it" can still deliver its final
+    /// result and submit the same sentence twice.
+    private var taskGen = 0
+    private var lastLevelEmit = Date.distantPast
+    /// Timestamps of automatic task restarts, for the runaway-loop guard.
+    private var restarts: [Date] = []
+
+    // The audio tap runs on a realtime thread while `request` is replaced on the
+    // main queue, so it is behind a lock rather than accessed bare.
+    private let requestLock = NSLock()
+    private var _request: SFSpeechAudioBufferRecognitionRequest?
+    private var request: SFSpeechAudioBufferRecognitionRequest? {
+        get { requestLock.lock(); defer { requestLock.unlock() }; return _request }
+        set { requestLock.lock(); _request = newValue; requestLock.unlock() }
+    }
+
+    private let deviceQueue = DispatchQueue(label: "com.floatnote.handsfree.device")
+    private var deviceListener: AudioObjectPropertyListenerBlock?
+    private var lastInputDevice: AudioDeviceID = 0
+    private var pendingDeviceRebuild: DispatchWorkItem?
+
+    // MARK: Authorization
+
+    static func requestAuthorization(_ completion: @escaping (Bool) -> Void) {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            completion(true)
+        case .denied, .restricted:
+            completion(false)
+        default:
+            SFSpeechRecognizer.requestAuthorization { status in
+                DispatchQueue.main.async { completion(status == .authorized) }
+            }
+        }
+    }
+
+    // MARK: Session
+
+    /// Start listening. `localeId` is `HandsfreeManager.systemLocaleId` or a
+    /// BCP-47 identifier; an unsupported locale falls back to en-US.
+    @discardableResult
+    func start(localeId: String) -> Bool {
+        guard !isRunning else { return true }
+        let locale = localeId == HandsfreeManager.systemLocaleId
+            ? Locale.current : Locale(identifier: localeId)
+        guard let rec = SFSpeechRecognizer(locale: locale)
+                ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US")),
+              rec.isAvailable else {
+            onUnavailable?("Speech recognition unavailable")
+            return false
+        }
+        recognizer = rec
+        do {
+            try startEngine()
+        } catch {
+            dbg("handsfree: audio engine failed — \(error)")
+            onUnavailable?("Microphone unavailable")
+            return false
+        }
+        isRunning = true
+        restarts = []
+        startTask()
+        installDeviceListener()
+        dbg("handsfree: mic on (locale=\(rec.locale.identifier), onDevice=\(rec.supportsOnDeviceRecognition))")
+        return true
+    }
+
+    func stop() {
+        guard isRunning || engine != nil else { return }
+        isRunning = false
+        taskGen += 1
+        task?.cancel()
+        task = nil
+        request?.endAudio()
+        request = nil
+        if let engine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        engine = nil
+        removeDeviceListener()
+        onLevel?(0)
+        dbg("handsfree: mic off")
+    }
+
+    /// Drop the current recognition task and open a fresh one. Called after a
+    /// command fires, so the audio already consumed can't be re-delivered.
+    func restartTask() {
+        guard isRunning else { return }
+        startTask()
+    }
+
+    // MARK: Engine
+
+    private func startEngine() throws {
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw NSError(domain: "FloatNote.Handsfree", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "No input format"])
+        }
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            guard let self else { return }
+            self.request?.append(buffer)
+            self.emitLevel(buffer)
+        }
+        engine.prepare()
+        try engine.start()
+        self.engine = engine
+        lastInputDevice = Self.currentInputDevice()
+    }
+
+    private func startTask() {
+        taskGen += 1
+        let gen = taskGen
+        task?.cancel()
+        request?.endAudio()
+
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        // On-device keeps a local-only app local, and lifts the ~1 minute cap
+        // server-based recognition puts on a single request.
+        if recognizer?.supportsOnDeviceRecognition == true { req.requiresOnDeviceRecognition = true }
+        request = req
+
+        task = recognizer?.recognitionTask(with: req) { [weak self] result, error in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                guard self.taskGen == gen, self.isRunning else { return }
+                if let result {
+                    self.onTranscript?(result.bestTranscription.formattedString, result.isFinal)
+                    if result.isFinal { self.scheduleRestart() }
+                    return
+                }
+                if error != nil { self.scheduleRestart() }
+            }
+        }
+    }
+
+    /// A task ends after every pause (and on "no speech detected"), so the
+    /// normal path is simply to open the next one. The rate guard is for the
+    /// abnormal path — a recognizer that fails instantly, forever.
+    private func scheduleRestart() {
+        guard isRunning else { return }
+        let now = Date()
+        restarts = restarts.filter { now.timeIntervalSince($0) < 5 }
+        restarts.append(now)
+        if restarts.count > 8 {
+            dbg("handsfree: recognizer restarting too fast — giving up")
+            stop()
+            onUnavailable?("Speech recognition failed")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.startTask()
+        }
+    }
+
+    private func emitLevel(_ buffer: AVAudioPCMBuffer) {
+        let now = Date()
+        guard now.timeIntervalSince(lastLevelEmit) > 1.0 / 15.0,
+              let channel = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
+        lastLevelEmit = now
+        var sum: Float = 0
+        for i in 0..<Int(buffer.frameLength) { sum += channel[i] * channel[i] }
+        let rms = sqrtf(sum / Float(buffer.frameLength))
+        // −50 dB (room tone) … 0 dB (clipping) mapped onto the waveform's 0…1.
+        let db = 20 * log10f(max(rms, 0.000_001))
+        let level = CGFloat(max(0, min(1, (db + 50) / 50)))
+        DispatchQueue.main.async { [weak self] in self?.onLevel?(level) }
+    }
+
+    // MARK: Input device changes
+
+    /// `AVAudioEngine` binds its input node at creation and never follows the
+    /// default input device, so plugging in AirPods would leave recognition on
+    /// the built-in mic. Rebuild a *fresh* engine when the device actually
+    /// changes — debounced, off the main queue, and only on a real change.
+    /// (Driving this off `AVAudioEngineConfigurationChange` instead caused a
+    /// main-thread rebuild loop that froze the app.)
+    private func installDeviceListener() {
+        guard deviceListener == nil else { return }
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.inputDeviceMayHaveChanged()
+        }
+        deviceListener = block
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, deviceQueue, block)
+    }
+
+    private func removeDeviceListener() {
+        guard let block = deviceListener else { return }
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, deviceQueue, block)
+        deviceListener = nil
+        pendingDeviceRebuild?.cancel()
+        pendingDeviceRebuild = nil
+    }
+
+    private func inputDeviceMayHaveChanged() {
+        let current = Self.currentInputDevice()
+        guard current != 0, current != lastInputDevice else { return }
+        lastInputDevice = current
+        pendingDeviceRebuild?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            DispatchQueue.main.async { self?.rebuildEngine() }
+        }
+        pendingDeviceRebuild = work
+        deviceQueue.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func rebuildEngine() {
+        guard isRunning else { return }
+        dbg("handsfree: input device changed — rebuilding engine")
+        if let engine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        engine = nil
+        do {
+            try startEngine()
+        } catch {
+            dbg("handsfree: engine rebuild failed — \(error)")
+            stop()
+            onUnavailable?("Microphone unavailable")
+            return
+        }
+        startTask()
+    }
+
+    private static func currentInputDevice() -> AudioDeviceID {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &device)
+        return status == noErr ? device : 0
     }
 }

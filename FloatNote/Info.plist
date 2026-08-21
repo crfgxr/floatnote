@@ -24,6 +24,8 @@
     <string>6.0</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>FloatNote needs microphone access for dictation and audio recording.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>FloatNote uses speech recognition to let you talk to Claude Code hands-free.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>FloatNote needs system audio access to record audio from other apps.</string>
 </dict>
