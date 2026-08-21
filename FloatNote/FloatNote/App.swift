@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import AVFoundation
 import AudioToolbox
 import ScreenCaptureKit
@@ -17,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.69.0"
+let APP_VERSION = "v1.69.3"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -26,6 +27,8 @@ let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
 struct FloatNoteApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var vm = EditorViewModel()
+
+    @ObservedObject private var handsfree = HandsfreeManager.shared
 
     var body: some Scene {
         WindowGroup {
@@ -43,6 +46,21 @@ struct FloatNoteApp: App {
                     .keyboardShortcut("e", modifiers: [.command, .shift])
                 Button("Import Notes…") { vm.importNotes() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
+            }
+            // The toolbar's photo button lives in a horizontally scrolling zone,
+            // so it can be off-screen when the terminal panel is open. This menu
+            // item is the always-reachable way to attach an image.
+            CommandGroup(after: .pasteboard) {
+                Button("Insert Image…") { vm.attachImage() }
+                    .keyboardShortcut("i", modifiers: [.command, .option])
+            }
+            // Hands-free voice needs a reachable, *named* way in: the toolbar
+            // has a second mic-shaped button (editor dictation) right next to
+            // it, and one icon among a dozen is not a discoverable switch.
+            CommandGroup(after: .toolbar) {
+                Button(handsfree.isEnabled ? "Turn Off Hands-Free Voice"
+                                           : "Hands-Free Voice") { vm.toggleHandsfree() }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
             }
         }
     }
@@ -68,7 +86,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Immediate delivery of Claude hook events; the timer below still
         // sweeps the spool as a safety net.
-        if let vm { MainActor.assumeIsolated { vm.startClaudeEventWatcher() } }
+        if let vm {
+            MainActor.assumeIsolated {
+                vm.startClaudeEventWatcher()
+                HandsfreeManager.shared.vm = vm
+            }
+        }
 
         // Poll tabs + folders files for external changes (e.g. from MCP server)
         fileWatchTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -94,6 +117,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             else { return event }
             let mods = event.modifierFlags.intersection([.command, .shift, .option, .control])
             if mods == [.command] && key == "w" { return nil }
+            // Cmd+Shift+M → hands-free voice, from anywhere (editor, terminal,
+            // sidebar). The menu item carries the same shortcut; this monitor
+            // sees the key first when focus is inside a terminal.
+            if mods == [.command, .shift] && key == "m" {
+                MainActor.assumeIsolated { vm.toggleHandsfree() }
+                return nil
+            }
+            // Cmd+. — the classic macOS cancel — shuts the voice up without
+            // relying on the mic hearing you over its own playback.
+            if mods == [.command] && key == "." {
+                var stopped = false
+                MainActor.assumeIsolated {
+                    stopped = HandsfreeManager.shared.stopSpeakingFromKeyboard()
+                }
+                if stopped { return nil }
+            }
             // Cmd+F → in-note find bar. Terminals keep their own keys, and the
             // board view has no text to search.
             if mods == [.command] && key == "f",
@@ -108,6 +147,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     handled = true
                 }
                 return handled ? nil : event
+            }
+            // Cmd+V with an IMAGE-ONLY clipboard always goes to the note. Nothing
+            // else in the app can consume an image paste (a shell can't, and when
+            // focus sits on a non-text view AppKit just drops Cmd+V), so routing
+            // it here is unambiguous — and it makes screenshot paste work no
+            // matter what has focus. Clipboards containing text fall through
+            // untouched, so terminal/editor text paste behaves exactly as before.
+            if mods == [.command] && key == "v" {
+                var handled = false
+                MainActor.assumeIsolated {
+                    let pb = NSPasteboard.general
+                    let hasText = !(pb.string(forType: .string) ?? "").isEmpty
+                    let hasImage = pb.availableType(from: [.tiff, .png]) != nil
+                    guard !vm.isBoardVisible, !hasText, hasImage,
+                          let img = NSImage(pasteboard: pb),
+                          let tv = vm.editorCoordinator?.textView as? BlockCaretTextView
+                    else { return }
+                    tv.window?.makeFirstResponder(tv)
+                    tv.insertImage(img)
+                    handled = true
+                }
+                if handled { return nil }
             }
             let isCmd = mods == [.command] && (key == "n" || key == "\r")
             let isShiftEnter = mods == [.shift] && key == "\r"
@@ -327,6 +388,7 @@ struct TabData: Codable {
     var localPath: String? = nil  // optional per-note terminal-folder override; nil = inherit from folder chain
     var jobStatus: String? = nil  // busy label while a job runs on this note ("Summarizing…", MCP-set, …); nil = idle
     var jobStatusAt: Double? = nil  // epoch seconds the status was last set — drives the 30-min stale TTL
+    var isBoardOpen: Bool? = nil  // was the Excalidraw board showing when this note was last left? nil/absent = no
 }
 
 class NoteTab: Identifiable, ObservableObject {
@@ -342,6 +404,10 @@ class NoteTab: Identifiable, ObservableObject {
     @Published var localPath: String? = nil
     /// Number of unchecked (`☐`) checklist items in this note. Drives the sidebar badge.
     @Published var uncheckedCount: Int = 0
+    /// Whether this note was showing its Excalidraw board rather than the text
+    /// editor when it was last left. Restored on the next visit so the board
+    /// stays "the view" for notes that are really diagrams.
+    var isBoardOpen: Bool = false
     /// Busy label while a job (transcribe/summarize, or an external MCP-set job)
     /// runs on this note. nil = idle. Drives the blue sidebar pulse.
     @Published var jobStatus: String? = nil
@@ -386,7 +452,8 @@ class NoteTab: Identifiable, ObservableObject {
             folderId: folderId?.uuidString,
             localPath: localPath,
             jobStatus: jobStatus,
-            jobStatusAt: jobStatusAt?.timeIntervalSince1970
+            jobStatusAt: jobStatusAt?.timeIntervalSince1970,
+            isBoardOpen: isBoardOpen
         )
     }
 
@@ -399,6 +466,7 @@ class NoteTab: Identifiable, ObservableObject {
         tab.localPath = data.localPath
         tab.jobStatus = data.jobStatus
         tab.jobStatusAt = data.jobStatusAt.map { Date(timeIntervalSince1970: $0) }
+        tab.isBoardOpen = data.isBoardOpen ?? false
         tab.recomputeUncheckedFromHTML()
         return tab
     }
@@ -462,10 +530,19 @@ let TRASH_FOLDER_ID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
 /// One terminal in the panel's tab bar. Identified for dedup by `path` (the
 /// shell's working directory); `label` is the folder name shown on the chip.
-struct TerminalTab: Identifiable, Equatable {
+struct TerminalTab: Identifiable, Equatable, Codable {
     let id: UUID
     let path: String
     let label: String
+    /// True for a pane the user explicitly added (toolbar + / Cmd+N) rather than
+    /// one opened by note routing. Such a pane always starts a fresh `claude`
+    /// instead of `--continue`-ing the conversation another pane may be running.
+    var freshClaude: Bool = false
+    /// The note this pane belongs to. Several panes can share a project
+    /// directory, so path alone no longer identifies "the note's terminal" —
+    /// this binding does. At most one pane is bound to a given note (the most
+    /// recent binding wins); nil = unbound, reachable only by path fallback.
+    var noteId: UUID? = nil
 }
 
 // MARK: - ViewModel
@@ -511,9 +588,39 @@ class EditorViewModel: ObservableObject {
     /// tab maps to a mounted SwiftTermContainer (and its shell process), kept
     /// alive across re-renders. Hiding the panel only unmounts the view — the
     /// shells survive (hide ≠ kill). Driven by the active note's folder route.
-    @Published var terminalTabs: [TerminalTab] = []
+    @Published var terminalTabs: [TerminalTab] = [] {
+        didSet { saveTerminalTabs() }
+    }
     /// The currently visible terminal tab.
-    @Published var activeTerminalId: UUID?
+    @Published var activeTerminalId: UUID? {
+        didSet { saveTerminalTabs() }
+    }
+    /// True while restoring panes at launch, so the restore doesn't write back
+    /// over the very state it is reading.
+    private var isRestoringTerminals = false
+    /// Which pane each note last used. `TerminalTab.noteId` answers "whose pane
+    /// is this" for chip → note; this answers "which pane does this note want",
+    /// which is what has to stay stable when panes are reordered or when
+    /// several notes share one project directory. Persisted with the panes.
+    var terminalForNote: [UUID: UUID] = [:] {
+        didSet { saveTerminalTabs() }
+    }
+    /// Terminal chip currently being dragged along the tab bar.
+    @Published var draggingTerminalId: UUID?
+
+    /// Move the dragged pane to sit where `destId` is. Hover-swap, matching how
+    /// note tabs reorder; the new order persists like any other pane change.
+    func moveTerminal(from sourceId: UUID, to destId: UUID) {
+        guard sourceId != destId,
+              let from = terminalTabs.firstIndex(where: { $0.id == sourceId }),
+              let to = terminalTabs.firstIndex(where: { $0.id == destId }) else { return }
+        dbg("moveTerminal before: " + terminalTabs.map { "\($0.label)/note=\($0.noteId?.uuidString.prefix(8) ?? "nil")" }.joined(separator: ", "))
+        withAnimation(.easeInOut(duration: 0.18)) {
+            terminalTabs.move(fromOffsets: IndexSet(integer: from),
+                              toOffset: to > from ? to + 1 : to)
+        }
+        dbg("moveTerminal after:  " + terminalTabs.map { "\($0.label)/note=\($0.noteId?.uuidString.prefix(8) ?? "nil")" }.joined(separator: ", "))
+    }
 
     /// Most-recently-active note per folder, so selecting a terminal tab can return
     /// the user to where they last were in that folder (reverse of folder routing).
@@ -579,14 +686,48 @@ class EditorViewModel: ObservableObject {
 
     /// Activate the tab for `path` if one exists, else create it. Opens the panel.
     func switchToRoute(path: String, label: String) {
-        if let existing = terminalTabs.first(where: { $0.path == path }) {
-            activeTerminalId = existing.id
+        // Prefer the pane bound to this note, so a project with several panes
+        // returns each note to its own. Fall back to any pane on the path (the
+        // single-pane case, and notes that share a project without their own
+        // pane), and only then create one — bound to the note that opened it.
+        // Resolution order, most specific first. Deliberately NOT "the first pane
+        // on this path" — that made the mapping depend on tab order, so dragging
+        // a chip handed the note a different terminal.
+        let chosen: UUID
+        if let remembered = activeTabId.flatMap({ terminalForNote[$0] }),
+           terminalTabs.contains(where: { $0.id == remembered && $0.path == path }) {
+            chosen = remembered                                     // this note's own pane
+        } else if let own = terminalTabs.first(where: { $0.noteId == activeTabId && $0.path == path }) {
+            chosen = own.id                                         // pane that claims this note
+        } else if let free = terminalTabs.first(where: { $0.path == path && $0.noteId == nil }) {
+            chosen = free.id                                        // an unclaimed pane (e.g. restored)
+        } else if let existing = terminalTabs.first(where: { $0.path == path }) {
+            chosen = existing.id                                    // share one
         } else {
             let id = UUID()
-            terminalTabs.append(TerminalTab(id: id, path: path, label: label))
-            activeTerminalId = id
+            terminalTabs.append(TerminalTab(id: id, path: path, label: label, noteId: activeTabId))
+            chosen = id
+        }
+        activeTerminalId = chosen
+        if let note = activeTabId {
+            terminalForNote[note] = chosen
+            // Give an unclaimed pane an owner so its chip can navigate back.
+            if let i = terminalTabs.firstIndex(where: { $0.id == chosen }),
+               terminalTabs[i].noteId == nil {
+                terminalTabs[i].noteId = note
+            }
         }
         isTerminalVisible = true
+    }
+
+    /// Bind `terminalId` to `noteId`, clearing any other pane's claim on that
+    /// note. One note ↔ at most one pane keeps route resolution unambiguous.
+    private func bindTerminal(_ terminalId: UUID, toNote noteId: UUID?) {
+        guard let noteId else { return }
+        for i in terminalTabs.indices {
+            if terminalTabs[i].noteId == noteId { terminalTabs[i].noteId = nil }
+            if terminalTabs[i].id == terminalId { terminalTabs[i].noteId = noteId }
+        }
     }
 
     /// Expand `~`, trim whitespace; returns nil for nil/empty. Central helper so
@@ -634,10 +775,67 @@ class EditorViewModel: ObservableObject {
     func selectTerminal(_ id: UUID) {
         activeTerminalId = id
         focusActiveTerminal()
-        guard let tab = terminalTabs.first(where: { $0.id == id }),
-              let folder = folderForTerminalPath(tab.path),
+        guard let tab = terminalTabs.first(where: { $0.id == id }) else { return }
+        dbg("selectTerminal \(tab.label) noteId=\(tab.noteId?.uuidString.prefix(8) ?? "nil")")
+        // A pane bound to a live note goes straight back to it; the note→terminal
+        // route then resolves to this same pane, so there is no ping-pong.
+        if let boundId = tab.noteId, let bound = tabs.first(where: { $0.id == boundId }),
+           bound.folderId != TRASH_FOLDER_ID {
+            if bound.id != activeTabId { switchTab(bound.id) }
+            return
+        }
+        // Unbound (or its note is gone): fall back to the folder's last note.
+        guard let folder = folderForTerminalPath(tab.path),
               let note = noteToActivate(forTerminalFolder: folder) else { return }
         if note.id != activeTabId { switchTab(note.id) }
+    }
+
+    // MARK: - Terminal pane persistence
+
+    /// Open panes survive a quit. The *shells* can't — those die with the app —
+    /// but the tabs, their working directories and their note bindings do, and
+    /// each restored pane re-runs `claude --continue`, so a relaunch lands back
+    /// on the same projects with their conversations resumed.
+    private func saveTerminalTabs() {
+        guard !isRestoringTerminals else { return }
+        let defaults = UserDefaults.standard
+        if let data = try? JSONEncoder().encode(terminalTabs) {
+            defaults.set(data, forKey: "fn.terminalTabs")
+        }
+        let map = Dictionary(uniqueKeysWithValues:
+            terminalForNote.map { ($0.key.uuidString, $0.value.uuidString) })
+        defaults.set(map, forKey: "fn.terminalForNote")
+        defaults.set(activeTerminalId?.uuidString, forKey: "fn.activeTerminalId")
+    }
+
+    /// Rebuild the pane list saved by the previous run. Call before the launch
+    /// route is applied, so `switchToRoute` dedups onto a restored pane instead
+    /// of opening a second one for the same project.
+    func restoreTerminalTabs() {
+        let defaults = UserDefaults.standard
+        guard let data = defaults.data(forKey: "fn.terminalTabs"),
+              let saved = try? JSONDecoder().decode([TerminalTab].self, from: data),
+              !saved.isEmpty else { return }
+        isRestoringTerminals = true
+        defer { isRestoringTerminals = false }
+
+        if let map = defaults.dictionary(forKey: "fn.terminalForNote") as? [String: String] {
+            terminalForNote = Dictionary(uniqueKeysWithValues: map.compactMap { k, v in
+                guard let n = UUID(uuidString: k), let t = UUID(uuidString: v) else { return nil }
+                return (n, t)
+            })
+        }
+
+        // Drop panes whose directory is gone (deleted or unmounted project).
+        terminalTabs = saved.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if let raw = defaults.string(forKey: "fn.activeTerminalId"),
+           let id = UUID(uuidString: raw),
+           terminalTabs.contains(where: { $0.id == id }) {
+            activeTerminalId = id
+        } else {
+            activeTerminalId = terminalTabs.first?.id
+        }
+        dbg("restored \(terminalTabs.count) terminal pane(s)")
     }
 
     /// Manual "+": a fresh tab at the active note's route, else HOME.
@@ -646,7 +844,12 @@ class EditorViewModel: ObservableObject {
         let id = UUID()
         terminalTabs.append(TerminalTab(id: id,
                                         path: route?.path ?? NSHomeDirectory(),
-                                        label: route?.label ?? "terminal"))
+                                        label: route?.label ?? "terminal",
+                                        freshClaude: true))
+        // The pane the user just asked for becomes this note's pane, so
+        // returning to the note comes back here rather than to the older one.
+        bindTerminal(id, toNote: activeTabId)
+        if let note = activeTabId { terminalForNote[note] = id }
         activeTerminalId = id
         isTerminalVisible = true
         focusActiveTerminal()
@@ -751,12 +954,29 @@ class EditorViewModel: ObservableObject {
         }
     }
 
+    /// Toggle hands-free voice. Everything that can turn it on goes through
+    /// here — toolbar button, ⌘⇧M, menu item — so the route gate and its
+    /// logging live in one place instead of being duplicated per affordance.
+    /// Turning it *off* never needs a route.
+    func toggleHandsfree() {
+        let manager = HandsfreeManager.shared
+        let hasRoute = terminalRoute(for: activeTab) != nil
+        dbg("handsfree: toggle requested (enabled=\(manager.isEnabled), route=\(hasRoute))")
+        guard hasRoute || manager.isEnabled else {
+            // Nothing to talk to: no project folder is linked for this note.
+            NSSound.beep()
+            return
+        }
+        manager.toggle()
+    }
+
     /// Close (kill) a single terminal session. Activates a neighbor; closing the
     /// last one hides the panel.
     func closeTerminal(_ id: UUID) {
         // Sessions are owned by TerminalSessions (not the SwiftUI view), so the
         // shell is killed only here on explicit close — never on hide.
         TerminalSessions.shared.close(id)
+        terminalForNote = terminalForNote.filter { $0.value != id }
         guard let idx = terminalTabs.firstIndex(where: { $0.id == id }) else { return }
         terminalTabs.remove(at: idx)
         if activeTerminalId == id {
@@ -872,7 +1092,18 @@ class EditorViewModel: ObservableObject {
     /// whose date differs was written by MCP.
     private var lastBoardModDates: [UUID: Date] = [:]
 
-    func toggleBoard() { isBoardVisible.toggle() }
+    func toggleBoard() {
+        isBoardVisible.toggle()
+        persistBoardVisibility()
+    }
+
+    /// Remember on the active note whether its board is showing, so the next
+    /// visit (and the next launch) restores the same view.
+    func persistBoardVisibility() {
+        guard let tab = activeTab, tab.isBoardOpen != isBoardVisible else { return }
+        tab.isBoardOpen = isBoardVisible
+        saveTabsLocal()
+    }
 
     /// True when the given note has a non-empty board.
     func boardHasContent(_ id: UUID?) -> Bool {
@@ -918,6 +1149,7 @@ class EditorViewModel: ObservableObject {
                 NotificationCenter.default.post(name: .floatnoteBoardExternallyChanged, object: id)
             } else {
                 isBoardVisible = true
+                persistBoardVisibility()
             }
         }
     }
@@ -954,6 +1186,19 @@ class EditorViewModel: ObservableObject {
     /// (the top/bottom edge of another folder's row). Nil while the hover means
     /// "nest inside", which uses `dropTargetFolderId`'s fill instead.
     @Published var folderInsertIndicator: FolderInsertIndicator?
+    /// True while a sidebar note or folder drag is in flight. Drop indicators
+    /// only render while this holds.
+    var isDragging: Bool { draggingTabId != nil || draggingFolderId != nil }
+    /// Wipe every transient sidebar drag/drop indicator. MUST be called from
+    /// each drag start and each `performDrop` — a drop handled by one delegate
+    /// (e.g. a note row) otherwise leaves *another* row's indicator painted
+    /// forever, which reads as a bogus "selected folder" highlight.
+    func clearDragIndicators() {
+        dropTargetFolderId = nil
+        folderInsertIndicator = nil
+        draggingTabId = nil
+        draggingFolderId = nil
+    }
     @Published var isRecording = false
     @Published var isSavingRecording = false
     @Published var recordPermissionDenied = false
@@ -1049,7 +1294,11 @@ class EditorViewModel: ObservableObject {
             ?? tabs.first(where: { isVisible($0) && normalize($0.title).contains(preferredTitle) })
             ?? tabs.first(where: { isVisible($0) })
             ?? tabs[0]
+        // Bring back last run's terminal panes first: the route applied at the
+        // end of this load then dedups onto them rather than opening duplicates.
+        restoreTerminalTabs()
         activeTabId = firstTab.id
+        isBoardVisible = firstTab.isBoardOpen  // cold start lands on the view the note was left on
         currentHTML = firstTab.html
         lastSavedHTML = firstTab.lastSavedHTML
         currentRecordingPath = firstTab.recordingPaths.last
@@ -1258,10 +1507,17 @@ class EditorViewModel: ObservableObject {
         saveFoldersLocal()
     }
 
+    /// Submitting an empty name is a cancel, not a rename: the folder keeps the
+    /// name it had. "Untitled" is only a last resort when there's nothing to keep.
     func renameFolder(_ id: UUID, to newName: String) {
         guard let f = folders.first(where: { $0.id == id }) else { return }
         let trimmed = newName.trimmingCharacters(in: .whitespaces)
-        f.name = trimmed.isEmpty ? "Untitled" : trimmed
+        if !trimmed.isEmpty {
+            f.name = trimmed
+        } else if f.name.trimmingCharacters(in: .whitespaces).isEmpty {
+            f.name = "Untitled"
+        }
+        folders = folders  // re-fire @Published (nested prop mutated)
         editingFolderId = nil
         saveFoldersLocal()
     }
@@ -1453,6 +1709,7 @@ class EditorViewModel: ObservableObject {
             }
             ExcalidrawStore.deleteBoard(for: tab.id)
             boardContentIds.remove(tab.id)
+            ImageStore.deleteImages(inHTML: tab.html)
         }
         tabs.removeAll { $0.folderId.map { doomedFolderIds.contains($0) } ?? false }
         folders.removeAll { doomedFolderIds.contains($0.id) }
@@ -1473,6 +1730,7 @@ class EditorViewModel: ObservableObject {
             }
             ExcalidrawStore.deleteBoard(for: tab.id)
             boardContentIds.remove(tab.id)
+            ImageStore.deleteImages(inHTML: tab.html)
         }
         tabs.removeAll { $0.folderId == TRASH_FOLDER_ID }
 
@@ -1485,6 +1743,7 @@ class EditorViewModel: ObservableObject {
             }
             ExcalidrawStore.deleteBoard(for: tab.id)
             boardContentIds.remove(tab.id)
+            ImageStore.deleteImages(inHTML: tab.html)
         }
         tabs.removeAll { tab in tab.folderId.map { trashedIds.contains($0) } ?? false }
         folders.removeAll { $0.isTrashed }
@@ -1505,6 +1764,9 @@ class EditorViewModel: ObservableObject {
         tab.folderId = folderId
         tabs = tabs  // re-fire @Published so sidebar repartitions
         saveTabsLocal()
+        // The note's inherited route changed with its folder — re-resolve it so
+        // the terminal follows immediately instead of waiting for a tab switch.
+        if tabId == activeTabId { applyTerminalRouteForActiveNote() }
     }
 
     /// Convenience: switch to the preferred home note ("agentforce tasks")
@@ -1547,8 +1809,9 @@ class EditorViewModel: ObservableObject {
     func switchTab(_ id: UUID) {
         guard id != activeTabId, let newTab = tabs.first(where: { $0.id == id }) else { return }
 
-        // Return to note view — avoid dropping the user onto another note's board.
-        isBoardVisible = false
+        // Restore whichever view this note was last left on — the board stays
+        // "the view" for notes that are really diagrams.
+        isBoardVisible = newTab.isBoardOpen
 
         // Commit any active rename
         if let editId = editingTabId {
@@ -1670,9 +1933,10 @@ class EditorViewModel: ObservableObject {
         for recPath in tabs[index].recordingPaths {
             try? FileManager.default.removeItem(atPath: recPath)
         }
-        // Delete the note's Excalidraw board, if any.
+        // Delete the note's Excalidraw board and stored images, if any.
         ExcalidrawStore.deleteBoard(for: id)
         boardContentIds.remove(id)
+        ImageStore.deleteImages(inHTML: tabs[index].html)
 
         // Switch away if deleting the active tab
         if activeTabId == id {
@@ -1696,15 +1960,19 @@ class EditorViewModel: ObservableObject {
               let fromIdx = tabs.firstIndex(where: { $0.id == sourceId }),
               let toIdx = tabs.firstIndex(where: { $0.id == destId }) else { return }
         let destFolderId = tabs[toIdx].folderId
+        let folderChanged = tabs[fromIdx].folderId != destFolderId
         withAnimation(.easeInOut(duration: 0.2)) {
             // Adopt the destination's folder so dropping on a note that lives
             // inside a folder places the dragged note in that same folder.
-            if tabs[fromIdx].folderId != destFolderId {
+            if folderChanged {
                 tabs[fromIdx].folderId = destFolderId
             }
             tabs.move(fromOffsets: IndexSet(integer: fromIdx), toOffset: toIdx > fromIdx ? toIdx + 1 : toIdx)
         }
         saveTabsLocal()
+        // Reordering onto a note in another folder reparents the dragged note,
+        // so its inherited route changed — re-resolve it (see moveTab(_:toFolder:)).
+        if folderChanged && sourceId == activeTabId { applyTerminalRouteForActiveNote() }
     }
 
     private var saveTimer: Timer?
@@ -1757,6 +2025,20 @@ class EditorViewModel: ObservableObject {
                 self.status = "Saved"
             }
         }
+    }
+
+    /// Toolbar "photo" button: pick an image file and insert it at the caret.
+    func attachImage() {
+        guard let tv = editorCoordinator?.textView as? BlockCaretTextView else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
+        panel.title = "Attach Images"
+        guard panel.runModal() == .OK else { return }
+        let images = panel.urls.compactMap { NSImage(contentsOf: $0) }
+        guard !images.isEmpty else { return }
+        tv.window?.makeFirstResponder(tv)
+        tv.insertImages(images)
     }
 
     func performFormat(_ action: FormatAction) {
@@ -2128,6 +2410,12 @@ class EditorViewModel: ObservableObject {
             let replacement = Tokens.Typography.editorFont(size: newSize, bold: isBold, italic: isItalic)
             attrStr.addAttribute(.font, value: replacement, range: range)
         }
+
+        // Swap persisted ⟦img:…⟧ markers back into live image attachments.
+        // Single choke point: launch, tab switch, reload and external merge all
+        // load through here.
+        attrStr.resolveImageMarkers(bodyFont: Tokens.Typography.body(),
+                                    bodyColor: theme.editorTextNS)
 
         return attrStr
     }
@@ -2959,16 +3247,25 @@ struct TerminalResizeHandle: View {
 
 struct TerminalPanel: View {
     @EnvironmentObject var vm: EditorViewModel
+    @ObservedObject private var handsfree = HandsfreeManager.shared
 
     var body: some View {
         VStack(spacing: 0) {
             tabBar
             Divider()
+            if handsfree.isEnabled {
+                HandsfreeBar()
+                Divider()
+            }
             if let activeId = vm.activeTerminalId,
                let tab = vm.terminalTabs.first(where: { $0.id == activeId }) {
-                SwiftTermContainer(id: tab.id, cwd: tab.path)
+                SwiftTermContainer(id: tab.id, cwd: tab.path, freshClaude: tab.freshClaude)
                     .id(tab.id)
                     .background(Color.black)
+                    // Scrolled up? Say how far behind the live output we are.
+                    .overlay(alignment: .bottomTrailing) {
+                        TerminalScrollPill(terminalId: tab.id)
+                    }
             } else {
                 Color.black
             }
@@ -3024,10 +3321,37 @@ struct TerminalPanel: View {
         .overlay(alignment: .top) {
             if isActive { Rectangle().fill(Color.accentColor).frame(height: 2) }
         }
+        .opacity(vm.draggingTerminalId == tab.id ? 0.4 : 1)
         .contentShape(Rectangle())
         .onTapGesture { vm.selectTerminal(tab.id) }
         .help(tab.path)
+        .onDrag {
+            vm.draggingTerminalId = tab.id
+            return NSItemProvider(object: tab.id.uuidString as NSString)
+        }
+        .onDrop(of: [.text], delegate: TerminalTabDropDelegate(tab: tab, vm: vm))
     }
+}
+
+/// Reorders terminal chips as the drag passes over them, so the bar rearranges
+/// under the cursor instead of waiting for the drop.
+struct TerminalTabDropDelegate: DropDelegate {
+    let tab: TerminalTab
+    let vm: EditorViewModel
+
+    func dropEntered(info: DropInfo) {
+        guard let dragId = vm.draggingTerminalId, dragId != tab.id else { return }
+        vm.moveTerminal(from: dragId, to: tab.id)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        vm.draggingTerminalId = nil
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func validateDrop(info: DropInfo) -> Bool { true }
+    func dropExited(info: DropInfo) {}
 }
 
 extension Notification.Name {
@@ -3158,17 +3482,24 @@ struct SidebarFolderView: View {
     @ObservedObject var folder: Folder
     @EnvironmentObject var vm: EditorViewModel
     @FocusState private var isFieldFocused: Bool
+    /// Rename buffer. Editing must NOT write straight through to `folder.name`,
+    /// or clearing the field destroys the old name before submit can fall back
+    /// to it.
+    @State private var draftName: String = ""
 
     private var tabsInFolder: [NoteTab] { vm.tabs.filter { $0.folderId == folder.id } }
     /// Live subfolders nested directly under this folder.
     private var subfolders: [Folder] { vm.folders.filter { !$0.isTrashed && $0.parentId == folder.id } }
-    private var isDropTarget: Bool { vm.dropTargetFolderId == folder.id }
+    /// A folder row has no "selected" state — the only thing that fills it is an
+    /// in-flight drag. The `isDragging` gate makes a leaked `dropTargetFolderId`
+    /// unpaintable, so a forgotten reset can never look like a selection.
+    private var isDropTarget: Bool { vm.dropTargetFolderId == folder.id && vm.isDragging }
     /// Measured height of the header row, used to split it into the
     /// above / inside / below drop zones.
     @State private var rowHeight: CGFloat = 0
     /// Edge to draw the sibling insertion line on, if this row is the target.
     private var insertEdge: Bool? {
-        guard let ind = vm.folderInsertIndicator, ind.id == folder.id else { return nil }
+        guard vm.isDragging, let ind = vm.folderInsertIndicator, ind.id == folder.id else { return nil }
         return ind.below
     }
 
@@ -3188,12 +3519,12 @@ struct SidebarFolderView: View {
                     .foregroundColor(.secondary)
 
                 if vm.editingFolderId == folder.id {
-                    TextField("", text: $folder.name)
+                    TextField("", text: $draftName)
                         .textFieldStyle(.plain)
                         .font(.system(size: 12, weight: .semibold))
                         .focused($isFieldFocused)
-                        .onSubmit { vm.renameFolder(folder.id, to: folder.name) }
-                        .onAppear { isFieldFocused = true }
+                        .onSubmit { vm.renameFolder(folder.id, to: draftName) }
+                        .onAppear { draftName = folder.name; isFieldFocused = true }
                 } else {
                     Text(folder.name)
                         .font(.system(size: 12, weight: .semibold))
@@ -3250,8 +3581,8 @@ struct SidebarFolderView: View {
             }
             .onDrop(of: [.text], delegate: FolderDropDelegate(folderId: folder.id, vm: vm, rowHeight: rowHeight))
             .onDrag {
+                vm.clearDragIndicators()
                 vm.draggingFolderId = folder.id
-                vm.draggingTabId = nil
                 return NSItemProvider(object: folder.id.uuidString as NSString)
             }
 
@@ -3338,12 +3669,12 @@ struct FolderDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         let edge = siblingEdge(at: info.location)
-        vm.dropTargetFolderId = nil
-        vm.folderInsertIndicator = nil
+        let dragFolderId = vm.draggingFolderId
+        let dragTabId = vm.draggingTabId
+        vm.clearDragIndicators()
         // Dragging a folder → reorder next to this one, or nest it under this
         // folder (root when folderId == nil).
-        if let dragFolder = vm.draggingFolderId {
-            vm.draggingFolderId = nil
+        if let dragFolder = dragFolderId {
             if let below = edge, let targetId = folderId {
                 vm.moveFolder(dragFolder, relativeTo: targetId, below: below)
             } else {
@@ -3352,9 +3683,8 @@ struct FolderDropDelegate: DropDelegate {
             return true
         }
         // Dragging a note → move it into this folder (or root).
-        guard let draggingId = vm.draggingTabId else { return false }
+        guard let draggingId = dragTabId else { return false }
         vm.moveTab(draggingId, toFolder: folderId)
-        vm.draggingTabId = nil
         return true
     }
 }
@@ -3434,6 +3764,7 @@ struct SidebarNoteItemView: View {
             if vm.editingTabId != tab.id { vm.switchTab(tab.id) }
         }
         .onDrag {
+            vm.clearDragIndicators()
             vm.draggingTabId = tab.id
             return NSItemProvider(object: tab.id.uuidString as NSString)
         }
@@ -3856,6 +4187,7 @@ struct TabItemView: View {
             }
         }
         .onDrag {
+            vm.clearDragIndicators()
             vm.draggingTabId = tab.id
             return NSItemProvider(object: tab.id.uuidString as NSString)
         }
@@ -3868,7 +4200,9 @@ struct TabDropDelegate: DropDelegate {
     let vm: EditorViewModel
 
     func performDrop(info: DropInfo) -> Bool {
-        vm.draggingTabId = nil
+        // Clears the folder indicators too: the drag may have passed over a
+        // folder header on its way here, which would otherwise stay filled.
+        vm.clearDragIndicators()
         return true
     }
 
@@ -3983,14 +4317,15 @@ struct FlowLayout: Layout {
 
 struct FontPicker: View {
     @EnvironmentObject var vm: EditorViewModel
-    @State private var current: String = Tokens.currentFontFamily
+    /// Bound to the defaults key rather than held as `@State` so the label also
+    /// follows changes made from the toolbar's overflow menu.
+    @AppStorage(Tokens.fontFamilyKey) private var current: String = Tokens.systemFontName
 
     var body: some View {
         Menu {
             ForEach(Tokens.fontOptions, id: \.self) { name in
                 Button {
                     Tokens.setFontFamily(name)
-                    current = name
                     vm.reloadActive()  // re-render the document in the new font, live
                 } label: {
                     HStack {
@@ -4024,19 +4359,20 @@ struct FontPicker: View {
 
 struct BodySizePicker: View {
     @EnvironmentObject var vm: EditorViewModel
-    @State private var currentSize: Int = Int(Tokens.currentBodySize)
+    /// See `FontPicker.current` — bound to defaults so the overflow menu's
+    /// "Text Size" submenu updates this label too.
+    @AppStorage(Tokens.bodySizeKey) private var currentSize: Double = 14
 
     var body: some View {
         Menu {
             ForEach(Tokens.bodySizeOptions, id: \.self) { size in
                 Button("\(Int(size)) pt") {
                     Tokens.setBodySize(size)
-                    currentSize = Int(size)
                     vm.reloadActive()
                 }
             }
         } label: {
-            Text("\(currentSize)pt")
+            Text("\(Int(currentSize))pt")
                 .font(.system(size: 10, weight: .medium, design: .rounded))
                 .foregroundColor(.secondary)
                 .frame(height: 22)
@@ -4049,11 +4385,69 @@ struct BodySizePicker: View {
     }
 }
 
+// MARK: - Toolbar Overflow
+
+/// One control of the toolbar's scrollable middle zone. Declaration order is
+/// toolbar order, and both the inline buttons and the overflow menu are keyed
+/// off these cases so a control can never exist in one and be missing from the
+/// other.
+enum ToolItem: String, CaseIterable, Identifiable {
+    case h1, h2, h3, body, font, size
+    case bold, italic, underline
+    case bullet, check, link, image, divider
+    case mic, record
+
+    var id: String { rawValue }
+}
+
+/// Frames of the middle-zone controls, measured in the scroll view's own
+/// coordinate space — origin is the viewport's left edge, so the values shift
+/// as the user scrolls and a control is off-screen exactly when its frame
+/// leaves `0..<viewportWidth`.
+struct ToolItemFramesKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// Width of the visible part of the scroll zone.
+struct ToolViewportKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+extension View {
+    /// Report this control's frame so `FormatToolbar` can tell whether it is
+    /// still inside the visible part of the scroll zone.
+    func overflowTracked(_ item: ToolItem, space: String) -> some View {
+        background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: ToolItemFramesKey.self,
+                    value: [item.rawValue: geo.frame(in: .named(space))]
+                )
+            }
+        )
+    }
+}
+
 // MARK: - Format Toolbar
 
 struct FormatToolbar: View {
     @EnvironmentObject var vm: EditorViewModel
+    @ObservedObject private var handsfree = HandsfreeManager.shared
     @State private var hoveredButton: String?
+
+    /// Controls currently scrolled/clipped out of the middle zone. Drives the
+    /// `chevron.down` overflow menu; empty = no caret.
+    @State private var hiddenItems: [ToolItem] = []
+    @State private var itemFrames: [String: CGRect] = [:]
+    @State private var viewportWidth: CGFloat = 0
+
+    private let scrollSpace = "fn.toolbarScroll"
 
     var body: some View {
         HStack(spacing: 0) {
@@ -4062,56 +4456,213 @@ struct FormatToolbar: View {
 
             thinDivider()
 
-            // Scrollable middle zone — all format groups live here so nothing
-            // clips when the window is narrow.
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    Group {
-                        toolBtn("H1", id: "h1") { vm.performFormat(.heading1) }
-                        toolBtn("H2", id: "h2") { vm.performFormat(.heading2) }
-                        toolBtn("H3", id: "h3") { vm.performFormat(.heading3) }
-                        toolBtn("Body", id: "body") { vm.performFormat(.body) }
-                        FontPicker().environmentObject(vm)
-                        BodySizePicker().environmentObject(vm)
-                    }
+            // Flexible middle zone — takes whatever width the fixed trailing
+            // controls leave over, and scrolls whatever doesn't fit.
+            middleZone
 
-                    thinDivider()
-
-                    Group {
-                        iconBtn("bold", id: "bold") { vm.performFormat(.bold) }
-                        iconBtn("italic", id: "italic") { vm.performFormat(.italic) }
-                        iconBtn("underline", id: "underline") { vm.performFormat(.underline) }
-                    }
-
-                    thinDivider()
-
-                    Group {
-                        iconBtn("list.bullet", id: "bullet") { vm.performFormat(.bulletList) }
-                        iconBtn("checklist", id: "check") { vm.performFormat(.checklist) }
-                        iconBtn("link", id: "link") { vm.performFormat(.link) }
-                        iconBtn("minus", id: "divider") { vm.performFormat(.divider) }
-                    }
-
-                    thinDivider()
-
-                    Group {
-                        micButton
-                        recordButton
-                    }
-                }
-            }
-            .layoutPriority(1)
-
-            // Trailing: board toggle + terminal toggle + theme + pin + folder chip
-            boardButton
-            terminalButton
-            themeButton
-            pinButton
-            folderChip
+            // Trailing: overflow caret + board toggle + terminal toggle
+            // (+ new terminal) + hands-free + theme + pin + folder chip.
+            trailingControls
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .background(vm.theme.chromeBackground)
+    }
+
+    /// The scrollable format groups. Every control reports its frame through
+    /// `overflowTracked` so `recomputeHidden()` knows what fell out of view.
+    private var middleZone: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 0) {
+                Group {
+                    toolBtn("H1", id: "h1") { vm.performFormat(.heading1) }
+                        .overflowTracked(.h1, space: scrollSpace)
+                    toolBtn("H2", id: "h2") { vm.performFormat(.heading2) }
+                        .overflowTracked(.h2, space: scrollSpace)
+                    toolBtn("H3", id: "h3") { vm.performFormat(.heading3) }
+                        .overflowTracked(.h3, space: scrollSpace)
+                    toolBtn("Body", id: "body") { vm.performFormat(.body) }
+                        .overflowTracked(.body, space: scrollSpace)
+                    FontPicker().environmentObject(vm)
+                        .overflowTracked(.font, space: scrollSpace)
+                    BodySizePicker().environmentObject(vm)
+                        .overflowTracked(.size, space: scrollSpace)
+                }
+
+                thinDivider()
+
+                Group {
+                    iconBtn("bold", id: "bold") { vm.performFormat(.bold) }
+                        .overflowTracked(.bold, space: scrollSpace)
+                    iconBtn("italic", id: "italic") { vm.performFormat(.italic) }
+                        .overflowTracked(.italic, space: scrollSpace)
+                    iconBtn("underline", id: "underline") { vm.performFormat(.underline) }
+                        .overflowTracked(.underline, space: scrollSpace)
+                }
+
+                thinDivider()
+
+                Group {
+                    iconBtn("list.bullet", id: "bullet") { vm.performFormat(.bulletList) }
+                        .overflowTracked(.bullet, space: scrollSpace)
+                    iconBtn("checklist", id: "check") { vm.performFormat(.checklist) }
+                        .overflowTracked(.check, space: scrollSpace)
+                    iconBtn("link", id: "link") { vm.performFormat(.link) }
+                        .overflowTracked(.link, space: scrollSpace)
+                    iconBtn("photo", id: "image") { vm.attachImage() }
+                        .overflowTracked(.image, space: scrollSpace)
+                    iconBtn("minus", id: "divider") { vm.performFormat(.divider) }
+                        .overflowTracked(.divider, space: scrollSpace)
+                }
+
+                thinDivider()
+
+                Group {
+                    micButton.overflowTracked(.mic, space: scrollSpace)
+                    recordButton.overflowTracked(.record, space: scrollSpace)
+                }
+            }
+        }
+        .coordinateSpace(name: scrollSpace)
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: ToolViewportKey.self, value: geo.size.width)
+            }
+        )
+        .onPreferenceChange(ToolItemFramesKey.self) { frames in
+            itemFrames = frames
+            recomputeHidden()
+        }
+        .onPreferenceChange(ToolViewportKey.self) { width in
+            viewportWidth = width
+            recomputeHidden()
+        }
+    }
+
+    /// Fixed controls. Higher layout priority than the (greedy) scroll zone so
+    /// these are never the ones squeezed off the edge — the caret in particular
+    /// has to stay reachable, since it's the only way back to what got clipped.
+    private var trailingControls: some View {
+        HStack(spacing: 0) {
+            overflowMenu
+            boardButton
+            terminalButton
+            newTerminalButton
+            handsfreeButton
+            themeButton
+            pinButton
+            folderChip
+        }
+        .layoutPriority(1)
+    }
+
+    /// Recompute which middle-zone controls sit outside the visible viewport.
+    ///
+    /// Showing the caret shrinks that viewport, which can push one more control
+    /// out — that converges rather than oscillating, because a viewport wide
+    /// enough to hide nothing *with* the caret hides nothing without it either.
+    /// Caret exposing whatever the middle zone clipped, so a narrow window
+    /// hides controls rather than losing them. Absent entirely while everything
+    /// fits — an always-on caret would be a permanent dead affordance.
+    @ViewBuilder
+    private var overflowMenu: some View {
+        if !hiddenItems.isEmpty {
+            Menu {
+                ForEach(hiddenItems) { item in
+                    overflowEntry(item)
+                }
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11))
+                    .frame(width: 22, height: 22)
+                    .foregroundColor(.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More controls")
+        }
+    }
+
+    /// One overflow row per clipped control, mirroring what the control itself
+    /// does. The two pickers keep their nested shape as submenus; everything
+    /// else is a single action.
+    @ViewBuilder
+    private func overflowEntry(_ item: ToolItem) -> some View {
+        switch item {
+        case .h1:
+            Button("Heading 1") { vm.performFormat(.heading1) }
+        case .h2:
+            Button("Heading 2") { vm.performFormat(.heading2) }
+        case .h3:
+            Button("Heading 3") { vm.performFormat(.heading3) }
+        case .body:
+            Button("Body") { vm.performFormat(.body) }
+        case .font:
+            Menu("Font") {
+                ForEach(Tokens.fontOptions, id: \.self) { name in
+                    Button(name) {
+                        Tokens.setFontFamily(name)
+                        vm.reloadActive()
+                    }
+                }
+            }
+        case .size:
+            Menu("Text Size") {
+                ForEach(Tokens.bodySizeOptions, id: \.self) { size in
+                    Button("\(Int(size)) pt") {
+                        Tokens.setBodySize(size)
+                        vm.reloadActive()
+                    }
+                }
+            }
+        case .bold:
+            Button { vm.performFormat(.bold) } label: { Label("Bold", systemImage: "bold") }
+        case .italic:
+            Button { vm.performFormat(.italic) } label: { Label("Italic", systemImage: "italic") }
+        case .underline:
+            Button { vm.performFormat(.underline) } label: { Label("Underline", systemImage: "underline") }
+        case .bullet:
+            Button { vm.performFormat(.bulletList) } label: { Label("Bullet List", systemImage: "list.bullet") }
+        case .check:
+            Button { vm.performFormat(.checklist) } label: { Label("Checklist", systemImage: "checklist") }
+        case .link:
+            Button { vm.performFormat(.link) } label: { Label("Link", systemImage: "link") }
+        case .image:
+            Button { vm.attachImage() } label: { Label("Insert Image", systemImage: "photo") }
+        case .divider:
+            Button { vm.performFormat(.divider) } label: { Label("Divider", systemImage: "minus") }
+        case .mic:
+            Button {
+                toggleDictation()
+            } label: {
+                Label(vm.isDictating ? "Stop Dictation" : "Start Dictation",
+                      systemImage: vm.isDictating ? "mic.fill" : "mic")
+            }
+        case .record:
+            Button {
+                if vm.recordPermissionDenied {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+                } else if vm.isRecording {
+                    Task { await vm.stopRecording() }
+                } else {
+                    Task { await vm.startRecording() }
+                }
+            } label: {
+                Label(vm.recordPermissionDenied ? "Microphone Settings…"
+                        : (vm.isRecording ? "Stop Recording" : "Record"),
+                      systemImage: vm.isRecording ? "stop.circle.fill" : "record.circle")
+            }
+        }
+    }
+
+    private func recomputeHidden() {
+        guard viewportWidth > 0, !itemFrames.isEmpty else { return }
+        let next = ToolItem.allCases.filter { item in
+            guard let f = itemFrames[item.rawValue] else { return false }
+            return f.minX < -0.5 || f.maxX > viewportWidth + 0.5
+        }
+        if next != hiddenItems { hiddenItems = next }
     }
 
     private var sidebarToggle: some View {
@@ -4214,12 +4765,12 @@ struct FormatToolbar: View {
 
     /// Per-note Excalidraw board toggle. Three states:
     /// • passive (gray) — note has no diagram yet
-    /// • has content (accent) — a board exists for this note
-    /// • open (accent + filled background) — the board is currently showing
+    /// • has content (green) — a board with drawings exists, currently closed
+    /// • open (blue/accent + filled background) — the board is showing
     private var boardButton: some View {
         let isOpen = vm.isBoardVisible
         let hasContent = vm.boardHasContent(vm.activeTabId)
-        let tint: Color = (isOpen || hasContent) ? .accentColor : .secondary
+        let tint: Color = isOpen ? .accentColor : (hasContent ? Tokens.SUI.boardHasContent : .secondary)
         return Button(action: {
             withAnimation(.easeInOut(duration: 0.18)) { vm.toggleBoard() }
         }) {
@@ -4256,6 +4807,57 @@ struct FormatToolbar: View {
         .disabled(!hasRoute)
         .onHover { hoveredButton = $0 ? "terminal" : nil }
         .help(hasRoute ? (vm.isTerminalVisible ? "Hide terminal" : "Show terminal") : "Link a folder to use the terminal")
+    }
+
+    /// Hands-free voice toggle. Route-gated exactly like `terminalButton` —
+    /// with no terminal there is nothing for Claude to talk to.
+    private var handsfreeButton: some View {
+        let hasRoute = vm.terminalRoute(for: vm.activeTab) != nil
+        let on = handsfree.isEnabled
+        return Button(action: { vm.toggleHandsfree() }) {
+            // NOT a plain mic: the editor's dictation button next door already
+            // owns `mic`/`mic.fill`, and two identical mic icons in one toolbar
+            // is how this got pressed instead of that one.
+            Image(systemName: on ? "waveform.circle.fill" : "waveform.circle")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(hasRoute ? (on ? .accentColor : .secondary)
+                                          : Color.secondary.opacity(0.4))
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(on ? Color.accentColor.opacity(0.14)
+                              : (hoveredButton == "handsfree" ? Color.primary.opacity(0.08) : Color.clear))
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(!hasRoute)
+        .onHover { hoveredButton = $0 ? "handsfree" : nil }
+        .help(hasRoute ? (on ? "Turn off hands-free voice" : "Hands-free voice")
+                       : "Link a folder to use the terminal")
+    }
+
+    /// Second terminal for the same note. Only appears once the panel is
+    /// already showing a terminal — before that, the plain terminal toggle is
+    /// the way in, and a second button would just be noise.
+    @ViewBuilder
+    private var newTerminalButton: some View {
+        if vm.isTerminalVisible && !vm.terminalTabs.isEmpty {
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.18)) { vm.addTerminal() }
+            }) {
+                Image(systemName: "plus.rectangle")
+                    .font(.system(size: 11))
+                    .frame(width: 26, height: 22)
+                    .foregroundColor(.secondary)
+                    .background(
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(hoveredButton == "newTerminal" ? Color.primary.opacity(0.08) : Color.clear)
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { hoveredButton = $0 ? "newTerminal" : nil }
+            .help("New terminal")
+        }
     }
 
     private var pinButton: some View {
@@ -5182,6 +5784,13 @@ class BlockCaretTextView: NSTextView {
     private var dragStartLineIndex: Int = 0  // character index of dragged line start
     private var dragInsertIndex: Int = -1     // character index where line will be inserted
     private var dragDidMove = false
+    /// Where the press started, so a click isn't mistaken for a drag. AppKit
+    /// sends `mouseDragged` for sub-pixel trackpad movement, and treating the
+    /// first one as a real drag made checkbox toggles fail at random — the
+    /// press became a line-reorder and `mouseUp` skipped the toggle.
+    private var dragStartPoint: NSPoint = .zero
+    /// Movement (points) before a press on a list prefix counts as a drag.
+    private static let dragSlop: CGFloat = 3
     private var dragNestIndent: String = ""   // indentation to apply on drop
     private let dragInsertionLine: NSView = {
         let v = NSView()
@@ -5199,11 +5808,38 @@ class BlockCaretTextView: NSTextView {
         return v
     }()
 
+    // MARK: - Image selection / resize state
+    private var selectedImageRange: NSRange?
+    private var isResizingImage = false
+    private var resizeStartX: CGFloat = 0
+    private var resizeStartWidth: CGFloat = 0
+    private let imageBorderView: NSView = {
+        let v = PassthroughView()
+        v.wantsLayer = true
+        v.layer?.borderColor = NSColor.controlAccentColor.cgColor
+        v.layer?.borderWidth = 1.5
+        v.layer?.cornerRadius = 2
+        v.isHidden = true
+        return v
+    }()
+    private let imageHandleView: NSView = {
+        let v = PassthroughView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        v.layer?.cornerRadius = 6
+        v.layer?.borderColor = NSColor.white.withAlphaComponent(0.9).cgColor
+        v.layer?.borderWidth = 1.5
+        v.isHidden = true
+        return v
+    }()
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         addSubview(caretView)
         addSubview(dragSourceDim)
         addSubview(dragInsertionLine)
+        addSubview(imageBorderView)
+        addSubview(imageHandleView)
         DispatchQueue.main.async { self.updateCaretPosition() }
 
         // The caret also hides while the window isn't key (app in background):
@@ -5230,6 +5866,14 @@ class BlockCaretTextView: NSTextView {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        // Resize handle of a selected image: horizontal drag is what scales it,
+        // so show the left-right resize cursor as the affordance.
+        let rawPoint = convert(event.locationInWindow, from: nil)
+        if !imageHandleView.isHidden,
+           imageHandleView.frame.insetBy(dx: -6, dy: -6).contains(rawPoint) {
+            NSCursor.resizeLeftRight.set()
+            return
+        }
         guard let lm = layoutManager, let tc = textContainer, let ts = textStorage else {
             super.mouseMoved(with: event)
             return
@@ -5238,6 +5882,11 @@ class BlockCaretTextView: NSTextView {
         let adjusted = NSPoint(x: point.x - textContainerInset.width, y: point.y - textContainerInset.height)
         var fraction: CGFloat = 0
         let charIndex = lm.characterIndex(for: adjusted, in: tc, fractionOfDistanceBetweenInsertionPoints: &fraction)
+        // Over an inline image: it's an object, not text — no I-beam.
+        if imageAttachment(at: charIndex) != nil {
+            NSCursor.arrow.set()
+            return
+        }
         if charIndex < ts.length {
             let (lineRange, prefixLen) = listPrefixLen(at: charIndex)
             if prefixLen > 0 && charIndex < lineRange.location + prefixLen {
@@ -5281,6 +5930,8 @@ class BlockCaretTextView: NSTextView {
 
     override func didChangeText() {
         super.didChangeText()
+        // Any text mutation invalidates the image-selection geometry.
+        deselectImage()
         updateCaretPosition()
         // Placeholder covers the whole first lines, not just the edited glyph
         // range — force a full redraw when emptiness flips either way.
@@ -5345,6 +5996,8 @@ class BlockCaretTextView: NSTextView {
 
     override func setSelectedRange(_ charRange: NSRange, affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
         super.setSelectedRange(charRange, affinity: affinity, stillSelecting: stillSelectingFlag)
+        // Moving the selection away from a selected image deselects it.
+        if let ir = selectedImageRange, charRange != ir { deselectImage() }
         updateCaretPosition()
         // If the caret has moved out of a link span, strip link styling from
         // typing attributes so further typing isn't a link.
@@ -5464,6 +6117,9 @@ class BlockCaretTextView: NSTextView {
     // MARK: - Backspace removes full prefix
     // MARK: - Paste: strip external formatting, apply FloatNote body style, auto-link URLs
     override func paste(_ sender: Any?) {
+        // Images first (screenshots, copied image files) — they'd otherwise
+        // paste as a file path string or an unmanaged native attachment.
+        if pasteImageIfPresent() { return }
         guard var pb = NSPasteboard.general.string(forType: .string), !pb.isEmpty else {
             super.paste(sender)
             return
@@ -5794,15 +6450,37 @@ class BlockCaretTextView: NSTextView {
             x: point.x - textContainerInset.width,
             y: point.y - textContainerInset.height
         )
+        // Resize handle of a selected image — grab it before anything else.
+        if !imageHandleView.isHidden {
+            let hitBox = imageHandleView.frame.insetBy(dx: -8, dy: -8)
+            dbg("imgMouseDown: pt=\(point) handle=\(imageHandleView.frame) hit=\(hitBox.contains(point))")
+            if hitBox.contains(point),
+               let r = selectedImageRange, let att = imageAttachment(at: r.location) {
+                isResizingImage = true
+                resizeStartX = point.x
+                resizeStartWidth = att.displayWidth
+                return
+            }
+        }
         if let lm = layoutManager, let tc = textContainer, let ts = textStorage {
             var fraction: CGFloat = 0
             let charIndex = lm.characterIndex(for: adjustedPoint, in: tc, fractionOfDistanceBetweenInsertionPoints: &fraction)
+            // Click directly on an inline image → select it (border + handle).
+            if imageAttachment(at: charIndex) != nil,
+               let rect = imageRect(for: NSRange(location: charIndex, length: 1)),
+               rect.contains(point) {
+                deselectImage()
+                selectImage(at: charIndex)
+                return
+            }
+            deselectImage()
             if charIndex < ts.length {
                 let (lineRange, prefixLen) = listPrefixLen(at: charIndex)
                 if prefixLen > 0 && charIndex < lineRange.location + prefixLen {
                     // Clicked on a list prefix — prepare for possible drag
                     isDraggingLine = true
                     dragDidMove = false
+                    dragStartPoint = point
                     dragStartLineIndex = lineRange.location
                     dragInsertIndex = -1
 
@@ -5832,6 +6510,103 @@ class BlockCaretTextView: NSTextView {
         updateCaretPosition()
     }
 
+    // MARK: - Image paste / insert / resize
+
+    /// Image-file URLs (Finder copies) first, else raw image data (screenshots,
+    /// browser copies). Returns false for non-image pasteboards.
+    private func pasteImageIfPresent() -> Bool {
+        let pb = NSPasteboard.general
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingFileURLsOnly: true,
+            .urlReadingContentsConformToTypes: ["public.image"]
+        ]) as? [URL], !urls.isEmpty {
+            let images = urls.compactMap { NSImage(contentsOf: $0) }
+            if !images.isEmpty {
+                insertImages(images)
+                return true
+            }
+        }
+        if pb.availableType(from: [.tiff, .png]) != nil, let img = NSImage(pasteboard: pb) {
+            insertImage(img)
+            return true
+        }
+        return false
+    }
+
+    /// Insert several images in order, each on its own line so a batch of
+    /// screenshots reads top-to-bottom instead of running together.
+    func insertImages(_ images: [NSImage]) {
+        for (i, image) in images.enumerated() {
+            if i > 0 { insertText("\n", replacementRange: selectedRange()) }
+            insertImage(image)
+        }
+    }
+
+    /// Save to ~/.floatnote-images and insert at the caret (undoable insertText).
+    func insertImage(_ image: NSImage) {
+        guard image.size.width > 0, let id = ImageStore.savePNG(image) else {
+            NSSound.beep()
+            return
+        }
+        let width = min(max(60, image.size.width), usableTextWidth())
+        guard let att = ImageAttachment(imageId: id, displayWidth: width) else { return }
+        insertText(NSAttributedString(attachment: att), replacementRange: selectedRange())
+    }
+
+    private func usableTextWidth() -> CGFloat {
+        let container = textContainer?.size.width ?? 400
+        let pad = (textContainer?.lineFragmentPadding ?? 5) * 2
+        return max(100, container - pad)
+    }
+
+    /// The ImageAttachment at `charIndex`, if any.
+    private func imageAttachment(at charIndex: Int) -> ImageAttachment? {
+        guard let ts = textStorage, charIndex >= 0, charIndex < ts.length else { return nil }
+        return ts.attribute(.attachment, at: charIndex, effectiveRange: nil) as? ImageAttachment
+    }
+
+    /// Glyph rect of the attachment char, in view coordinates.
+    private func imageRect(for range: NSRange) -> NSRect? {
+        guard let lm = layoutManager, let tc = textContainer else { return nil }
+        let glyphRange = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        var rect = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
+        rect.origin.x += textContainerInset.width
+        rect.origin.y += textContainerInset.height
+        return rect
+    }
+
+    private func selectImage(at charIndex: Int) {
+        selectedImageRange = NSRange(location: charIndex, length: 1)
+        setSelectedRange(selectedImageRange!)
+        positionImageOverlays()
+        updateCaretPosition()
+    }
+
+    func deselectImage() {
+        selectedImageRange = nil
+        imageBorderView.isHidden = true
+        imageHandleView.isHidden = true
+    }
+
+    /// Reposition (or hide) the selection border + resize handle. Call after
+    /// anything that changes layout while an image is selected.
+    private func positionImageOverlays() {
+        guard let r = selectedImageRange, imageAttachment(at: r.location) != nil,
+              let rect = imageRect(for: r) else {
+            deselectImage()
+            return
+        }
+        imageBorderView.frame = rect.insetBy(dx: -1, dy: -1)
+        imageHandleView.frame = NSRect(x: rect.maxX - 6, y: rect.maxY - 6, width: 12, height: 12)
+        imageBorderView.isHidden = false
+        imageHandleView.isHidden = false
+        // Keep overlays above the text (same trick as ensureCaretOnTop).
+        for v in [imageBorderView, imageHandleView] where subviews.last !== v {
+            v.removeFromSuperview()
+            addSubview(v)
+        }
+    }
+
     /// Returns the Y position of the top edge of the line at character index, and its height.
     private func lineGeometry(at charIndex: Int) -> (y: CGFloat, height: CGFloat)? {
         guard let lm = layoutManager, let tc = textContainer, let ts = textStorage else { return nil }
@@ -5843,16 +6618,38 @@ class BlockCaretTextView: NSTextView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        // Live image resize: scale width with the drag, aspect locked.
+        if isResizingImage, let r = selectedImageRange,
+           let att = imageAttachment(at: r.location), let ts = textStorage {
+            let point = convert(event.locationInWindow, from: nil)
+            let newWidth = min(max(60, resizeStartWidth + (point.x - resizeStartX)),
+                               usableTextWidth())
+            att.setDisplayWidth(newWidth)
+            // An attachment's glyph size is cached by the layout manager, so a
+            // bounds change needs an explicit layout+display invalidation —
+            // `edited(.editedAttributes:)` alone leaves the old size on screen.
+            ts.edited(.editedAttributes, range: r, changeInLength: 0)
+            layoutManager?.invalidateLayout(forCharacterRange: r, actualCharacterRange: nil)
+            layoutManager?.invalidateDisplay(forCharacterRange: r)
+            positionImageOverlays()
+            return
+        }
         guard isDraggingLine, let storage = textStorage, let lm = layoutManager, let tc = textContainer else {
             super.mouseDragged(with: event)
             return
         }
 
-        dragDidMove = true
-        dragSourceDim.isHidden = false
-        NSCursor.closedHand.set()
-
         let point = convert(event.locationInWindow, from: nil)
+        // Below the slop radius this is still a click, not a drag: leave
+        // `dragDidMove` false so mouseUp toggles, and don't show drag chrome.
+        if !dragDidMove {
+            let dx = point.x - dragStartPoint.x
+            let dy = point.y - dragStartPoint.y
+            guard (dx * dx + dy * dy).squareRoot() >= Self.dragSlop else { return }
+            dragDidMove = true
+            dragSourceDim.isHidden = false
+            NSCursor.closedHand.set()
+        }
         let adjustedPoint = NSPoint(
             x: point.x - textContainerInset.width,
             y: point.y - textContainerInset.height
@@ -5909,6 +6706,25 @@ class BlockCaretTextView: NSTextView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        // Finish an image resize: register undo for the old width, then run the
+        // normal change pipeline so the new width reaches the debounced save.
+        if isResizingImage {
+            isResizingImage = false
+            if let r = selectedImageRange, let att = imageAttachment(at: r.location),
+               att.displayWidth != resizeStartWidth {
+                let oldWidth = resizeStartWidth
+                undoManager?.registerUndo(withTarget: self) { tv in
+                    att.setDisplayWidth(oldWidth)
+                    tv.textStorage?.edited(.editedAttributes, range: r, changeInLength: 0)
+                    tv.deselectImage()
+                    tv.didChangeText()
+                }
+                undoManager?.setActionName("Resize Image")
+                didChangeText()  // deselects; re-select below so handle stays usable
+                if imageAttachment(at: r.location) != nil { selectImage(at: r.location) }
+            }
+            return
+        }
         if isDraggingLine {
             isDraggingLine = false
             dragInsertionLine.isHidden = true
@@ -6835,8 +7651,12 @@ struct RichTextEditor: NSViewRepresentable {
 
         func extractHTML(from textView: NSTextView) -> String {
             guard let storage = textView.textStorage, storage.length > 0 else { return "" }
-            let range = NSRange(location: 0, length: storage.length)
-            guard let data = try? storage.data(from: range, documentAttributes: [
+            // Image attachments don't survive the Cocoa HTML exporter — swap
+            // them for plain-text ⟦img:…⟧ markers on a COPY (never the live storage).
+            let copy = NSMutableAttributedString(attributedString: storage)
+            copy.replaceImageAttachmentsWithMarkers(font: bodyFont, color: textColor)
+            let range = NSRange(location: 0, length: copy.length)
+            guard let data = try? copy.data(from: range, documentAttributes: [
                 .documentType: NSAttributedString.DocumentType.html,
                 .characterEncoding: String.Encoding.utf8.rawValue
             ]) else { return "" }

@@ -9,6 +9,15 @@ const os = require("os");
 
 const TABS_PATH = path.join(os.homedir(), ".floatnote-tabs.json");
 const FOLDERS_PATH = path.join(os.homedir(), ".floatnote-folders.json");
+const IMAGES_DIR = path.join(os.homedir(), ".floatnote-images");
+
+// Inline images are stored as PNGs and referenced from a note's HTML by the
+// plain-text marker ⟦img:<uuid>:<width>⟧ (the Cocoa HTML exporter drops real
+// attachments, so the app persists markers instead — see Images.swift).
+const IMG_MARKER_RE = /⟦img:([0-9A-Fa-f-]{36}):(\d+)⟧/g;
+// Guardrails so reading an image-heavy note can't flood the context.
+const MAX_INLINE_IMAGES = 8;
+const MAX_IMAGE_EDGE = 1568; // px; Claude downsamples beyond this anyway
 
 // --- Helpers ---
 
@@ -46,8 +55,58 @@ function findFolder(folders, identifier) {
   );
 }
 
+/// Base64 PNG for an image id, downscaled via macOS `sips` when it's larger
+/// than MAX_IMAGE_EDGE so a 4K screenshot doesn't cost a fortune in tokens.
+/// Returns null when the file is missing or unreadable.
+function imageBase64(id) {
+  const src = path.join(IMAGES_DIR, `${id.toUpperCase()}.png`);
+  if (!fs.existsSync(src)) return null;
+  let tmp = null;
+  try {
+    const { execFileSync } = require("child_process");
+    tmp = path.join(os.tmpdir(), `floatnote-mcp-${process.pid}-${Date.now()}.png`);
+    // -Z resizes only if the long edge exceeds the limit (aspect preserved).
+    execFileSync("/usr/bin/sips", ["-Z", String(MAX_IMAGE_EDGE), src, "--out", tmp], {
+      stdio: "ignore",
+    });
+    return fs.readFileSync(tmp).toString("base64");
+  } catch {
+    // sips unavailable or failed — fall back to the original bytes.
+    try { return fs.readFileSync(src).toString("base64"); } catch { return null; }
+  } finally {
+    if (tmp) { try { fs.unlinkSync(tmp); } catch {} }
+  }
+}
+
+/// Split a note's text into readable text (markers replaced by [image N]
+/// placeholders) plus the MCP image content blocks to append after it.
+function extractImages(text) {
+  const ids = [];
+  const labeled = text.replace(IMG_MARKER_RE, (_m, id) => {
+    ids.push(id);
+    return `[image ${ids.length}]`;
+  });
+  const blocks = [];
+  const notes = [];
+  ids.slice(0, MAX_INLINE_IMAGES).forEach((id, i) => {
+    const data = imageBase64(id);
+    if (data) blocks.push({ type: "image", data, mimeType: "image/png" });
+    else notes.push(`[image ${i + 1}: file missing on disk]`);
+  });
+  if (ids.length > MAX_INLINE_IMAGES) {
+    notes.push(
+      `[${ids.length - MAX_INLINE_IMAGES} more image(s) in this note were not inlined (cap: ${MAX_INLINE_IMAGES}).]`
+    );
+  }
+  return { text: labeled, blocks, notes };
+}
+
 function stripHTML(html) {
   return html
+    // Drop <style>/<script> BODIES first — stripping tags alone would leave
+    // their CSS/JS text in the output (Cocoa's exporter emits a <style> block).
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/p>/gi, "\n")
     .replace(/<\/div>/gi, "\n")
@@ -323,7 +382,7 @@ server.tool("list_notes", "List all FloatNote tabs with their IDs and titles. Ea
 
 server.tool(
   "read_note",
-  "Read the content of a FloatNote tab by ID or title. Returns plain text content.",
+  "Read the content of a FloatNote tab by ID or title. Returns plain text, with any inline images attached as image blocks ([image N] placeholders mark where they sit in the text).",
   {
     identifier: z.string().describe("Tab ID (UUID) or tab title to search for"),
   },
@@ -338,16 +397,20 @@ server.tool(
       return { content: [{ type: "text", text: `Note not found: "${identifier}"` }] };
     }
 
-    const text = stripHTML(tab.html);
+    // Inline images: markers become [image N] placeholders in the text and the
+    // pictures themselves follow as image content blocks, in the same order.
+    const { text, blocks, notes } = extractImages(stripHTML(tab.html));
     const boardNote = boardHasContent(tab.id)
       ? `\n\n[This note has an attached whiteboard diagram — use read_board to inspect it or draw_on_board to modify it.]`
       : "";
+    const imgNote = notes.length ? `\n\n${notes.join("\n")}` : "";
     return {
       content: [
         {
           type: "text",
-          text: `# ${tab.title}\nID: ${tab.id}\n\n${text || "(empty note)"}${boardNote}`,
+          text: `# ${tab.title}\nID: ${tab.id}\n\n${text || "(empty note)"}${boardNote}${imgNote}`,
         },
+        ...blocks,
       ],
     };
   }
