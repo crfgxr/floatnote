@@ -781,6 +781,17 @@ final class TranscriptStore: ObservableObject {
     /// The hook reported this pane's turn over — `Stop`, or `Notification`
     /// (Claude is waiting on the human, which is not working either). Only the
     /// bound pane's events touch the spinner.
+    /// The human pressed escape in a terminal. Claude Code does not always write
+    /// its `[Request interrupted…]` record for a plain cancel, and the hook fires
+    /// no Stop, so the keystroke itself is the signal — the app is the one thing
+    /// that sees it. A stray escape (closing a TUI menu) costs nothing: the next
+    /// turn that lands re-evaluates the spinner.
+    func noteInterrupted(paneId: UUID) {
+        guard paneId == boundPaneId, isWorking else { return }
+        workingReason = "escape pressed"
+        isWorking = false
+    }
+
     func noteTurnEnded(paneId: UUID) {
         guard paneId == boundPaneId, isWorking else { return }
         workingReason = "hook said the turn ended"
@@ -1728,12 +1739,18 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
     let styleGeneration: Int
     /// Reading measure; the view centres it and grows its gutters, not its lines.
     let measure: CGFloat
+    /// The pane's own width, straight from SwiftUI. The gutters are derived from
+    /// THIS, not from the scroll view's bounds: those are zero on the passes that
+    /// run before layout, and a zero-width scroll view produced a full-bleed
+    /// column — which is why the text width flipped every time a turn landed.
+    let available: CGFloat
 
     final class Coordinator {
         var textView: TranscriptTextView?
         var scrollView: NSScrollView?
         var lastGeneration = -1
         var lastStyleGeneration = -1
+        var lastMeasure: CGFloat = 0
         /// Length of the document installed last time, to tell an append (the
         /// tail grew) from a fresh load (a pane switch, or a restyle).
         var lastLength = 0
@@ -1778,6 +1795,11 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         let scroll = NSScrollView()
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
+        // Overlay, not legacy: a scroller that takes layout width changes
+        // `contentSize` the moment the document becomes scrollable, and the
+        // centred text column jumped sideways as soon as a reply made it long
+        // enough to scroll.
+        scroll.scrollerStyle = .overlay
         scroll.drawsBackground = true
         scroll.backgroundColor = style.background
         scroll.automaticallyAdjustsContentInsets = false
@@ -1802,6 +1824,12 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard context.coordinator.lastGeneration != generation
                 || context.coordinator.lastStyleGeneration != styleGeneration else { return }
+        // A width change re-lays out everything, bubbles included, so it counts
+        // as a restyle — otherwise resizing the panel left the old measure.
+        if context.coordinator.lastMeasure != measure {
+            context.coordinator.lastMeasure = measure
+            context.coordinator.lastLength = 0
+        }
         let restyled = context.coordinator.lastStyleGeneration != styleGeneration
         context.coordinator.lastGeneration = generation
         context.coordinator.lastStyleGeneration = styleGeneration
@@ -1825,7 +1853,7 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         (textView.layoutManager as? TranscriptLayoutManager)?.style = style
         textView.backgroundColor = style.background
         scroll.backgroundColor = style.background
-        let inset = max(0, (scroll.contentSize.width - measure) / 2)
+        let inset = max(24, (available - measure) / 2)
         textView.textContainerInset = NSSize(width: max(24, inset), height: 20)
         let previous = coordinator.lastLength
         coordinator.lastLength = document.length
@@ -1896,7 +1924,11 @@ struct TranscriptPane: View {
 
     var body: some View {
         GeometryReader { geo in
-            let measure = min(480, max(320, geo.size.width - 48))
+            // Adaptive: wide panes get long-ish lines, but never longer than
+            // the eye can track back. 480 flat looked like a book column in a
+            // 900pt pane; full-bleed made every line a scan.
+            let available = geo.size.width
+            let measure = min(720, max(360, available - 96))
             ZStack(alignment: .top) {
                 Color(nsColor: style.background)
                 if store.turns.isEmpty {
@@ -1909,7 +1941,8 @@ struct TranscriptPane: View {
                         style: style,
                         generation: store.generation,
                         styleGeneration: paletteGeneration,
-                        measure: measure)
+                        measure: measure,
+                        available: available)
                 }
                 if !store.isAuthoritative, store.resolvedPath != nil {
                     guessChip

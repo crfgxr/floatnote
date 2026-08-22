@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.83.4"
+let APP_VERSION = "v1.85.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -210,6 +210,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     handled = true
                 }
                 if handled { return nil }
+            }
+            // Escape inside a terminal cancels Claude's turn. The transcript
+            // has no other way to know: no hook fires, and the interrupt record
+            // is not always written. The event is NOT swallowed — the terminal
+            // still gets its escape.
+            if mods.isEmpty, event.keyCode == 53 {
+                MainActor.assumeIsolated {
+                    if let id = TerminalSessions.shared.id(containing: NSApp.keyWindow?.firstResponder) {
+                        TranscriptStore.shared.noteInterrupted(paneId: id)
+                    }
+                }
+                return event
             }
             // ⌘− / ⌘+ / ⌘0 resize the TRANSCRIPT text, from anywhere, while it is
             // on screen. Focus is almost always in the terminal when you want the
@@ -879,6 +891,13 @@ class EditorViewModel: ObservableObject {
             }
         }
         isTerminalVisible = true
+    }
+
+    /// The pane bound to this note, if one is open. Drives the sidebar's terminal
+    /// glyph — "this note has a shell running against it" is worth seeing from
+    /// the list, without opening the note to find out.
+    func terminalTab(forNote id: UUID) -> TerminalTab? {
+        terminalTabs.first { $0.noteId == id }
     }
 
     /// Bind `terminalId` to `noteId`, clearing any other pane's claim on that
@@ -4182,6 +4201,16 @@ struct SidebarNoteItemView: View {
                     .help(isJobRunningHere ? (tab.jobStatus ?? "") : "")
             }
             Spacer(minLength: 4)
+            if let pane = vm.terminalTab(forNote: tab.id) {
+                // Accent when it is the pane on screen, muted when it is one of
+                // the others: the difference between "this note's terminal is
+                // what you're looking at" and "it has one, somewhere behind".
+                Image(systemName: "terminal")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(vm.activeTerminalId == pane.id
+                                     ? .accentColor : .secondary.opacity(0.55))
+                    .help("Terminal: \(pane.label) · \(pane.path)")
+            }
             if tab.uncheckedCount > 0 {
                 UncheckedBadge(count: tab.uncheckedCount)
             }
