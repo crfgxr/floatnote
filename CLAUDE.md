@@ -5,7 +5,9 @@ After ANY code change, run `./build.sh` to rebuild and update the app in `/Appli
 
 Do NOT just run `swift build` — the app bundle in /Applications must be updated too.
 
-**GOTCHA — build.sh's relaunch can silently no-op from sandboxed shells (e.g. Claude Code):** its `pkill` may be blocked, and `open` then just re-focuses the STALE running instance — the new binary never loads. Reliable relaunch: `osascript -e 'tell application "FloatNote" to quit'; sleep 1; open /Applications/FloatNote.app`. When in doubt, compare binary mtime (`stat -f %m /Applications/FloatNote.app/Contents/MacOS/FloatNote`) against the process start time (`ps -o lstart= -p $(pgrep -f FloatNote.app/Contents/MacOS)`).
+**GOTCHA — build.sh's relaunch can silently no-op from sandboxed shells (e.g. Claude Code):** its `pkill` may be blocked, and `open` then just re-focuses the STALE running instance — the new binary never loads. Use **`./relaunch.sh`**: it quits, waits for the pid to actually go away (a bare `open` during the quit fails with LaunchServices `-600`), opens, and verifies the live process is newer than the binary, retrying up to 3×.
+- Run it **detached** — `nohup ./relaunch.sh > /tmp/fn-relaunch.log 2>&1 & disown` — then check the log in a later call. A sandboxed Claude Code shell kills any foreground call that waits (`sleep` is blocked outright, and the script's own poll loop gets SIGKILLed at ~137), so a synchronous run reports nothing even when it worked.
+- Verify by hand with binary mtime (`stat -f %m /Applications/FloatNote.app/Contents/MacOS/FloatNote`) vs process start (`ps -o lstart= -p $(pgrep -f FloatNote.app/Contents/MacOS)`) — `pgrep` returning nothing means the app is DOWN, not that the check failed.
 
 ## Code Signing & Permissions (macOS TCC)
 - `build.sh` signs `/Applications/FloatNote.app` with the self-signed **"FloatNote Dev"** identity when present (else ad-hoc). A *stable* identity is what keeps macOS TCC grants (Screen Recording, Microphone) across rebuilds — **ad-hoc pins the cdhash**, so every rebuild changed it and macOS re-prompted. Create the cert once per machine with `docs/dev-signing-cert.sh` (self-signed, codeSigning EKU, in a dedicated `floatnote-dev` keychain).
@@ -15,9 +17,11 @@ Do NOT just run `swift build` — the app bundle in /Applications must be update
 
 ## Project Layout
 - `FloatNote/FloatNote/App.swift` - SwiftUI app, views, ViewModel, editor
+- `FloatNote/FloatNote/Transcript.swift` - Transcript pane (Claude Code session JSONL → typeset prose)
 - `FloatNote/Package.swift` - SPM manifest (macOS 14+)
 - `mcp-server.js` - MCP server exposing notes to Claude
 - `build.sh` - Build + deploy script (signs with "FloatNote Dev" identity — see Code Signing)
+- `relaunch.sh` - Quit + relaunch /Applications/FloatNote.app with verification (see the build GOTCHA)
 - `docs/dev-signing-cert.sh` - Creates the self-signed "FloatNote Dev" code-signing cert (run once per machine)
 - `vendor-swiftterm.sh` - Clones SwiftTerm + applies `vendor/swiftterm-sticky-scroll.patch` (run once per machine — see Terminal)
 
@@ -105,6 +109,23 @@ the mic stays open, and "send it" types the reply into the pane. Native port of
 - **Settings** (all `UserDefaults`, domain `com.floatnote.app`): `fn.handsfreeResponseMode` (**brief** (default) / full / summary / notify), `fn.handsfreeVoiceId` (`"system"` = follow Spoken Content), `fn.handsfreeLocale` (recognition language, `"system"` = current locale), `fn.handsfreeBargeIn` (default **on**), `fn.handsfreeAutoSend` (submit after 3s of silence, default **off**).
 - **Permissions**: `NSSpeechRecognitionUsageDescription` is in `Info.plist`; authorization is requested on first *use*, not at launch. Like Mic/Screen Recording, the grant survives rebuilds only because of the stable "FloatNote Dev" signing identity.
 - Debug: `handsfree: …` and `tts: …` lines in `~/.floatnote-debug.log` (mic on/off, barge-in, send, ESC, quick response, pane resolution).
+
+## Transcript Pane
+
+The conversation running in a terminal pane, rendered a second time as typeset prose from Claude
+Code's own session JSONL, stacked **above** the terminal inside `TerminalPanel`. Read-only by
+construction — the terminal stays the only place you type. All of it lives in `Transcript.swift`.
+Spec: `docs/superpowers/specs/2026-08-22-transcript-pane-design.md`.
+
+- **Ingest**: `TranscriptParser` reads `~/.claude/projects/<munged-cwd>/<sessionId>.jsonl`. Two things a naive reader gets wrong: one visible reply is up to six `assistant` records (regroup by `requestId`), and most `user` records aren't the user — tool results (`toolUseResult`), `isMeta` injections, harness reminders and slash-command echoes are all filtered out. `TranscriptTail` follows one file by byte offset on a private queue; `TranscriptStore` owns turns, the 400-turn cap and the spinner.
+- **Binding is per PANE, never per directory.** `docs/floatnote-claude-hook.sh` spools `session_id` / `transcript_path`; `checkClaudeEvents` stamps them onto `TerminalTab.claudeSessionId` / `claudeTranscriptPath` (persisted, so a restored pane is right before any new turn). `TranscriptResolver.resolve` ladder: hook fields → **sticky claim** (what this pane already showed, if the file still exists) → `~/.claude.json` `lastSessionId` → newest CLI-written file; the last two skip any path another pane has claimed. Above all of that, `openTranscript(shellPid:storeDir:)` asks **`lsof` which `.jsonl` the pane's own shell tree holds open** (~16ms, exact) — `TranscriptStore.probeOpenFiles` runs it off the main thread on every provisional bind and re-tries from `poll()` every 5s until the binding is authoritative. Without the fd probe, two panes on one project mirrored each other.
+- **Rendering is TextKit 1 by hand-assembly** (explicit storage + container + `TranscriptLayoutManager`): `NSTextView()` on macOS 14 defaults to TextKit 2, where `usesFontLeading` is unreachable and any line carrying a ☐ breaks the line grid. `drawBackground` paints code panels, inline chips, blockquote bars, thematic rules and the user bubble (ONE pill per message — the run is expanded to its full extent first).
+- **Type is Claude's own.** `TranscriptStyle.claudeFacesRegistered` registers the four variable TTFs in `/Applications/Claude.app/Contents/Resources/fonts/` with `CTFontManagerRegisterFontsForURL` (process scope, read in place — nothing is copied into this app, so nothing is redistributed), making **Anthropic Sans** the default reading face (Serif, Charter, Iowan, Palatino, Georgia behind it). Emphasis asks for the **named cut** (`AnthropicSansVariable-TextBold`) — `NSFontManager.convert` synthesises a smear on a variable instance. Availability is always tested by RESOLUTION (`NSFont(name:)`), never by enumerating `availableFontFamilies`, which omits many installed faces. Reading face + text size live in the terminal tab bar's **Aa** menu (`fn.transcriptFontFamily` / `fn.transcriptFontSize`, default Anthropic Sans 16).
+- **Two modes only**: `TranscriptMode` is `terminal` or `split` (`fn.transcriptMode`, default `split`; an unknown stored value — e.g. the removed `transcript` — falls back to split). Height is `fn.transcriptSplitFraction` via `TranscriptSplitHandle`.
+- **A fresh document opens at the TOP of the newest turn**, not the document end (landing at the end shows the last line of an answer and none of its start). `TranscriptDocument.build` marks each turn's first character with `.transcriptTurnStart`; the representable scrolls there when the installed document is new or shorter than the last one, and only follows the tail on genuine appends while the reader is parked at the bottom.
+- **GFM tables are real `NSTextTable`s** (prose cells wrap inside their column), alignment taken from the `|:---:|` row, which is consumed rather than rendered. No speaker labels: the bubble says who spoke, and "CLAUDE" over every answer is noise.
+- **The spinner** (`isWorking`) is set only when the NEWEST turn is a `.user` one under 180s old, cleared by Claude text landing, by the hook's `Stop`/`Notification`, or after 90s of silence. Every flip logs `transcript: working=<bool> pane=<label> [reason]` — the only way to tell a stuck spinner from a correct one after the fact.
+- **Theme**: the style resolves from `TerminalSessions.currentPalette()`, repainting on `.floatnoteTerminalPaletteChanged`. Two traps, both fixed: the text view must diff a **styleGeneration** as well as the turn count (keying on turns alone left the text in the old palette until the next reply), and the app-theme repaint is driven from `EditorViewModel.theme.didSet`, NOT an `.onChange` — `@Published` fires `objectWillChange` *before* `didSet` writes `fn.theme`, so a view-side observer could resolve the palette from the old value.
 
 ## Folders & Trash
 - Folders live in `~/.floatnote-folders.json`: `{id, name, isExpanded, isTrashed?, parentId?}`

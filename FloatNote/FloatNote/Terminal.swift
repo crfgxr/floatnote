@@ -538,6 +538,57 @@ final class TerminalFontMenuTarget: NSObject {
     /// above 18 a terminal panel holds too few columns for Claude Code's UI.
     static let sizes: [Double] = [10, 11, 12, 13, 14, 15, 16, 18]
 
+    /// Transcript reading sizes. 13 is the smallest the serif/sans faces stay
+    /// comfortable at with a 1.625 line height; past 20 the 480pt measure holds
+    /// too few words per line.
+    static let transcriptSizes: [Double] = [13, 14, 15, 16, 17, 18, 20]
+
+    @objc func selectTranscriptFamily(_ sender: NSMenuItem) {
+        guard let family = sender.representedObject as? String else { return }
+        UserDefaults.standard.set(family, forKey: TranscriptStyle.familyKey)
+        restyleTranscript("face → \(family)")
+    }
+
+    /// Reading sizes are clamped, not free: under 11 the 1.625 line height stops
+    /// reading as prose, over 24 the 480pt measure holds a handful of words.
+    static let transcriptSizeRange: ClosedRange<CGFloat> = 11...24
+    static let transcriptDefaultSize: CGFloat = 16
+
+    /// Nudge the transcript text a point at a time — the control the reader
+    /// actually wants ("a notch bigger"), rather than picking a number off a list.
+    @discardableResult
+    static func stepTranscriptSize(_ delta: CGFloat) -> CGFloat {
+        let next = min(max(TranscriptStyle.selectedSize + delta, transcriptSizeRange.lowerBound),
+                       transcriptSizeRange.upperBound)
+        UserDefaults.standard.set(Double(next), forKey: TranscriptStyle.sizeKey)
+        NotificationCenter.default.post(name: .floatnoteTerminalPaletteChanged, object: nil)
+        dbg("transcript: size → \(Int(next))pt")
+        return next
+    }
+
+    static func resetTranscriptSize() {
+        UserDefaults.standard.set(Double(transcriptDefaultSize), forKey: TranscriptStyle.sizeKey)
+        NotificationCenter.default.post(name: .floatnoteTerminalPaletteChanged, object: nil)
+        dbg("transcript: size → \(Int(transcriptDefaultSize))pt (reset)")
+    }
+
+    @objc func stepTranscriptSmaller(_ sender: NSMenuItem) { Self.stepTranscriptSize(-1) }
+    @objc func stepTranscriptBigger(_ sender: NSMenuItem) { Self.stepTranscriptSize(1) }
+    @objc func resetTranscriptSizeAction(_ sender: NSMenuItem) { Self.resetTranscriptSize() }
+
+    @objc func selectTranscriptSize(_ sender: NSMenuItem) {
+        guard let size = sender.representedObject as? Double else { return }
+        UserDefaults.standard.set(size, forKey: TranscriptStyle.sizeKey)
+        restyleTranscript("size → \(Int(size))pt")
+    }
+
+    /// The pane resolves its own style on this notification, so nothing here
+    /// needs a reference to the view.
+    private func restyleTranscript(_ what: String) {
+        NotificationCenter.default.post(name: .floatnoteTerminalPaletteChanged, object: nil)
+        dbg("transcript: \(what)")
+    }
+
     @objc func selectAppearance(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let appearance = TerminalAppearance(rawValue: raw) else { return }
@@ -624,6 +675,67 @@ final class TerminalFontMenuTarget: NSObject {
         }
         spacingItem.submenu = spacingMenu
         menu.addItem(spacingItem)
+
+        // The transcript is the other half of this panel and had no controls at
+        // all — its face and size were only reachable by editing UserDefaults.
+        menu.addItem(.separator())
+        let transcriptHeader = NSMenuItem(title: "Transcript", action: nil, keyEquivalent: "")
+        transcriptHeader.isEnabled = false
+        menu.addItem(transcriptHeader)
+
+        // Steppers first: "one notch bigger" is the request, not "15pt".
+        let smaller = NSMenuItem(title: "Smaller Text", action: #selector(stepTranscriptSmaller(_:)),
+                                 keyEquivalent: "-")
+        smaller.target = self
+        smaller.keyEquivalentModifierMask = [.command]
+        smaller.isEnabled = TranscriptStyle.selectedSize > Self.transcriptSizeRange.lowerBound
+        menu.addItem(smaller)
+
+        let bigger = NSMenuItem(title: "Bigger Text", action: #selector(stepTranscriptBigger(_:)),
+                                keyEquivalent: "+")
+        bigger.target = self
+        bigger.keyEquivalentModifierMask = [.command]
+        bigger.isEnabled = TranscriptStyle.selectedSize < Self.transcriptSizeRange.upperBound
+        menu.addItem(bigger)
+
+        let reset = NSMenuItem(title: "Reset Text Size (\(Int(Self.transcriptDefaultSize)) pt)",
+                               action: #selector(resetTranscriptSizeAction(_:)), keyEquivalent: "0")
+        reset.target = self
+        reset.keyEquivalentModifierMask = [.command]
+        menu.addItem(reset)
+        menu.addItem(.separator())
+
+        let faceItem = NSMenuItem(title: "Reading Face", action: nil, keyEquivalent: "")
+        let faceMenu = NSMenu()
+        let currentFace = TranscriptStyle.selectedFamily
+        for (name, postscript) in TranscriptStyle.availableReadingFaces() {
+            let item = NSMenuItem(title: name, action: #selector(selectTranscriptFamily(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = name
+            item.state = currentFace == name ? .on : .off
+            if let font = NSFont(name: postscript, size: 13) {
+                item.attributedTitle = NSAttributedString(string: name, attributes: [.font: font])
+            }
+            faceMenu.addItem(item)
+        }
+        faceItem.submenu = faceMenu
+        menu.addItem(faceItem)
+
+        let textSizeItem = NSMenuItem(title: "Text Size (\(Int(TranscriptStyle.selectedSize)) pt)",
+                                      action: nil, keyEquivalent: "")
+        let textSizeMenu = NSMenu()
+        let currentSize = TranscriptStyle.selectedSize
+        for value in Self.transcriptSizes {
+            let item = NSMenuItem(title: "\(Int(value)) pt", action: #selector(selectTranscriptSize(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = value
+            item.state = abs(currentSize - CGFloat(value)) < 0.01 ? .on : .off
+            textSizeMenu.addItem(item)
+        }
+        textSizeItem.submenu = textSizeMenu
+        menu.addItem(textSizeItem)
         return menu
     }
 }

@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.73.3"
+let APP_VERSION = "v1.75.2"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -168,6 +168,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     tv.window?.makeFirstResponder(tv)
                     tv.insertImage(img)
                     handled = true
+                }
+                if handled { return nil }
+            }
+            // ⌘− / ⌘+ / ⌘0 resize the TRANSCRIPT text, from anywhere, while it is
+            // on screen. Focus is almost always in the terminal when you want the
+            // reading a notch bigger, and the terminal never sees ⌘ combinations,
+            // so this cannot steal a key Claude Code wanted.
+            if mods == [.command] || mods == [.command, .shift] {
+                var handled = false
+                MainActor.assumeIsolated {
+                    guard vm.isTerminalVisible, vm.transcriptMode == .split else { return }
+                    switch key {
+                    case "-": TerminalFontMenuTarget.stepTranscriptSize(-1); handled = true
+                    case "=", "+": TerminalFontMenuTarget.stepTranscriptSize(1); handled = true
+                    case "0": TerminalFontMenuTarget.resetTranscriptSize(); handled = true
+                    default: break
+                    }
                 }
                 if handled { return nil }
             }
@@ -3424,6 +3441,7 @@ struct TerminalPanel: View {
             .help("New terminal at current route")
             Spacer(minLength: 0)
             transcriptModeControl
+            if vm.transcriptMode == .split { transcriptSizeControls }
             // `terminalFontButton` is deliberately not in the bar: the palette
             // follows the app theme and SF Mono 13 is settled, so the menu was
             // only clutter. The menu itself still builds — put the button back
@@ -3444,6 +3462,32 @@ struct TerminalPanel: View {
         }
         .buttonStyle(.plain)
         .help(vm.transcriptMode.help)
+    }
+
+    /// A−/A+ for the transcript, shown only while it is on screen. The Aa menu
+    /// holds the same commands, but reading size is adjusted often enough that
+    /// digging two levels into a popup for it is the wrong shape.
+    private var transcriptSizeControls: some View {
+        HStack(spacing: 0) {
+            stepButton("textformat.size.smaller", help: "Smaller transcript text (⌘−)") {
+                TerminalFontMenuTarget.stepTranscriptSize(-1)
+            }
+            stepButton("textformat.size.larger", help: "Bigger transcript text (⌘+)") {
+                TerminalFontMenuTarget.stepTranscriptSize(1)
+            }
+        }
+    }
+
+    private func stepButton(_ symbol: String, help: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11))
+                .frame(width: 24, height: 28)
+                .foregroundColor(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     /// Font/size picker for every pane. Trailing edge of the tab bar, away from
@@ -4410,15 +4454,8 @@ struct StatusBar: View {
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
             Spacer()
-            if vm.tabs.count > 1, let activeId = vm.activeTabId {
-                Button(action: { vm.trashTab(activeId) }) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Move this note to Trash")
-            }
+            // No trash button here — trashing a note belongs to its sidebar row
+            // context menu, not to a status line you brush past with the cursor.
             Text("\(vm.charCount) chars")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)

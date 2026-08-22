@@ -103,7 +103,7 @@ enum TranscriptParser {
         func flushGroup() {
             guard let key = state.groupKey else { return }
             let text = state.groupText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty {
+            if !text.isEmpty, !Self.isBookkeeping(text) {
                 out.append(TranscriptTurn(id: key, kind: .claude, text: text, timestamp: state.groupTime))
             }
             state.groupKey = nil
@@ -236,7 +236,27 @@ enum TranscriptParser {
     }
 
     /// Whole messages that are machinery, not speech.
+    /// Turns that are harness bookkeeping rather than conversation. They arrive
+    /// as ordinary records — "No response requested." is an assistant turn, and
+    /// "Continue from where you left off." a user one — and a pane whose whole
+    /// job is the conversation should not typeset either. Exact match on the
+    /// whole turn only: a real answer that happens to contain these words keeps
+    /// its own sentences around it and stays.
+    private static let bookkeeping: Set<String> = [
+        "no response requested.",
+        "no response requested",
+        "(no response requested)",
+        "continue from where you left off.",
+        "continue from where you left off",
+        "continue",
+    ]
+
+    static func isBookkeeping(_ text: String) -> Bool {
+        bookkeeping.contains(text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
     private static func isInjection(_ text: String) -> Bool {
+        if isBookkeeping(text) { return true }
         let head = text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40)
         for tag in ["<task-notification", "<system-reminder", "<command-name", "<local-command",
                     "<user-prompt-submit-hook", "Caveat: The messages below"] where head.hasPrefix(tag) {
@@ -555,7 +575,15 @@ final class TranscriptStore: ObservableObject {
     /// landed and neither hook (Stop, or Notification = waiting on the human)
     /// has said the turn is over. The JSONL has no "turn started" record, so a
     /// recent `.user` turn IS the start signal.
-    @Published private(set) var isWorking = false
+    @Published private(set) var isWorking = false {
+        didSet {
+            guard isWorking != oldValue else { return }
+            dbg("transcript: working=\(isWorking) pane=\(paneLabel) [\(workingReason)]")
+        }
+    }
+    /// Why the spinner last flipped — the only way to tell a stuck spinner from
+    /// a correct one after the fact.
+    private var workingReason = "init"
 
     /// Mirrors the terminal's scrollback decision rather than holding the file.
     private let maxTurns = 400
@@ -577,7 +605,10 @@ final class TranscriptStore: ObservableObject {
     /// A user message older than this was already answered; a turn quieter than
     /// this has almost certainly ended without its hook reaching us.
     private static let turnStartWindow: TimeInterval = 180
-    private static let workingCap: TimeInterval = 600
+    /// A spinner still up this long after the last record is wrong, whatever the
+    /// reason (hook not installed, a turn that ended with no text, a reply whose
+    /// records were all tool calls). 600s meant "stuck for ten minutes".
+    private static let workingCap: TimeInterval = 150
     private var parseState = TranscriptParser.State()
     private var showToolCalls: Bool {
         UserDefaults.standard.bool(forKey: "fn.transcriptShowToolCalls")
@@ -623,6 +654,7 @@ final class TranscriptStore: ObservableObject {
         tail = nil
         turns = []
         parseState = TranscriptParser.State()
+        workingReason = "pane bound"
         isWorking = false
         lastRecordAt = Date()
         generation &+= 1
@@ -636,6 +668,10 @@ final class TranscriptStore: ObservableObject {
             var state = TranscriptParser.State()
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // Liveness is measured in BYTES, not in visible turns: a reply
+                // that is 90 seconds of tool calls emits nothing renderable, and
+                // timing the spinner off `append` cleared it mid-turn.
+                self.lastRecordAt = Date()
                 if isReset { self.turns = []; self.parseState = TranscriptParser.State() }
                 state = self.parseState
                 var new = TranscriptParser.parse(lines: lines, state: &state, showToolCalls: showTools)
@@ -689,7 +725,10 @@ final class TranscriptStore: ObservableObject {
     /// Safety net on the app's existing 2s timer, for a watcher that missed.
     func poll() {
         tail?.poll()
-        if isWorking, Date().timeIntervalSince(lastRecordAt) > Self.workingCap { isWorking = false }
+        if isWorking, Date().timeIntervalSince(lastRecordAt) > Self.workingCap {
+            workingReason = "file quiet for \(Int(Date().timeIntervalSince(lastRecordAt)))s"
+            isWorking = false
+        }
         // A pane whose Claude started after the bind (or hadn't started at all)
         // is still on a guess. Re-probe until the fd answers, then stop.
         if !isAuthoritative, let tab = boundTab,
@@ -703,6 +742,7 @@ final class TranscriptStore: ObservableObject {
     /// bound pane's events touch the spinner.
     func noteTurnEnded(paneId: UUID) {
         guard paneId == boundPaneId, isWorking else { return }
+        workingReason = "hook said the turn ended"
         isWorking = false
     }
 
@@ -722,12 +762,22 @@ final class TranscriptStore: ObservableObject {
         turns = merged
         generation &+= 1
         lastRecordAt = Date()
-        // A user message that just landed means Claude is off working. The
-        // timestamp gate keeps the initial full-file read (whose last turn is
-        // often a long-answered prompt) from lighting the spinner.
-        if let started = new.last(where: { $0.kind == .user }),
-           abs((started.timestamp ?? Date()).timeIntervalSinceNow) < Self.turnStartWindow {
-            isWorking = true
+        // Only the NEWEST turn decides. Asking for the last *user* turn in the
+        // batch lit the spinner on any cold read whose file happened to contain
+        // a recent prompt — even when Claude had already answered it further
+        // down — and then it sat there until the 10-minute cap.
+        switch new.last?.kind {
+        case .user:
+            let at = new.last?.timestamp ?? Date()
+            let fresh = abs(at.timeIntervalSinceNow) < Self.turnStartWindow
+            workingReason = fresh ? "user turn landed" : "user turn too old (\(Int(-at.timeIntervalSinceNow))s)"
+            isWorking = fresh
+        case .claude, .summary:
+            // Text is landing: whatever the spinner was for is now on screen.
+            workingReason = "claude text landed"
+            isWorking = false
+        default:
+            break
         }
     }
 }
@@ -766,7 +816,39 @@ struct TranscriptStyle {
     static let sizeKey = "fn.transcriptFontSize"
 
     static var selectedFamily: String {
-        UserDefaults.standard.string(forKey: familyKey) ?? "Charter"
+        UserDefaults.standard.string(forKey: familyKey) ?? "Anthropic Sans"
+    }
+
+    /// Claude Desktop ships its own faces as variable TTFs inside its bundle.
+    /// Registering them (process scope, read in place — nothing is copied into
+    /// this app, so nothing is redistributed) is what lets the transcript render
+    /// in the same type Claude's own UI uses. Absent Claude.app, the ladder in
+    /// `resolve` falls through to Charter.
+    ///
+    /// Named instances rather than the weight axis: "AnthropicSansVariable-Text\(cut)"
+    /// resolves through `NSFont(name:)`, which every other font path here already
+    /// uses. Optical size defaults to 16 (the Text cuts), which is the body size.
+    static let claudeFacesRegistered: Bool = {
+        let dir = "/Applications/Claude.app/Contents/Resources/fonts"
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return false }
+        var count = 0
+        for file in files where file.hasSuffix(".ttf") {
+            let url = URL(fileURLWithPath: dir + "/" + file)
+            if CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil) { count += 1 }
+        }
+        dbg("transcript: registered \(count) Claude face file(s)")
+        return count > 0
+    }()
+
+    /// The named cut of an Anthropic family for a given emphasis, or nil for
+    /// anything else (Charter and friends go through `NSFontManager`).
+    static func anthropicCut(of fontName: String, bold: Bool, italic: Bool) -> String? {
+        for family in ["AnthropicSansVariable", "AnthropicSerifVariable"]
+        where fontName.hasPrefix(family + "-Text") {
+            return family + "-Text" + (bold ? "Bold" : "Regular") + (italic ? "Italic" : "")
+        }
+        return nil
     }
     static var selectedSize: CGFloat {
         let stored = UserDefaults.standard.double(forKey: sizeKey)
@@ -778,6 +860,8 @@ struct TranscriptStyle {
     /// Style, Athelas, Seravek, Superclarendon) are absent from
     /// `availableFontFamilies` yet resolve perfectly via `NSFont(name:)`.
     static let readingFaces: [(String, String)] = [
+        ("Anthropic Sans", "AnthropicSansVariable-TextRegular"),
+        ("Anthropic Serif", "AnthropicSerifVariable-TextRegular"),
         ("Charter", "Charter-Roman"),
         ("Iowan Old Style", "IowanOldStyle-Roman"),
         ("Palatino", "Palatino-Roman"),
@@ -785,10 +869,12 @@ struct TranscriptStyle {
     ]
 
     static func availableReadingFaces() -> [(String, String)] {
-        readingFaces.filter { NSFont(name: $0.1, size: 16) != nil }
+        _ = claudeFacesRegistered      // Anthropic Sans/Serif only resolve after this
+        return readingFaces.filter { NSFont(name: $0.1, size: 16) != nil }
     }
 
     static func resolve(isDark: Bool) -> TranscriptStyle {
+        _ = claudeFacesRegistered      // before the first NSFont(name:) below
         let size = selectedSize
         let family = selectedFamily
         let postscript = readingFaces.first { $0.0 == family }?.1 ?? family
@@ -803,8 +889,18 @@ struct TranscriptStyle {
         let small = NSFont(name: body.fontName, size: size - 1) ?? body
         // The scale derives from the body size, so a size change moves everything.
         let scale = size / 16
+        // Headings track the body family when it carries real cuts (Anthropic
+        // Sans/Serif do), and only fall back to the system face otherwise —
+        // Charter's own bold is fine for prose but muddy at 24pt display size.
         func sf(_ points: CGFloat, _ weight: NSFont.Weight) -> NSFont {
-            NSFont.systemFont(ofSize: (points * scale).rounded(), weight: weight)
+            let points = (points * scale).rounded()
+            if let base = ["AnthropicSansVariable", "AnthropicSerifVariable"]
+                .first(where: { body.fontName.hasPrefix($0 + "-Text") }) {
+                let cut = weight == .bold ? "Bold" : "Semibold"
+                let display = points >= 19 ? "Display" : "Text"
+                if let font = NSFont(name: "\(base)-\(display)\(cut)", size: points) { return font }
+            }
+            return NSFont.systemFont(ofSize: points, weight: weight)
         }
         return TranscriptStyle(
             body: body,
@@ -857,6 +953,9 @@ extension NSAttributedString.Key {
     static let transcriptRule = NSAttributedString.Key("fnTranscriptRule")
     /// The user's own message, painted as a right-aligned bubble.
     static let transcriptBubble = NSAttributedString.Key("fnTranscriptBubble")
+    /// First character of each turn, so a fresh load can land on the newest
+    /// turn's TOP instead of the document's end.
+    static let transcriptTurnStart = NSAttributedString.Key("fnTranscriptTurnStart")
 }
 
 /// Markdown → `NSAttributedString`, in two passes: a line-oriented block scanner,
@@ -1279,6 +1378,13 @@ enum TranscriptMarkdown {
     }
 
     private static func styled(_ font: NSFont, bold: Bool, italic: Bool) -> NSFont {
+        // A variable font's named instance can't be re-weighted by NSFontManager
+        // (it synthesises a smear instead), so ask for the real cut by name.
+        if bold || italic,
+           let name = TranscriptStyle.anthropicCut(of: font.fontName, bold: bold, italic: italic),
+           let cut = NSFont(name: name, size: font.pointSize) {
+            return cut
+        }
         var traits: NSFontTraitMask = []
         if bold { traits.insert(.boldFontMask) }
         if italic { traits.insert(.italicFontMask) }
@@ -1302,19 +1408,25 @@ enum TranscriptDocument {
             let isClaude: Bool
             if case .claude = turn.kind { isClaude = true } else { isClaude = false }
             defer { lastWasClaude = isClaude }
+            let start = out.length
+            defer {
+                if out.length > start {
+                    out.addAttribute(.transcriptTurnStart, value: true,
+                                     range: NSRange(location: start, length: 1))
+                }
+            }
             switch turn.kind {
             case .claude:
-                // Label the speaker, not every API turn — one visible reply can
-                // be six records, and a label above each shreds the page.
-                if !lastWasClaude {
-                    out.append(meta("CLAUDE", style: style, alignment: .left))
-                    out.append(NSAttributedString(string: "\n"))
-                }
-                out.append(TranscriptMarkdown.render(turn.text, style: style))
+                // No speaker labels: the bubble already says who spoke, and a
+                // "CLAUDE" rubric over every answer is noise on a page where
+                // all the unbubbled text is Claude's. A reply that follows a
+                // bubble buys its air from paragraph spacing instead.
+                let body = NSMutableAttributedString(
+                    attributedString: TranscriptMarkdown.render(turn.text, style: style))
+                if !lastWasClaude { spaceBefore(20, in: body) }
+                out.append(body)
             case .user:
                 out.append(bubble(turn.text, style: style, measure: measure))
-                out.append(NSAttributedString(string: "\n"))
-                out.append(meta("YOU", style: style, alignment: .right))
             case .summary:
                 out.append(meta("SUMMARY OF EARLIER CONVERSATION", style: style, alignment: .left))
                 out.append(NSAttributedString(string: "\n"))
@@ -1329,6 +1441,27 @@ enum TranscriptDocument {
             out.append(NSAttributedString(string: "\n"))
         }
         return out
+    }
+
+    /// Where the newest turn begins, for the initial scroll position.
+    static func lastTurnStart(in document: NSAttributedString) -> Int? {
+        var found: Int?
+        document.enumerateAttribute(.transcriptTurnStart,
+                                    in: NSRange(location: 0, length: document.length)) { value, range, _ in
+            if value != nil { found = range.location }
+        }
+        return found
+    }
+
+    /// Raise the leading space above a block's first paragraph.
+    private static func spaceBefore(_ points: CGFloat, in text: NSMutableAttributedString) {
+        guard text.length > 0 else { return }
+        var range = NSRange(location: 0, length: 0)
+        let existing = text.attribute(.paragraphStyle, at: 0,
+                                      effectiveRange: &range) as? NSParagraphStyle
+        let ps = (existing?.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
+        ps.paragraphSpacingBefore = max(ps.paragraphSpacingBefore, points)
+        text.addAttribute(.paragraphStyle, value: ps, range: range)
     }
 
     /// Sans, not serif: serifs go muddy at 11pt under grayscale-only AA.
@@ -1554,6 +1687,9 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         var scrollView: NSScrollView?
         var lastGeneration = -1
         var lastStyleGeneration = -1
+        /// Length of the document installed last time, to tell an append (the
+        /// tail grew) from a fresh load (a pane switch, or a restyle).
+        var lastLength = 0
         /// The pane follows the tail only while the reader is already at it.
         var following = true
     }
@@ -1622,6 +1758,11 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         let restyled = context.coordinator.lastStyleGeneration != styleGeneration
         context.coordinator.lastGeneration = generation
         context.coordinator.lastStyleGeneration = styleGeneration
+        // A restyle re-lays out every line, so the old scroll offset means
+        // nothing — at a smaller size it can sit past the end of the shorter
+        // document, which reads as a blank pane with one clipped line. Forcing
+        // the fresh-load path re-anchors on the newest turn.
+        if restyled { context.coordinator.lastLength = 0 }
         if restyled {
             (scroll.documentView as? NSTextView)?.linkTextAttributes = [
                 .foregroundColor: style.link,
@@ -1639,7 +1780,53 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         scroll.backgroundColor = style.background
         let inset = max(0, (scroll.contentSize.width - measure) / 2)
         textView.textContainerInset = NSSize(width: max(24, inset), height: 20)
+        let previous = coordinator.lastLength
+        coordinator.lastLength = document.length
         textView.textStorage?.setAttributedString(document)
+
+        // A fresh document (pane switch, first read) opens at the TOP of the
+        // newest turn — landing at the very end shows you the last line of the
+        // answer and none of its beginning. A grown one keeps following the tail.
+        if previous == 0 || document.length < previous {
+            let index = TranscriptDocument.lastTurnStart(in: document)
+            DispatchQueue.main.async {
+                guard let layout = textView.layoutManager,
+                      let container = textView.textContainer else { return }
+                // Three things have to happen in this order, and skipping any one
+                // of them leaves the pane looking broken after a size change:
+                //   1. lay the WHOLE document out — offsets measured against a
+                //      partially laid-out document point at the wrong lines;
+                //   2. resize the view to it, or every offset below is computed
+                //      against the previous type size's height;
+                //   3. invalidate the drawing, because AppKit only repaints the
+                //      band it thinks changed — that is the empty strip above the
+                //      text after a restyle, laid out but never drawn.
+                let whole = NSRange(location: 0, length: document.length)
+                layout.ensureLayout(for: container)
+                textView.sizeToFit()
+                layout.invalidateDisplay(forCharacterRange: whole)
+                textView.needsDisplay = true
+
+                let clip = scroll.contentView
+                let maxY = max(0, textView.bounds.height - clip.bounds.height)
+                var y = maxY
+                if let index, index < document.length {
+                    let glyphs = layout.glyphRange(forCharacterRange: NSRange(location: index, length: 1),
+                                                   actualCharacterRange: nil)
+                    let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+                    y = min(max(0, rect.minY + textView.textContainerInset.height - 12), maxY)
+                }
+                clip.scroll(to: NSPoint(x: 0, y: y))
+                scroll.reflectScrolledClipView(clip)
+                // One more pass after the scroll settles: the clip view's own
+                // bounds change can leave the newly exposed rows unpainted.
+                DispatchQueue.main.async {
+                    textView.needsDisplay = true
+                    clip.needsDisplay = true
+                }
+            }
+            return
+        }
         guard coordinator.following else { return }
         DispatchQueue.main.async {
             textView.scrollToEndOfDocument(nil)
