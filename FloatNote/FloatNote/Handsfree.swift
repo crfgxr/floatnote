@@ -113,6 +113,10 @@ final class HandsfreeManager: ObservableObject {
     private var tickTimer: Timer?
     /// Transcript from tasks that already finalized within this utterance.
     private var committedTranscript = ""
+    /// The newest partial of the hypothesis the recognizer is currently
+    /// revising. Held separately from `committedTranscript` so a hypothesis can
+    /// be committed whole the moment the next one starts.
+    private var lastPartial = ""
     private var lastTranscriptChange = Date()
     /// The text currently being read aloud, for the barge-in echo filter.
     private var currentSpokenText = ""
@@ -353,9 +357,26 @@ final class HandsfreeManager: ObservableObject {
     // MARK: - Transcript
 
     private func handleTranscript(_ text: String, isFinal: Bool) {
-        let combined = (committedTranscript + " " + text)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if isFinal { committedTranscript = combined }
+        // The recognizer does NOT reliably report finals: with on-device
+        // recognition a pause just starts a NEW hypothesis, and the next partial
+        // contains only the new sentence — 0 of 0 finals arrived in a session
+        // where the first sentence kept disappearing. So the sentence boundary
+        // is detected from the partials themselves: a partial that is not a
+        // revision of the previous one means that hypothesis is done, and it is
+        // committed before the new words are appended. Nothing is ever dropped
+        // on a pause, whether or not a final ever comes.
+        if !isFinal, !lastPartial.isEmpty, !Self.isRevision(of: lastPartial, text) {
+            committedTranscript = VoiceEngine.joinDictation(committedTranscript, lastPartial)
+            dbg("handsfree: sentence committed — \(committedTranscript.split(separator: " ").count)w held")
+        }
+        let combined = VoiceEngine.joinDictation(committedTranscript, text)
+        if isFinal {
+            committedTranscript = combined
+            lastPartial = ""
+            dbg("handsfree: final committed — \(combined.split(separator: " ").count)w held")
+        } else {
+            lastPartial = text
+        }
 
         if state == .speaking {
             guard bargeInEnabled, canBargeIn(combined) else {
@@ -420,8 +441,20 @@ final class HandsfreeManager: ObservableObject {
         refreshStatus()
     }
 
+    /// Two partials belong to the same hypothesis when they still agree on how
+    /// they start: the recognizer revises words in place ("send it" → "send
+    /// its"), but a new utterance begins with different words.
+    private static func isRevision(of old: String, _ new: String) -> Bool {
+        let o = VoiceEngine.normalizeSpeech(old).split(separator: " ")
+        let n = VoiceEngine.normalizeSpeech(new).split(separator: " ")
+        guard !o.isEmpty, !n.isEmpty else { return true }
+        let k = min(3, o.count, n.count)
+        return Array(o.prefix(k)) == Array(n.prefix(k))
+    }
+
     private func resetTranscript() {
         committedTranscript = ""
+        lastPartial = ""
         liveTranscript = ""
         lastTranscriptChange = Date()
     }

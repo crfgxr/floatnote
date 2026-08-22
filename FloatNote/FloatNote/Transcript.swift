@@ -772,11 +772,12 @@ final class TranscriptStore: ObservableObject {
             let fresh = abs(at.timeIntervalSinceNow) < Self.turnStartWindow
             workingReason = fresh ? "user turn landed" : "user turn too old (\(Int(-at.timeIntervalSinceNow))s)"
             isWorking = fresh
-        case .claude, .summary:
-            // Text is landing: whatever the spinner was for is now on screen.
-            workingReason = "claude text landed"
-            isWorking = false
         default:
+            // Claude text does NOT end a turn: prose usually lands in the
+            // middle of one, with tool calls still to come ("Calculating… 1m
+            // 41s" in the terminal, nothing new in the file for a while).
+            // Only the hook's Stop/Notification, or the file going quiet for
+            // `workingCap`, mean the turn is over.
             break
         }
     }

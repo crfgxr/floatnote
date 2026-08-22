@@ -62,12 +62,19 @@ struct HandsfreeBar: View {
     @ViewBuilder
     private var centerText: some View {
         if !handsfree.liveTranscript.isEmpty {
+            // Hugs its content: one spoken line is one line tall, and it grows
+            // to at most three. A ScrollView here reserved its full height even
+            // while empty, which left a slab of dead space under the bar.
+            // Head truncation keeps the newest words in view; the whole
+            // utterance is still buffered and still gets sent.
             Text(handsfree.liveTranscript)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.primary)
-                .lineLimit(1)
-                // Head truncation keeps the newest words — the tail — visible.
+                .lineLimit(3)
                 .truncationMode(.head)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else if handsfree.state == .listening && !handsfree.awaitingQuickResponse {
             Text(Self.hints[hintIndex])
                 .font(.system(size: 10))

@@ -280,6 +280,47 @@ extension VoiceEngine {
         return s.trimmingCharacters(in: .whitespaces)
     }
 
+    /// Append one dictated fragment to another, dropping any overlap between
+    /// them.
+    ///
+    /// A recognition task ends on a pause and the next one starts against the
+    /// SAME live audio tap, so the tail of the sentence you just finished is
+    /// re-consumed and comes back as the head of the next result. Appending
+    /// blind said those words twice — which is what made a pause look like it
+    /// "repeated the previous sentence". Compared word-wise on normalised
+    /// words, longest overlap first, so punctuation and casing don't defeat it.
+    static func joinDictation(_ committed: String, _ next: String) -> String {
+        let head = committed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tail = next.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !head.isEmpty else { return tail }
+        guard !tail.isEmpty else { return head }
+        let headWords = head.split(separator: " ").map(String.init)
+        let tailWords = tail.split(separator: " ").map(String.init)
+        func norm(_ words: [String]) -> [String] {
+            words.map { normalizeSpeech($0) }.filter { !$0.isEmpty }
+        }
+        let normHead = norm(headWords), normTail = norm(tailWords)
+        // 8 words is about the longest tail the recognizer replays; beyond that
+        // a match is more likely a real repetition the speaker meant.
+        let limit = min(8, normHead.count, normTail.count)
+        var drop = 0
+        var k = limit
+        while k >= 1 {
+            if Array(normHead.suffix(k)) == Array(normTail.prefix(k)) { drop = k; break }
+            k -= 1
+        }
+        guard drop > 0 else { return head + " " + tail }
+        // The dropped words are counted in normalised space; skip the same
+        // number of RAW words, whose punctuation we want to keep discarding too.
+        var skipped = 0, index = 0
+        while index < tailWords.count, skipped < drop {
+            if !normalizeSpeech(tailWords[index]).isEmpty { skipped += 1 }
+            index += 1
+        }
+        let rest = tailWords[index...].joined(separator: " ")
+        return rest.isEmpty ? head : head + " " + rest
+    }
+
     // Trailing triggers are matched against the END of the transcript, so a
     // whole dictated message can carry one. Turkish aliases are included
     // because the recognizer locale is user-selectable.
@@ -421,6 +462,9 @@ final class SpeechListener {
     /// this, a task cancelled right after "send it" can still deliver its final
     /// result and submit the same sentence twice.
     private var taskGen = 0
+    /// Latest partial of the CURRENT task, so a task that dies without a final
+    /// result can still hand its words over.
+    private var lastPartial = ""
     private var lastLevelEmit = Date.distantPast
     /// Timestamps of automatic task restarts, for the runaway-loop guard.
     private var restarts: [Date] = []
@@ -533,6 +577,7 @@ final class SpeechListener {
 
     private func startTask() {
         taskGen += 1
+        lastPartial = ""
         let gen = taskGen
         task?.cancel()
         request?.endAudio()
@@ -556,11 +601,24 @@ final class SpeechListener {
             DispatchQueue.main.async {
                 guard self.taskGen == gen, self.isRunning else { return }
                 if let result {
-                    self.onTranscript?(result.bestTranscription.formattedString, result.isFinal)
+                    let text = result.bestTranscription.formattedString
+                    self.lastPartial = result.isFinal ? "" : text
+                    self.onTranscript?(text, result.isFinal)
                     if result.isFinal { self.scheduleRestart() }
                     return
                 }
-                if error != nil { self.scheduleRestart() }
+                if error != nil {
+                    // A task that dies mid-sentence (the usual "no speech
+                    // detected" / timeout) never reports a final result, so its
+                    // words were being thrown away. Commit what it had heard
+                    // before opening the next one.
+                    if !self.lastPartial.isEmpty {
+                        let text = self.lastPartial
+                        self.lastPartial = ""
+                        self.onTranscript?(text, true)
+                    }
+                    self.scheduleRestart()
+                }
             }
         }
     }
