@@ -543,6 +543,16 @@ final class TerminalFontMenuTarget: NSObject {
     /// too few words per line.
     static let transcriptSizes: [Double] = [13, 14, 15, 16, 17, 18, 20]
 
+    @objc func toggleTranscriptToolCalls(_ sender: NSMenuItem) {
+        let key = "fn.transcriptShowToolCalls"
+        let now = UserDefaults.standard.object(forKey: key) as? Bool ?? true
+        UserDefaults.standard.set(!now, forKey: key)
+        // The store re-reads this when it rebinds, so the change lands on the
+        // next turn; the notification repaints what is already on screen.
+        NotificationCenter.default.post(name: .floatnoteTerminalPaletteChanged, object: nil)
+        dbg("transcript: tool calls \(!now ? "shown" : "hidden")")
+    }
+
     @objc func selectTranscriptFamily(_ sender: NSMenuItem) {
         guard let family = sender.representedObject as? String else { return }
         UserDefaults.standard.set(family, forKey: TranscriptStyle.familyKey)
@@ -736,6 +746,13 @@ final class TerminalFontMenuTarget: NSObject {
         }
         textSizeItem.submenu = textSizeMenu
         menu.addItem(textSizeItem)
+
+        let toolItem = NSMenuItem(title: "Show Tool Calls",
+                                  action: #selector(toggleTranscriptToolCalls(_:)), keyEquivalent: "")
+        toolItem.target = self
+        toolItem.state = (UserDefaults.standard.object(forKey: "fn.transcriptShowToolCalls") as? Bool ?? true)
+            ? .on : .off
+        menu.addItem(toolItem)
         return menu
     }
 }

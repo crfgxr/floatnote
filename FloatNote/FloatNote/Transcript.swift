@@ -81,6 +81,9 @@ struct TranscriptTurn: Identifiable, Equatable {
         case toolCall(String)
         /// A new `claude` run started in this pane.
         case sessionBreak
+        /// The human hit escape. Not a prompt — the END of a turn, and the only
+        /// signal for it that arrives in the file rather than through the hook.
+        case interrupt
     }
 
     let id: String
@@ -183,6 +186,11 @@ enum TranscriptParser {
                 // Harness injections wear the user role too: task notifications,
                 // system reminders, slash-command echoes. A person did not say them.
                 guard !Self.isInjection(text) else { state.skipped["injection", default: 0] += 1; continue }
+                if Self.isInterrupt(text) {
+                    out.append(TranscriptTurn(id: (obj["uuid"] as? String) ?? UUID().uuidString,
+                                              kind: .interrupt, text: "", timestamp: time))
+                    continue
+                }
                 let isSummary = obj["isCompactSummary"] as? Bool == true
                 out.append(TranscriptTurn(id: (obj["uuid"] as? String) ?? UUID().uuidString,
                                           kind: isSummary ? .summary : .user,
@@ -269,6 +277,14 @@ enum TranscriptParser {
         "continue from where you left off",
         "continue",
     ]
+
+    /// Claude Code writes an interrupt into the transcript as a `user` record.
+    /// Read as a prompt it looked like the start of a turn and lit the spinner
+    /// for work that had just been cancelled.
+    static func isInterrupt(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .hasPrefix("[Request interrupted by user")
+    }
 
     static func isBookkeeping(_ text: String) -> Bool {
         bookkeeping.contains(text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
@@ -633,7 +649,10 @@ final class TranscriptStore: ObservableObject {
     private static let workingCap: TimeInterval = 150
     private var parseState = TranscriptParser.State()
     private var showToolCalls: Bool {
-        UserDefaults.standard.bool(forKey: "fn.transcriptShowToolCalls")
+        // On by default. Off, an answer that ends "…building that now:" is the
+        // last thing on the page — the work that followed was a tool call, and
+        // the pane looked like it had truncated the reply.
+        UserDefaults.standard.object(forKey: "fn.transcriptShowToolCalls") as? Bool ?? true
     }
 
     private init() {}
@@ -789,6 +808,9 @@ final class TranscriptStore: ObservableObject {
         // a recent prompt — even when Claude had already answered it further
         // down — and then it sat there until the 10-minute cap.
         switch new.last?.kind {
+        case .interrupt:
+            workingReason = "interrupted"
+            isWorking = false
         case .user:
             let at = new.last?.timestamp ?? Date()
             let fresh = abs(at.timeIntervalSinceNow) < Self.turnStartWindow
@@ -1458,6 +1480,8 @@ enum TranscriptDocument {
                 out.append(divider(label, style: style))
             case .sessionBreak:
                 out.append(divider("New session started", style: style))
+            case .interrupt:
+                out.append(divider("Interrupted", style: style))
             case .toolCall(let label):
                 out.append(toolLine(label, style: style))
             }
@@ -1981,8 +2005,37 @@ struct TranscriptSplitHandle: View {
     @State private var isDragging = false
     @State private var startFraction: Double = 0.6
 
-    private let transcriptMinimum: CGFloat = 180
-    private let terminalMinimum: CGFloat = 220
+    /// 100pt of transcript still shows a turn's opening line.
+    static let transcriptFloor: CGFloat = 100
+
+    /// The terminal's floor is measured in ROWS, not points, because what has to
+    /// stay on screen is a fixed amount of Claude Code's own furniture: the input
+    /// frame (3 rows), the model/context/status block under it (4), and a few
+    /// rows of actual output. A flat 96pt let the bar swallow the output area and
+    /// leave nothing but the status lines; a flat 220pt stopped it too high at
+    /// small font sizes. This tracks the font.
+    ///
+    /// Static because the LAYOUT has to honour the same number: clamping only
+    /// the drag left a stored fraction from before the change rendering a
+    /// terminal with no output area at all, and no way to see that it was wrong.
+    static func terminalFloor() -> CGFloat {
+        let font = TerminalSessions.currentFont()
+        let row = (font.ascender - font.descender + font.leading).rounded()
+            + TerminalSessions.selectedLineSpacing
+        // Seven rows, not ten: ten stopped the bar ~50pt higher than people
+        // actually want it — enough for Claude Code's input frame and status
+        // block, with a row or two of output above them.
+        return max(140, row * 7)
+    }
+
+    /// The transcript's height for a given panel height, with both floors applied.
+    static func transcriptHeight(in total: CGFloat, fraction: Double) -> CGFloat {
+        let ceiling = max(transcriptFloor, total - terminalFloor())
+        return min(max(transcriptFloor, total * CGFloat(fraction)), ceiling)
+    }
+
+    private let transcriptMinimum = TranscriptSplitHandle.transcriptFloor
+    private var terminalMinimum: CGFloat { TranscriptSplitHandle.terminalFloor() }
 
     var body: some View {
         ZStack {

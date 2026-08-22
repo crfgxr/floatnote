@@ -45,6 +45,52 @@ private enum BrowserRPCOutcome {
     case failure(String)
 }
 
+/// A viewport to render the page in, the way Chrome DevTools' device toolbar
+/// does it: a fixed CSS pixel size plus the user agent that goes with it.
+///
+/// Both halves matter. The size alone shows you the layout at that width; the
+/// user agent is what makes a server send its mobile page in the first place, so
+/// switching device reloads the tab.
+struct BrowserDevice: Identifiable, Equatable {
+    let name: String
+    let width: CGFloat
+    let height: CGFloat
+    /// nil = leave the platform default (a Mac Safari UA) alone.
+    let userAgent: String?
+    /// `.responsive` fills the panel instead of pinning a width.
+    var isResponsive: Bool { width == 0 }
+
+    var id: String { name }
+    var label: String { isResponsive ? name : "\(name) · \(Int(width))×\(Int(height))" }
+
+    static let iPhoneUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+        + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+    static let iPadUA = "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) "
+        + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+    static let androidUA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+        + "(KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+
+    static let responsive = BrowserDevice(name: "Responsive", width: 0, height: 0, userAgent: nil)
+
+    /// Sizes are the CSS viewports these devices actually report, not their
+    /// hardware pixels — a 393pt iPhone 15 is a 1179px screen.
+    static let all: [BrowserDevice] = [
+        responsive,
+        BrowserDevice(name: "iPhone SE", width: 375, height: 667, userAgent: iPhoneUA),
+        BrowserDevice(name: "iPhone 15", width: 393, height: 852, userAgent: iPhoneUA),
+        BrowserDevice(name: "iPhone 15 Pro Max", width: 430, height: 932, userAgent: iPhoneUA),
+        BrowserDevice(name: "Pixel 8", width: 412, height: 915, userAgent: androidUA),
+        BrowserDevice(name: "Galaxy S24", width: 360, height: 780, userAgent: androidUA),
+        BrowserDevice(name: "iPad mini", width: 744, height: 1133, userAgent: iPadUA),
+        BrowserDevice(name: "iPad Pro 11\"", width: 834, height: 1194, userAgent: iPadUA),
+        BrowserDevice(name: "Desktop", width: 1440, height: 900, userAgent: nil),
+    ]
+
+    static func named(_ name: String) -> BrowserDevice {
+        all.first { $0.name == name } ?? responsive
+    }
+}
+
 // MARK: - Sessions
 
 /// Owns browser pages independently of the SwiftUI view lifecycle, exactly as
@@ -72,6 +118,13 @@ final class BrowserSessions: ObservableObject {
     @Published private(set) var states: [UUID: BrowserPageState] = [:]
 
     private var pages: [UUID: BrowserPage] = [:]
+    /// The viewport every tab renders in — app-wide, like a DevTools toolbar
+    /// setting, because you are checking "the page" and not one tab of it.
+    @Published var device: BrowserDevice = BrowserDevice.named(
+        UserDefaults.standard.string(forKey: "fn.browserDevice") ?? "Responsive")
+    /// Landscape swaps the two axes without needing a preset per orientation.
+    @Published var deviceLandscape: Bool = UserDefaults.standard.bool(forKey: "fn.browserDeviceLandscape")
+
     private var rpcWatcher: DispatchSourceFileSystemObject?
     /// Request stems already handed to `execute` — an action can take seconds
     /// (a navigation waits for `didFinish`), and both the vnode watcher and the
@@ -498,7 +551,88 @@ final class BrowserSessions: ObservableObject {
             // isn't in a window has nothing rendered to capture.
             requestVisible()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                self.capture(page, fullPage: fullPage, done: done)
+                // The annotation tool bar is OUR chrome. It has no business in a
+                // picture of the user's page, whoever asked for the picture.
+                page.webView.evaluateJavaScript("window.__fnAnn && window.__fnAnn.chrome(false)") { _, _ in
+                    self.capture(page, fullPage: fullPage) { outcome in
+                        page.webView.evaluateJavaScript("window.__fnAnn && window.__fnAnn.chrome(true)") { _, _ in }
+                        done(outcome)
+                    }
+                }
+            }
+
+        // Annotations: boxes drawn ON the page, in page coordinates, so they
+        // scroll with the content and land in every screenshot. Claude adds them
+        // to point at something ("this is the fare that flips"); the user draws
+        // them with the pane's pencil. Both end up in the same list.
+        case "annotate":
+            guard Self.allowClaudeWrites else { return done(.failure(Self.writesDisabled)) }
+            guard let id = resolve(params), let page = page(for: id) else {
+                return done(.failure(Self.noTabError))
+            }
+            let selector = Self.str(params, "selector")
+            let rect = params["rect"] as? [String: Any]
+            guard selector != nil || rect != nil else {
+                return done(.failure("annotate needs a selector or a rect"))
+            }
+            var spec: [String: Any] = ["source": "claude"]
+            if let selector { spec["selector"] = selector }
+            if let rect { spec["rect"] = rect }
+            if let note = Self.str(params, "note") { spec["note"] = note }
+            if let color = Self.str(params, "color") { spec["color"] = color }
+            let call = "window.__fnAnn.add(\(Self.jsonLiteral(spec)))"
+            withAnnotations(page, call) { value, error in
+                if let error { return done(.failure("annotate failed — \(error)")) }
+                guard let json = value as? String, let item = Self.decodeJSON(json) else {
+                    return done(.failure(selector.map { "nothing matched selector \($0)" }
+                                         ?? "the rect could not be placed"))
+                }
+                done(.ok(["annotation": item]))
+            }
+
+        case "device":
+            if let name = Self.str(params, "name") {
+                let match = BrowserDevice.all.first {
+                    $0.name.lowercased() == name.lowercased()
+                        || $0.name.lowercased().contains(name.lowercased())
+                }
+                guard let match else {
+                    let names = BrowserDevice.all.map(\.name).joined(separator: ", ")
+                    return done(.failure("no such device \"\(name)\" — try one of: \(names)"))
+                }
+                setDevice(match, landscape: Self.boolOrNil(params, "landscape") ?? deviceLandscape)
+            } else if let landscape = Self.boolOrNil(params, "landscape") {
+                setDevice(device, landscape: landscape)
+            }
+            requestVisible()
+            let size = deviceSize
+            done(.ok(["name": device.name,
+                      "width": size == .zero ? 0 : Int(size.width),
+                      "height": size == .zero ? 0 : Int(size.height),
+                      "landscape": deviceLandscape,
+                      "userAgent": device.userAgent ?? "default (macOS Safari)",
+                      "available": BrowserDevice.all.map(\.name)]))
+
+        case "annotations":
+            guard let id = resolve(params), let page = page(for: id) else {
+                return done(.failure(Self.noTabError))
+            }
+            withAnnotations(page, "window.__fnAnn.list()") { value, error in
+                if let error { return done(.failure("annotations failed — \(error)")) }
+                let items = (value as? String).flatMap { Self.decodeJSONArray($0) } ?? []
+                done(.ok(["url": page.currentURL, "annotations": items]))
+            }
+
+        case "annotate_clear":
+            guard Self.allowClaudeWrites else { return done(.failure(Self.writesDisabled)) }
+            guard let id = resolve(params), let page = page(for: id) else {
+                return done(.failure(Self.noTabError))
+            }
+            let index = Self.num(params, "index")
+            let call = index.map { "window.__fnAnn.clear(\($0))" } ?? "window.__fnAnn.clear()"
+            withAnnotations(page, call) { value, error in
+                if let error { return done(.failure("annotate_clear failed — \(error)")) }
+                done(.ok(["cleared": (value as? NSNumber)?.intValue ?? 0]))
             }
 
         case "wait":
@@ -706,6 +840,477 @@ final class BrowserSessions: ObservableObject {
     /// *visible*-text match over the things a person could actually click. The
     /// visibility test matters: pages keep hidden duplicates of their nav, and
     /// clicking one does nothing at all.
+    /// Install the annotation runtime (idempotent) and then run `call` against
+    /// it. Every annotation action goes through here, so a page that navigated
+    /// since the last call still gets a live layer instead of a JS error.
+    private func withAnnotations(_ page: BrowserPage, _ call: String,
+                                 _ done: @escaping (Any?, String?) -> Void) {
+        page.webView.evaluateJavaScript(Self.annotationRuntimeJS) { _, error in
+            if let error { return done(nil, error.localizedDescription) }
+            page.webView.evaluateJavaScript(call) { value, error in
+                done(value, error?.localizedDescription)
+            }
+        }
+    }
+
+    /// Screenshot the annotated page and post it for delivery. Not sent from
+    /// here: `BrowserSessions` has no idea which terminal is active, and the
+    /// AppDelegate that observes this does.
+    func sendAnnotations(tab id: UUID) {
+        guard let page = page(for: id) else { return }
+        withAnnotations(page, "window.__fnAnn.list()") { [weak self] value, _ in
+            guard let self else { return }
+            let items = (value as? String).flatMap { Self.decodeJSONArray($0) } ?? []
+            // The tool bar is app chrome, not a mark — a screenshot with it in
+            // shows Claude a picture of our own UI.
+            page.webView.evaluateJavaScript("window.__fnAnn.chrome(false)") { _, _ in
+            self.capture(page, fullPage: false) { outcome in
+                guard case .ok(let result) = outcome, let path = result["path"] as? String else {
+                    dbg("browser: annotation send failed — no screenshot")
+                    return
+                }
+                var lines = ["Screenshot of \(page.currentURL) with my annotations: \(path)"]
+                for item in items {
+                    let index = (item["index"] as? NSNumber)?.intValue ?? 0
+                    let note = (item["note"] as? String) ?? ""
+                    let covers = (item["text"] as? String) ?? ""
+                    var line = "\(index). \(note.isEmpty ? "(no note)" : note)"
+                    if !covers.isEmpty { line += " — covers: \(covers)" }
+                    lines.append(line)
+                }
+                let text = lines.joined(separator: "\n")
+                dbg("browser: annotation → terminal (\(items.count) mark(s), \(path))")
+                NotificationCenter.default.post(name: .floatnoteBrowserAnnotationReady,
+                                                object: nil, userInfo: ["text": text])
+                // "Add to chat" ends the markup session: the marks are in the
+                // picture that was just sent, so they are wiped, and the tool
+                // closes — leaving them up meant the next send carried the same
+                // stale drawing, and the pencil stayed armed over a page you
+                // were done marking.
+                page.webView.evaluateJavaScript("window.__fnAnn.clear(); window.__fnAnn.mode(false)") { _, _ in
+                    NotificationCenter.default.post(name: .floatnoteBrowserAnnotateModeOff, object: nil)
+                }
+            }
+            }
+        }
+    }
+
+    /// The size to render at, honouring orientation. Zero means "fill the panel".
+    var deviceSize: CGSize {
+        guard !device.isResponsive else { return .zero }
+        return deviceLandscape
+            ? CGSize(width: device.height, height: device.width)
+            : CGSize(width: device.width, height: device.height)
+    }
+
+    /// Switch viewport. The user agent goes on every live page and each one
+    /// reloads: a site that decides mobile-vs-desktop on the server would
+    /// otherwise keep serving what it decided before the switch.
+    func setDevice(_ device: BrowserDevice, landscape: Bool? = nil) {
+        self.device = device
+        if let landscape { deviceLandscape = landscape }
+        UserDefaults.standard.set(device.name, forKey: "fn.browserDevice")
+        UserDefaults.standard.set(deviceLandscape, forKey: "fn.browserDeviceLandscape")
+        for page in pages.values {
+            page.webView.customUserAgent = device.userAgent
+            if page.currentURL.isEmpty == false, page.currentURL != "about:blank" {
+                page.webView.reload()
+            }
+        }
+        dbg("browser: device → \(device.name)\(deviceLandscape ? " (landscape)" : "")")
+    }
+
+    /// Turn the pane's pencil on or off for a page (the user-drawn path).
+    func setAnnotating(_ on: Bool, tab id: UUID?) {
+        guard let id, let page = page(for: id) else { return }
+        withAnnotations(page, "window.__fnAnn.mode(\(on))") { _, error in
+            if let error { dbg("browser: annotate mode failed — \(error)") }
+        }
+        dbg("browser: annotate mode \(on ? "on" : "off")")
+    }
+
+    /// A dictionary as a JS object literal (valid JSON is valid JS).
+    private static func jsonLiteral(_ dict: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+              let text = String(data: data, encoding: .utf8) else { return "{}" }
+        return text
+    }
+
+    /// A bool param that may be absent — `bool(_:default:)` can't say "unset".
+    private static func boolOrNil(_ params: [String: Any], _ key: String) -> Bool? {
+        (params[key] as? NSNumber)?.boolValue ?? (params[key] as? Bool)
+    }
+
+    private static func decodeJSON(_ text: String) -> [String: Any]? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private static func decodeJSONArray(_ text: String) -> [[String: Any]]? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+    }
+
+    /// The in-page annotation layer. Lives in the document (not in an AppKit
+    /// overlay) for three reasons: `takeSnapshot` captures it for free, the
+    /// boxes scroll with the content because they are in page coordinates, and
+    /// the same list serves Claude and the user. Navigation clears it — an
+    /// annotation is about the page in front of you, not a saved artefact.
+    /// The in-page markup layer: pen, line, rectangle, ellipse and text, in four
+    /// colours, drawn into one SVG that lives in the document.
+    ///
+    /// In the document, not in an AppKit overlay, for three reasons: `takeSnapshot`
+    /// captures it for free, page coordinates mean the marks scroll with the
+    /// content they point at, and the same shape list serves both the person
+    /// drawing and Claude reading. Navigation clears it — a mark is about the
+    /// page in front of you, not a saved artefact.
+    private static let annotationRuntimeJS = """
+    (function() {
+      if (window.__fnAnn) return 'ok';
+      var COLORS = { coral: '#E5484D', blue: '#3B82F6', green: '#22A06B', black: '#111111' };
+      var NS = 'http://www.w3.org/2000/svg';
+      var doc = document;
+      var root = doc.body || doc.documentElement;
+
+      var svg = doc.createElementNS(NS, 'svg');
+      svg.setAttribute('id', '__fn_ann_svg');
+      svg.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;z-index:2147483000;overflow:visible;';
+      root.appendChild(svg);
+
+      var api = { shapes: [], seq: 0, drawing: false, tool: 'pen', color: 'coral' };
+
+      function docSize() {
+        var d = doc.documentElement, b = doc.body || d;
+        return {
+          w: Math.max(d.scrollWidth, b.scrollWidth, window.innerWidth),
+          h: Math.max(d.scrollHeight, b.scrollHeight, window.innerHeight),
+        };
+      }
+      function sizeSVG() {
+        var s = docSize();
+        svg.setAttribute('width', s.w);
+        svg.setAttribute('height', s.h);
+        svg.setAttribute('viewBox', '0 0 ' + s.w + ' ' + s.h);
+      }
+      sizeSVG();
+
+      function hex(name) { return COLORS[name] || COLORS.coral; }
+
+      function bounds(shape) {
+        if (shape.kind === 'pen') {
+          var xs = shape.points.map(function(p) { return p[0]; });
+          var ys = shape.points.map(function(p) { return p[1]; });
+          var x = Math.min.apply(null, xs), y = Math.min.apply(null, ys);
+          return { x: Math.round(x), y: Math.round(y),
+                   w: Math.round(Math.max.apply(null, xs) - x),
+                   h: Math.round(Math.max.apply(null, ys) - y) };
+        }
+        return { x: Math.round(Math.min(shape.x1, shape.x2)), y: Math.round(Math.min(shape.y1, shape.y2)),
+                 w: Math.round(Math.abs(shape.x2 - shape.x1)), h: Math.round(Math.abs(shape.y2 - shape.y1)) };
+      }
+
+      function textUnder(box) {
+        var cx = Math.min(window.innerWidth - 2, Math.max(1, box.x + box.w / 2 - window.scrollX));
+        var cy = Math.min(window.innerHeight - 2, Math.max(1, box.y + box.h / 2 - window.scrollY));
+        var el = doc.elementFromPoint(cx, cy);
+        var t = el ? (el.innerText || el.value || '') : '';
+        return String(t).replace(/\\s+/g, ' ').trim().slice(0, 120);
+      }
+
+      function draw(shape) {
+        var el;
+        var stroke = hex(shape.color);
+        if (shape.kind === 'pen') {
+          el = doc.createElementNS(NS, 'polyline');
+          el.setAttribute('points', shape.points.map(function(p) { return p.join(','); }).join(' '));
+          el.setAttribute('fill', 'none');
+        } else if (shape.kind === 'line') {
+          el = doc.createElementNS(NS, 'line');
+          el.setAttribute('x1', shape.x1); el.setAttribute('y1', shape.y1);
+          el.setAttribute('x2', shape.x2); el.setAttribute('y2', shape.y2);
+        } else if (shape.kind === 'ellipse') {
+          el = doc.createElementNS(NS, 'ellipse');
+          el.setAttribute('cx', (shape.x1 + shape.x2) / 2);
+          el.setAttribute('cy', (shape.y1 + shape.y2) / 2);
+          el.setAttribute('rx', Math.abs(shape.x2 - shape.x1) / 2);
+          el.setAttribute('ry', Math.abs(shape.y2 - shape.y1) / 2);
+          el.setAttribute('fill', 'none');
+        } else if (shape.kind === 'text') {
+          el = doc.createElementNS(NS, 'text');
+          el.setAttribute('x', shape.x1); el.setAttribute('y', shape.y1);
+          el.setAttribute('fill', stroke);
+          el.setAttribute('font-family', '-apple-system, system-ui, sans-serif');
+          el.setAttribute('font-size', '17');
+          el.setAttribute('font-weight', '600');
+          el.textContent = shape.note || '';
+        } else {
+          var b = bounds(shape);
+          el = doc.createElementNS(NS, 'rect');
+          el.setAttribute('x', b.x); el.setAttribute('y', b.y);
+          el.setAttribute('width', b.w); el.setAttribute('height', b.h);
+          el.setAttribute('rx', 4);
+          el.setAttribute('fill', 'none');
+        }
+        if (shape.kind !== 'text') {
+          el.setAttribute('stroke', stroke);
+          el.setAttribute('stroke-width', 3);
+          el.setAttribute('stroke-linecap', 'round');
+          el.setAttribute('stroke-linejoin', 'round');
+        }
+        shape.el = el;
+        svg.appendChild(el);
+        if (shape.label) {
+          var tag = doc.createElementNS(NS, 'text');
+          var b2 = bounds(shape);
+          tag.setAttribute('x', b2.x);
+          tag.setAttribute('y', Math.max(14, b2.y - 6));
+          tag.setAttribute('fill', stroke);
+          tag.setAttribute('font-family', '-apple-system, system-ui, sans-serif');
+          tag.setAttribute('font-size', '13');
+          tag.setAttribute('font-weight', '700');
+          tag.textContent = shape.label;
+          shape.tagEl = tag;
+          svg.appendChild(tag);
+        }
+      }
+
+      function repaint() {
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+        sizeSVG();
+        api.shapes.forEach(draw);
+      }
+
+      // ---- programmatic marks (Claude pointing at something) ----
+      api.add = function(spec) {
+        var box = spec.rect;
+        if (spec.selector) {
+          var el = doc.querySelector(spec.selector);
+          if (!el) return null;
+          el.scrollIntoView({ block: 'center' });
+          var r = el.getBoundingClientRect();
+          box = { x: r.left + window.scrollX, y: r.top + window.scrollY, w: r.width, h: r.height };
+        }
+        if (!box || !(box.w > 0) || !(box.h > 0)) return null;
+        var shape = {
+          index: ++api.seq, kind: 'rect', source: spec.source || 'claude',
+          color: COLORS[spec.color] ? spec.color : 'coral',
+          x1: box.x, y1: box.y, x2: box.x + box.w, y2: box.y + box.h,
+          note: spec.note || '', selector: spec.selector || null,
+        };
+        shape.label = String(shape.index) + (shape.note ? ' · ' + shape.note : '');
+        api.shapes.push(shape);
+        repaint();
+        return JSON.stringify(api.describe(shape));
+      };
+
+      api.describe = function(shape) {
+        var b = bounds(shape);
+        return { index: shape.index, kind: shape.kind, color: shape.color, note: shape.note || '',
+                 selector: shape.selector || null, source: shape.source, rect: b, text: textUnder(b) };
+      };
+
+      api.list = function() {
+        return JSON.stringify(api.shapes.map(api.describe));
+      };
+
+      api.clear = function(index) {
+        var before = api.shapes.length;
+        api.shapes = index == null ? [] : api.shapes.filter(function(s) { return s.index !== index; });
+        repaint();
+        return before - api.shapes.length;
+      };
+
+      api.setTool = function(t) { api.tool = t; applyCursor(); return api.tool; };
+      api.setColor = function(c) { api.color = COLORS[c] ? c : 'coral'; return api.color; };
+
+      // The pointer has to say what mode you are in, and a crosshair says
+      // "select", not "draw". Page CSS sets its own cursors on links and
+      // buttons, so this goes in as a `!important` rule over everything —
+      // except the tool bar, which is chrome and keeps an arrow.
+      var cursorStyle = null;
+      function cursorFor(tool) {
+        if (tool === 'text') return 'text';
+        if (tool !== 'pen') return 'crosshair';
+        var svg = '<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2224%22 height=%2224%22 ' +
+          'viewBox=%220 0 24 24%22><path d=%22M3 21l4-1 11.5-11.5-3-3L4 17z%22 fill=%22%23ffffff%22 ' +
+          'stroke=%22%23111111%22 stroke-width=%221.4%22 stroke-linejoin=%22round%22/>' +
+          '<path d=%22M16.2 4.9l2.9 2.9 1.5-1.5a1.4 1.4 0 0 0 0-2l-.9-.9a1.4 1.4 0 0 0-2 0z%22 ' +
+          'fill=%22%23E5484D%22 stroke=%22%23111111%22 stroke-width=%221.2%22/>' +
+          '<path d=%22M3 21l1.6-.4-1.2-1.2z%22 fill=%22%23111111%22/></svg>';
+        return 'url("data:image/svg+xml;utf8,' + svg + '") 2 22, crosshair';
+      }
+      function applyCursor() {
+        if (!api.drawing) {
+          if (cursorStyle) { cursorStyle.remove(); cursorStyle = null; }
+          return;
+        }
+        if (!cursorStyle) {
+          cursorStyle = doc.createElement('style');
+          cursorStyle.id = '__fn_ann_cursor';
+          (doc.head || root).appendChild(cursorStyle);
+        }
+        cursorStyle.textContent =
+          'html, body, *, *::before, *::after { cursor: ' + cursorFor(api.tool) + ' !important; }' +
+          '#__fn_ann_bar, #__fn_ann_bar * { cursor: default !important; }';
+      }
+
+      // ---- drawing ----
+      var live = null;
+      function pt(e) { return [Math.round(e.pageX), Math.round(e.pageY)]; }
+
+      function onDown(e) {
+        if (!api.drawing || e.button !== 0) return;
+        if (e.target.closest && e.target.closest('#__fn_ann_bar')) return;
+        e.preventDefault(); e.stopPropagation();
+        var p = pt(e);
+        if (api.tool === 'text') { promptText(p); return; }
+        live = { index: ++api.seq, kind: api.tool, color: api.color, source: 'user',
+                 x1: p[0], y1: p[1], x2: p[0], y2: p[1], points: [p], note: '' };
+        api.shapes.push(live);
+        repaint();
+      }
+      function onMove(e) {
+        if (!live) return;
+        e.preventDefault();
+        var p = pt(e);
+        if (live.kind === 'pen') { live.points.push(p); } else { live.x2 = p[0]; live.y2 = p[1]; }
+        repaint();
+      }
+      function onUp(e) {
+        if (!live) return;
+        e.preventDefault(); e.stopPropagation();
+        var b = bounds(live);
+        var trivial = live.kind === 'pen' ? live.points.length < 3 : (b.w < 6 && b.h < 6);
+        if (trivial) { api.shapes.pop(); }
+        live = null;
+        repaint();
+      }
+
+      function promptText(p) {
+        var input = doc.createElement('input');
+        input.placeholder = 'text, then Enter';
+        input.style.cssText = 'position:absolute;left:' + p[0] + 'px;top:' + p[1] +
+          'px;z-index:2147483002;font:15px -apple-system,system-ui,sans-serif;padding:4px 6px;' +
+          'border:2px solid ' + hex(api.color) + ';border-radius:5px;background:#fff;color:#111;min-width:180px;';
+        root.appendChild(input);
+        input.focus();
+        input.addEventListener('keydown', function(ev) {
+          ev.stopPropagation();
+          if (ev.key === 'Enter') {
+            var value = input.value.trim();
+            input.remove();
+            if (!value) return;
+            api.shapes.push({ index: ++api.seq, kind: 'text', color: api.color, source: 'user',
+                              x1: p[0], y1: p[1], x2: p[0] + 8 * value.length, y2: p[1] + 18,
+                              points: [p], note: value });
+            repaint();
+          } else if (ev.key === 'Escape') {
+            input.remove();
+          }
+        }, true);
+      }
+
+      doc.addEventListener('mousedown', onDown, true);
+      doc.addEventListener('mousemove', onMove, true);
+      doc.addEventListener('mouseup', onUp, true);
+      window.addEventListener('resize', repaint);
+
+      // ---- the floating tool bar, in the page so it follows the viewport ----
+      var bar = null;
+      function buildBar() {
+        if (bar) return;
+        bar = doc.createElement('div');
+        bar.id = '__fn_ann_bar';
+        bar.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);' +
+          'z-index:2147483003;display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:11px;' +
+          'background:rgba(28,28,30,0.94);box-shadow:0 6px 24px rgba(0,0,0,0.35);' +
+          'font:600 12px -apple-system,system-ui,sans-serif;';
+        var tools = [['pen', '✎'], ['line', '╱'], ['rect', '▢'], ['ellipse', '◯'], ['text', 'T']];
+        tools.forEach(function(t) {
+          var b = doc.createElement('button');
+          b.textContent = t[1];
+          b.dataset.tool = t[0];
+          b.style.cssText = btnCSS(api.tool === t[0]);
+          b.onclick = function(e) { e.stopPropagation(); api.setTool(t[0]); syncBar(); };
+          bar.appendChild(b);
+        });
+        var sep = doc.createElement('div');
+        sep.style.cssText = 'width:1px;height:18px;background:rgba(255,255,255,0.22);margin:0 2px;';
+        bar.appendChild(sep);
+        Object.keys(COLORS).forEach(function(name) {
+          var dot = doc.createElement('button');
+          dot.dataset.color = name;
+          // flex:none + box-sizing, or the flex row shrinks the width and the
+          // 2px selection ring grows the height — which is how a swatch ends up
+          // an oval instead of a dot. -webkit-appearance:none drops the
+          // platform button chrome that distorts it further.
+          dot.style.cssText = 'width:18px;height:18px;flex:0 0 18px;box-sizing:border-box;' +
+            'border-radius:50%;border:2px solid transparent;padding:0;margin:0;' +
+            '-webkit-appearance:none;appearance:none;background:' + COLORS[name] + ';cursor:pointer;';
+          dot.onclick = function(e) { e.stopPropagation(); api.setColor(name); syncBar(); };
+          bar.appendChild(dot);
+        });
+        var trash = doc.createElement('button');
+        trash.textContent = '🗑';
+        trash.style.cssText = btnCSS(false);
+        trash.onclick = function(e) { e.stopPropagation(); api.clear(); };
+        bar.appendChild(trash);
+        var close = doc.createElement('button');
+        close.textContent = 'Close';
+        close.style.cssText = btnCSS(false) + 'padding:3px 8px;';
+        close.onclick = function(e) {
+          e.stopPropagation();
+          api.mode(false);
+          post({ type: 'annotationMode', on: false });
+        };
+        bar.appendChild(close);
+        var send = doc.createElement('button');
+        send.textContent = 'Add to chat';
+        send.style.cssText = 'background:#E5E4DF;color:#111;border:0;border-radius:7px;padding:4px 9px;' +
+          'font:600 12px -apple-system,system-ui,sans-serif;cursor:pointer;';
+        send.onclick = function(e) { e.stopPropagation(); post({ type: 'annotation', send: true }); };
+        bar.appendChild(send);
+        root.appendChild(bar);
+      }
+      function btnCSS(active) {
+        return 'background:' + (active ? 'rgba(255,255,255,0.22)' : 'transparent') +
+          ';color:#fff;border:0;border-radius:6px;min-width:24px;height:22px;cursor:pointer;' +
+          'flex:0 0 auto;box-sizing:border-box;-webkit-appearance:none;appearance:none;' +
+          'font:600 13px -apple-system,system-ui,sans-serif;padding:0 4px;';
+      }
+      function syncBar() {
+        if (!bar) return;
+        Array.prototype.forEach.call(bar.querySelectorAll('button[data-tool]'), function(b) {
+          b.style.cssText = btnCSS(b.dataset.tool === api.tool);
+        });
+        Array.prototype.forEach.call(bar.querySelectorAll('button[data-color]'), function(b) {
+          b.style.borderColor = b.dataset.color === api.color ? '#fff' : 'transparent';
+        });
+      }
+      function post(msg) {
+        try { window.webkit.messageHandlers.floatnote.postMessage(msg); } catch (e) {}
+      }
+
+      api.mode = function(on) {
+        api.drawing = !!on;
+        svg.style.pointerEvents = 'none';   // the SVG never eats clicks; the doc listeners do the work
+        applyCursor();
+        if (on) { buildBar(); syncBar(); bar.style.display = 'flex'; }
+        else if (bar) { bar.style.display = 'none'; }
+        return api.drawing;
+      };
+
+      /// Hide the tool bar for a screenshot: it is app chrome, not a mark.
+      api.chrome = function(on) {
+        if (bar) bar.style.display = on && api.drawing ? 'flex' : 'none';
+        return true;
+      };
+
+      window.__fnAnn = api;
+      return 'ok';
+    })()
+    """
+
     private static func clickJS(selector: String?, text: String?) -> String {
         """
         (function() {
@@ -798,7 +1403,7 @@ final class BrowserSessions: ObservableObject {
 
 /// One page: its `WKWebView`, its delegates, and the load-completion waiters the
 /// RPC resolves on. Retained by `BrowserSessions`, never by a SwiftUI view.
-final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate {
+final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let id: UUID
     let webView: WKWebView
     private weak var sessions: BrowserSessions?
@@ -815,9 +1420,17 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate {
         // Without this, `window.open` from a script is dropped before
         // `createWebViewWith` is ever consulted.
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        // The annotation layer talks back through this: the moment a mark is
+        // finished in the page, Swift hears about it and can ship the picture.
+        let bridge = WKUserContentController()
+        config.userContentController = bridge
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
+        bridge.add(self, name: "floatnote")
         webView.navigationDelegate = self
+        // A tab opened while a device is selected has to start in that device,
+        // not inherit the Mac UA until the next switch.
+        webView.customUserAgent = sessions.device.userAgent
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
         // nil = WebKit's own Safari UA. A custom one gets served the
@@ -888,6 +1501,23 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate {
         for waiter in pending.values { waiter(url) }
     }
 
+    func userContentController(_ controller: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any] else { return }
+        switch body["type"] as? String {
+        case "annotation":
+            // "Add to chat": screenshot the page with the marks on it and drop
+            // the picture into Claude Code's prompt.
+            sessions?.sendAnnotations(tab: id)
+        case "annotationMode":
+            // The page's own Close button — the pencil in the toolbar has to
+            // come back up, and only the panel knows about that.
+            NotificationCenter.default.post(name: .floatnoteBrowserAnnotateModeOff, object: nil)
+        default:
+            break
+        }
+    }
+
     /// Drop the page for good (tab closed, or the data store changed under us).
     func detach() {
         observations.forEach { $0.invalidate() }
@@ -942,6 +1572,12 @@ extension Notification.Name {
     /// An RPC action needs the browser panel on screen (the app shell owns
     /// `isBrowserVisible`, so `BrowserSessions` asks instead of reaching for
     /// it). Object = the tab the action targets, when there is one.
+    /// The page asked to leave annotate mode (its own Close button).
+    static let floatnoteBrowserAnnotateModeOff =
+        Notification.Name("floatnoteBrowserAnnotateModeOff")
+    /// An annotated screenshot is ready for whichever terminal is active.
+    static let floatnoteBrowserAnnotationReady =
+        Notification.Name("floatnoteBrowserAnnotationReady")
     static let floatnoteBrowserRequestedVisible =
         Notification.Name("floatnote.browser.requestedVisible")
 }
@@ -1007,6 +1643,10 @@ struct BrowserPanel: View {
     /// body — the palette lives in `TerminalSessions`, not in SwiftUI state.
     @State private var paletteGeneration = 0
     @State private var urlText = ""
+    /// Pencil state is per panel, not per page: the runtime it drives is
+    /// reinstalled on every call, and navigating away drops the layer, so the
+    /// button is reset whenever the active tab changes.
+    @State private var annotating = false
     @FocusState private var urlFocused: Bool
 
     private var palette: TerminalPalette {
@@ -1029,10 +1669,9 @@ struct BrowserPanel: View {
             Divider()
             toolbar
             progressBar
+            if !sessions.device.isResponsive { deviceBar }
             if let tab = activeTab {
-                BrowserWebContainer(id: tab.id)
-                    .id(tab.id)
-                    .background(palette.backgroundColor)
+                page(tab)
             } else {
                 palette.backgroundColor
             }
@@ -1041,7 +1680,13 @@ struct BrowserPanel: View {
             paletteGeneration &+= 1
         }
         .onAppear { syncURLField() }
-        .onChange(of: sessions.activeTabId) { _, _ in syncURLField() }
+        .onChange(of: sessions.activeTabId) { _, _ in
+            syncURLField()
+            annotating = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .floatnoteBrowserAnnotateModeOff)) { _ in
+            annotating = false
+        }
         // The page's own navigations (a redirect, a link, an RPC `open`) have to
         // reach the field too — it is the only place the current URL is shown.
         .onChange(of: activeTab?.url) { _, _ in syncURLField() }
@@ -1106,7 +1751,74 @@ struct BrowserPanel: View {
 
     // MARK: Toolbar
 
+    /// The page, at the selected viewport. A device narrower than the panel is
+    /// centred on a gutter; a wider one (an iPad in a 500pt panel) scrolls
+    /// horizontally rather than being scaled — a scaled viewport reports the
+    /// wrong CSS width and stops being an emulation.
+    @ViewBuilder
+    private func page(_ tab: BrowserTab) -> some View {
+        let size = sessions.deviceSize
+        if size == .zero {
+            BrowserWebContainer(id: tab.id)
+                .id(tab.id)
+                .background(palette.backgroundColor)
+        } else {
+            GeometryReader { geo in
+                ScrollView(size.width > geo.size.width ? .horizontal : [], showsIndicators: true) {
+                    BrowserWebContainer(id: tab.id)
+                        .id(tab.id)
+                        .frame(width: size.width, height: geo.size.height)
+                        .background(Color.white)
+                        .shadow(color: .black.opacity(0.25), radius: 6)
+                        .frame(minWidth: geo.size.width, alignment: .center)
+                }
+                .background(palette.backgroundColor.opacity(0.6))
+            }
+        }
+    }
+
+    /// States what you are looking at. Without it a mobile-width page in a wide
+    /// panel just looks like a broken site.
+    private var deviceBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: sessions.device.width >= 700 ? "ipad" : "iphone")
+                .font(.system(size: 10))
+            Text(sessions.device.label + (sessions.deviceLandscape ? " · landscape" : ""))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+            Spacer()
+            Button(action: { sessions.setDevice(sessions.device, landscape: !sessions.deviceLandscape) }) {
+                Image(systemName: "rotate.right").font(.system(size: 10))
+            }
+            .buttonStyle(.plain)
+            .help("Rotate")
+            Button(action: { sessions.setDevice(.responsive) }) {
+                Image(systemName: "xmark").font(.system(size: 9))
+            }
+            .buttonStyle(.plain)
+            .help("Back to the full panel width")
+        }
+        .foregroundColor(palette.foregroundColor.opacity(0.75))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(vm.theme.chromeBackground)
+    }
+
+    /// Buttons are a fixed cost; the field gets what is left. Layout priority
+    /// alone did not do it — a `TextField` keeps asking for its ideal width, the
+    /// row overflowed the panel and the trailing buttons were simply clipped
+    /// away. So the width is measured and handed out explicitly.
     private var toolbar: some View {
+        GeometryReader { geo in
+            toolbarRow(width: geo.size.width)
+        }
+        .frame(height: 34)
+    }
+
+    /// 7 buttons at 23pt, plus the row's own padding and the gaps around the
+    /// field. Kept in one place so adding a button can't silently re-break this.
+    private static let toolbarButtonsWidth: CGFloat = 7 * 23 + 26
+
+    private func toolbarRow(width: CGFloat) -> some View {
         HStack(spacing: 2) {
             navButton("chevron.left", help: "Back", enabled: state.canGoBack) {
                 if let id = sessions.activeTabId { sessions.back(id) }
@@ -1120,6 +1832,9 @@ struct BrowserPanel: View {
                 guard let id = sessions.activeTabId else { return }
                 if state.isLoading { sessions.stop(id) } else { sessions.reload(id) }
             }
+            // The field yields, the buttons don't. Left greedy, it pushed the
+            // trailing group off the end of the panel — "open in default
+            // browser" simply wasn't there at 500pt wide.
             TextField("Search or enter address", text: $urlText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
@@ -1136,10 +1851,44 @@ struct BrowserPanel: View {
                                 .stroke(palette.foregroundColor.opacity(urlFocused ? 0.35 : 0.15))
                         )
                 )
+                .frame(width: max(56, width - Self.toolbarButtonsWidth))
+            // Annotate: drag a box on the page and label it. The same list
+            // Claude writes to over MCP, so a mark made here is a mark Claude
+            // can read back — that is the point of having it in the pane.
+            Button(action: {
+                annotating.toggle()
+                sessions.setAnnotating(annotating, tab: sessions.activeTabId)
+            }) {
+                Image(systemName: "pencil.tip.crop.circle")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 23, height: 24)
+                    .foregroundColor(annotating ? .accentColor : palette.foregroundColor.opacity(0.8))
+            }
+            .buttonStyle(.plain)
+            .disabled(activeTab == nil)
+            .help(annotating ? "Stop annotating" : "Annotate the page — drag a box, type a note")
+
+            HStack(spacing: 0) {
+            Button(action: { showDeviceMenu() }) {
+                Image(systemName: sessions.device.isResponsive ? "desktopcomputer" : "iphone")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 23, height: 24)
+                    .foregroundColor(sessions.device.isResponsive
+                                     ? palette.foregroundColor.opacity(0.8) : .accentColor)
+            }
+            .buttonStyle(.plain)
+            .help("Device viewport — mobile, tablet or full width")
+
+            navButton("paperplane", help: "Send this page (with annotations) to Claude",
+                      enabled: activeTab != nil) {
+                if let id = sessions.activeTabId { sessions.sendAnnotations(tab: id) }
+            }
             navButton("arrow.up.forward.app", help: "Open in default browser",
                       enabled: activeTab != nil) {
                 openExternally()
             }
+            }
+            .fixedSize()
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 5)
@@ -1151,7 +1900,7 @@ struct BrowserPanel: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 11, weight: .medium))
-                .frame(width: 26, height: 24)
+                .frame(width: 23, height: 24)
                 .foregroundColor(enabled ? palette.foregroundColor.opacity(0.8)
                                          : Color.secondary.opacity(0.4))
         }
@@ -1184,6 +1933,29 @@ struct BrowserPanel: View {
         urlText = url == "about:blank" ? "" : url
     }
 
+    /// An `NSMenu`, not a SwiftUI Menu: the list is long, needs a checkmark on
+    /// the current entry and a separated rotate item, and the tab bar already
+    /// builds its Aa menu this way.
+    private func showDeviceMenu() {
+        let menu = NSMenu()
+        for device in BrowserDevice.all {
+            let item = NSMenuItem(title: device.label,
+                                  action: #selector(BrowserDeviceMenuTarget.pick(_:)), keyEquivalent: "")
+            item.target = BrowserDeviceMenuTarget.shared
+            item.representedObject = device.name
+            item.state = device.name == sessions.device.name ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let rotate = NSMenuItem(title: "Landscape",
+                                action: #selector(BrowserDeviceMenuTarget.rotate(_:)), keyEquivalent: "")
+        rotate.target = BrowserDeviceMenuTarget.shared
+        rotate.state = sessions.deviceLandscape ? .on : .off
+        rotate.isEnabled = !sessions.device.isResponsive
+        menu.addItem(rotate)
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+
     private func commitURL() {
         let target = BrowserSessions.resolveInput(urlText)
         if let id = sessions.activeTabId {
@@ -1205,6 +1977,22 @@ struct BrowserPanel: View {
 
 /// The terminal↔browser boundary handle — same shape as `TerminalResizeHandle`,
 /// adjusting `vm.browserWidth`. Drag-left widens the browser.
+/// `NSMenuItem` needs an ObjC target; `HandsfreeMenuTarget` exists for the same
+/// reason.
+final class BrowserDeviceMenuTarget: NSObject {
+    static let shared = BrowserDeviceMenuTarget()
+
+    @objc func pick(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        BrowserSessions.shared.setDevice(BrowserDevice.named(name))
+    }
+
+    @objc func rotate(_ sender: NSMenuItem) {
+        let sessions = BrowserSessions.shared
+        sessions.setDevice(sessions.device, landscape: !sessions.deviceLandscape)
+    }
+}
+
 struct BrowserResizeHandle: View {
     @EnvironmentObject var vm: EditorViewModel
 
@@ -1215,16 +2003,13 @@ struct BrowserResizeHandle: View {
     private let minWidth: CGFloat = 280
     private let maxWidth: CGFloat = 1600
     private let hitWidth: CGFloat = 10
-    /// Room the editor keeps no matter what the drag asks for. A panel that ate
-    /// the note would also eat the handle you'd drag back with.
-    private let editorFloor: CGFloat = 200
 
-    /// `availableBrowserWidth()` is the same number the panel is rendered at, so
-    /// the drag can't run past the point where it stops having any visible
-    /// effect. NOT `availablePanelWidth()` — that one subtracts *this* panel's
-    /// width, so the cap would shrink as the drag grew it and fight the gesture.
+    /// The ceiling comes from the view model, which knows what the terminal
+    /// panel is already using and what the editor must keep. Deriving it here
+    /// from this panel's own width would shrink the cap as the drag grew it and
+    /// fight the gesture.
     private var widthCap: CGFloat {
-        min(maxWidth, max(minWidth, vm.availableBrowserWidth() - editorFloor))
+        min(maxWidth, max(minWidth, vm.maxBrowserWidth()))
     }
 
     var body: some View {

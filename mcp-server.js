@@ -1317,6 +1317,93 @@ server.tool(
 );
 
 server.tool(
+  "browser_annotate",
+  "Draw a labelled box ON the page in FloatNote's browser panel, so the person watching can see exactly what you are pointing at. Give a `selector` (the box tracks that element) or a page-coordinate `rect`. The box appears in browser_screenshot and in browser_annotations, and survives until the page navigates. Counts as a write action.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    selector: z.string().optional().describe("CSS selector to box. Mutually exclusive with rect"),
+    rect: z
+      .object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() })
+      .optional()
+      .describe("Page-coordinate rectangle to box, when no element matches what you mean"),
+    note: z.string().optional().describe("Short label drawn on the box — say what is wrong or interesting"),
+    color: z.enum(["coral", "yellow", "blue", "green"]).optional().describe("Box colour (default coral)"),
+  },
+  async ({ id, selector, rect, note, color }) => {
+    if (!selector && !rect) {
+      return textResult("browser_annotate needs either a `selector` or a `rect`.");
+    }
+    const res = await browserRPC("annotate", compact({ id, selector, rect, note, color }));
+    if (!res.ok) return textResult(rpcError("annotate", res));
+    const a = res.result.annotation || {};
+    const where = a.selector ? `selector ${a.selector}` : `rect ${JSON.stringify(a.rect)}`;
+    return textResult(
+      `Annotation ${a.index} drawn on ${where}${a.note ? ` — "${a.note}"` : ""}.` +
+        (a.text ? `\nIt covers: ${a.text}` : "") +
+        `\nIt is visible in the panel now and will appear in browser_screenshot.`
+    );
+  }
+);
+
+server.tool(
+  "browser_annotations",
+  "List the annotations on the page in FloatNote's browser panel — both the ones you drew with browser_annotate and the ones the person drew by hand with the pane's pencil tool. Use it to read what they marked and what they wrote on it.",
+  { id: z.string().optional().describe(TAB_ID_PARAM) },
+  async ({ id }) => {
+    const res = await browserRPC("annotations", compact({ id }));
+    if (!res.ok) return textResult(rpcError("annotations", res));
+    const list = Array.isArray(res.result.annotations) ? res.result.annotations : [];
+    if (!list.length) {
+      return textResult(`No annotations on ${res.result.url || "the page"}.`);
+    }
+    const lines = list.map((a) => {
+      const by = a.source === "user" ? "drawn by the user" : "yours";
+      const rect = a.rect ? `${a.rect.w}×${a.rect.h} at ${a.rect.x},${a.rect.y}` : "?";
+      return `${a.index}. [${by}] ${a.note || "(no note)"}\n   ${rect}${a.selector ? ` · ${a.selector}` : ""}${a.text ? `\n   covers: ${a.text}` : ""}`;
+    });
+    return textResult(`${list.length} annotation(s) on ${res.result.url}:\n\n${lines.join("\n")}`);
+  }
+);
+
+server.tool(
+  "browser_annotate_clear",
+  "Remove annotations from the page in FloatNote's browser panel: one by index, or all of them when no index is given. Counts as a write action.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    index: z.number().optional().describe("Annotation index from browser_annotations. Omit to clear every one"),
+  },
+  async ({ id, index }) => {
+    const res = await browserRPC("annotate_clear", compact({ id, index }));
+    if (!res.ok) return textResult(rpcError("annotate_clear", res));
+    const n = res.result.cleared || 0;
+    return textResult(n ? `Cleared ${n} annotation(s).` : "Nothing to clear.");
+  }
+);
+
+server.tool(
+  "browser_device",
+  "Switch the viewport FloatNote's browser panel renders in — a phone, a tablet, or the full panel width — the way Chrome DevTools' device toolbar does. It sets both the CSS viewport size AND the matching user agent, then reloads the tab, so a site that decides mobile-vs-desktop on the server serves its mobile page. Call it with no arguments to read the current viewport and the list of presets.",
+  {
+    name: z
+      .string()
+      .optional()
+      .describe("Preset name or a fragment of one, e.g. 'iPhone 15', 'Pixel', 'iPad mini', 'Desktop', 'Responsive' (full panel width)"),
+    landscape: z.boolean().optional().describe("Rotate: swap width and height"),
+  },
+  async ({ name, landscape }) => {
+    const res = await browserRPC("device", compact({ name, landscape }));
+    if (!res.ok) return textResult(rpcError("device", res));
+    const r = res.result || {};
+    const size = r.width ? `${r.width}×${r.height}${r.landscape ? " (landscape)" : ""}` : "full panel width";
+    const list = Array.isArray(r.available) ? `\n\nPresets: ${r.available.join(", ")}` : "";
+    return textResult(
+      `Viewport: ${r.name} — ${size}\nUser agent: ${r.userAgent}` +
+        `\nThe tab reloaded, so browser_read / browser_screenshot now show that rendering.${list}`
+    );
+  }
+);
+
+server.tool(
   "browser_close",
   "Close a tab in FloatNote's own browser panel. Takes the tab id from browser_tabs.",
   {

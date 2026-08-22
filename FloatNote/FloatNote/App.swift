@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.78.0"
+let APP_VERSION = "v1.83.4"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -76,6 +76,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var terminalKeyMonitor: Any?
     private var terminalExitObserver: NSObjectProtocol?
     private var browserVisibilityObserver: NSObjectProtocol?
+    private var browserAnnotationObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
@@ -117,6 +118,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 vm.sweepExpiredJobStatuses()
                 TranscriptStore.shared.poll()
                 BrowserSessions.shared.pollRPC()
+            }
+        }
+
+        // A finished annotation goes into the active terminal's prompt as text
+        // naming the PNG, not as a clipboard paste: Claude Code reads the file
+        // itself, and no Accessibility permission or synthetic ⌘V is involved.
+        // Deliberately not submitted — you get to add the question.
+        browserAnnotationObserver = NotificationCenter.default.addObserver(
+            forName: .floatnoteBrowserAnnotationReady, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let vm = self?.vm, let text = note.userInfo?["text"] as? String else { return }
+            MainActor.assumeIsolated {
+                guard let id = vm.activeTerminalId,
+                      let session = TerminalSessions.shared.existing(id) else {
+                    dbg("browser: annotation dropped — no live terminal")
+                    return
+                }
+                session.view.send(txt: text + " ")
+                vm.focusActiveTerminal()
+                dbg("browser: annotation pasted into pane \(vm.terminalTabs.first { $0.id == id }?.label ?? "?")")
             }
         }
 
@@ -625,7 +646,14 @@ class EditorViewModel: ObservableObject {
     }
     /// True while the sidebar was closed by the auto-hide threshold (not the user).
     /// Lets us re-open on resize without overriding a manual collapse.
-    @Published var isSidebarAutoHidden: Bool = false
+    /// Persisted, because it is the receipt for an automatic collapse. In memory
+    /// only, a relaunch forgot that the app (not the user) had hidden the
+    /// sidebar — so the collapse never got undone and the sidebar was gone for
+    /// good, with only the toolbar toggle to bring it back.
+    @Published var isSidebarAutoHidden: Bool =
+        UserDefaults.standard.bool(forKey: "fn.sidebarAutoHidden") {
+        didSet { UserDefaults.standard.set(isSidebarAutoHidden, forKey: "fn.sidebarAutoHidden") }
+    }
     /// User-resizable sidebar width, persisted across launches.
     @Published var sidebarWidth: CGFloat = {
         let v = UserDefaults.standard.double(forKey: "fn.sidebarWidth")
@@ -700,10 +728,72 @@ class EditorViewModel: ObservableObject {
 
     /// Current window content width, fed in by `EditorView` from its
     /// GeometryReader. Used to keep the terminal panel inside the window.
-    var windowContentWidth: CGFloat = 0
+    /// Published: the panel budget is derived from it, so a window resize has to
+    /// re-run the layout. As a plain property it was written on every resize and
+    /// read by nobody until the next unrelated redraw.
+    @Published var windowContentWidth: CGFloat = 0
 
     /// Horizontal room the terminal panel may occupy: window width minus the
     /// sidebar (when open) and the resize handles flanking the panel.
+    /// Room the note itself always keeps. A panel that ate the editor would
+    /// also eat the handle you'd drag back with.
+    static let editorFloorWidth: CGFloat = 260
+
+    /// The widths the terminal and browser panels are actually rendered at.
+    ///
+    /// They used to be clamped independently, each against the OTHER's full
+    /// width — so opening both in a window too narrow for both shrank BOTH to a
+    /// sliver instead of taking the room off one. They now share one budget:
+    /// stored widths when they fit, scaled in proportion when they don't. At
+    /// launch, before the geometry reader has measured anything, the stored
+    /// widths are used as-is — clamping against a window width of 0 is what
+    /// made a relaunch come up with two hairline panels.
+    func panelWidths() -> (terminal: CGFloat, browser: CGFloat) {
+        let showTerminal = isTerminalVisible && !terminalTabs.isEmpty
+        let showBrowser = isBrowserVisible
+        guard showTerminal || showBrowser else { return (0, 0) }
+        let wantTerminal = showTerminal ? terminalWidth : 0
+        let wantBrowser = showBrowser ? browserWidth : 0
+        // Before the geometry reader has measured anything, clamp against the
+        // SCREEN rather than handing back the stored widths raw: an unclamped
+        // first pass is what let the window grow past the display and stay there.
+        guard windowContentWidth > 0 else {
+            let screen = NSScreen.main?.visibleFrame.width ?? 1440
+            let ceiling = max(320, screen - Self.editorFloorWidth - 40)
+            let wanted = wantTerminal + wantBrowser
+            guard wanted > ceiling, wanted > 0 else { return (wantTerminal, wantBrowser) }
+            let scale = ceiling / wanted
+            return ((wantTerminal * scale).rounded(), (wantBrowser * scale).rounded())
+        }
+        let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
+        let handles: CGFloat = (showTerminal ? 10 : 0) + (showBrowser ? 10 : 0)
+        let floor: CGFloat = isEditorVisible ? Self.editorFloorWidth : 0
+        let budget = max(0, windowContentWidth - sidebar - handles - floor)
+        let wanted = wantTerminal + wantBrowser
+        guard wanted > budget, wanted > 0 else { return (wantTerminal, wantBrowser) }
+        let scale = budget / wanted
+        return ((wantTerminal * scale).rounded(), (wantBrowser * scale).rounded())
+    }
+
+    /// Drag ceilings: each panel may grow into the editor's slack, never into
+    /// the other panel's stored width.
+    func maxTerminalWidth() -> CGFloat {
+        let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
+        let browser: CGFloat = isBrowserVisible ? browserWidth + 10 : 0
+        guard windowContentWidth > 0 else { return 1600 }
+        return max(Self.minTerminalColumnWidth,
+                   windowContentWidth - sidebar - browser - 10
+                       - (isEditorVisible ? Self.editorFloorWidth : 0))
+    }
+
+    func maxBrowserWidth() -> CGFloat {
+        let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
+        let terminal: CGFloat = (isTerminalVisible && !terminalTabs.isEmpty) ? terminalWidth + 10 : 0
+        guard windowContentWidth > 0 else { return 1600 }
+        return max(280, windowContentWidth - sidebar - terminal - 10
+                       - (isEditorVisible ? Self.editorFloorWidth : 0))
+    }
+
     func availablePanelWidth() -> CGFloat {
         let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
         let browser: CGFloat = isBrowserVisible ? browserWidth + 6 : 0
@@ -1074,6 +1164,25 @@ class EditorViewModel: ObservableObject {
         return stored > 0 ? CGFloat(stored) : 520
     }() {
         didSet { UserDefaults.standard.set(Double(browserWidth), forKey: "fn.browserWidth") }
+    }
+
+    /// The note column can be hidden like the sidebar: with a terminal and a
+    /// browser open, the note is often not what you are looking at, and 300pt of
+    /// unread prose is worse than none. Never hidden with nothing to fall back
+    /// on — the toggle is disabled unless a panel is up.
+    @Published var isEditorVisible: Bool =
+        UserDefaults.standard.object(forKey: "fn.editorVisible") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(isEditorVisible, forKey: "fn.editorVisible") }
+    }
+
+    var canHideEditor: Bool {
+        (isTerminalVisible && !terminalTabs.isEmpty) || isBrowserVisible
+    }
+
+    func toggleEditor() {
+        guard canHideEditor || !isEditorVisible else { return }
+        isEditorVisible.toggle()
+        dbg("editor: note column \(isEditorVisible ? "shown" : "hidden")")
     }
 
     func toggleBrowser() {
@@ -3250,6 +3359,11 @@ struct EditorView: View {
         }
     }
 
+    /// Only the WINDOW's width hides the sidebar. Keying it off the room left for
+    /// the note as well sounded right and was wrong: with a terminal and a
+    /// browser open the note is always starved, so the sidebar hid itself on
+    /// every launch. Panels give up their width instead — that is what
+    /// `panelWidths()` reserves the sidebar and the editor floor for.
     private func evaluateAutoHide(width: CGFloat) {
         let shouldAutoHide = width < sidebarAutoHideThreshold
         if shouldAutoHide && !vm.isSidebarCollapsed {
@@ -3267,17 +3381,30 @@ struct EditorView: View {
 
     private var content: some View {
         VStack(spacing: 0) {
+            // One bar, the width of the WINDOW, above every column — sidebar
+            // included. Inside the editor column it was sized by whatever the
+            // panels left over, so the narrower that column got the more of the
+            // note's own controls vanished into the overflow chevron. The panels
+            // keep their own tab rows: a terminal's chips and a browser's URL
+            // field say WHICH conversation and WHICH page, and that only means
+            // something directly above the thing it belongs to.
+            FormatToolbar()
+            Divider()
             HStack(spacing: 0) {
                 if !vm.isSidebarCollapsed {
                     NotesSidebar()
+                        // Priority 1: yields to the panels' 2, wins over the
+                        // editor's 0. Enough to stop the sidebar being squeezed
+                        // to a sliver, without the hard minimum that pushed the
+                        // window off the screen.
                         .frame(width: vm.sidebarWidth)
+                        .layoutPriority(1)
                         .transition(.move(edge: .leading).combined(with: .opacity))
                     SidebarResizeHandle()
                         .environmentObject(vm)
                 }
+                if vm.isEditorVisible {
                 VStack(spacing: 0) {
-                    FormatToolbar()
-                    Divider()
                     if vm.isRecording && vm.activeTabId == vm.recordingTabId {
                         RecordingInProgressView(startTime: vm.recordingStartTime ?? Date())
                         Divider()
@@ -3310,6 +3437,17 @@ struct EditorView: View {
                             .environmentObject(vm)
                     }
                 }
+                // The editor is the flexible column and must be the one that
+                // yields — in BOTH directions. `.frame(width:)` on a panel is
+                // only a proposal, so without the priority the HStack honoured
+                // the editor and squeezed the panels to a couple of wrapped
+                // words each; and without `minWidth: 0` the editor's own
+                // intrinsic minimum (its toolbar) pushed the browser panel past
+                // the right edge of the window, which read as a clipped page.
+                .frame(minWidth: 0, maxWidth: .infinity)
+                .layoutPriority(0)
+                .transition(.opacity)
+                }
                 if vm.isTerminalVisible && !vm.terminalTabs.isEmpty {
                     TerminalResizeHandle()
                         .environmentObject(vm)
@@ -3322,7 +3460,15 @@ struct EditorView: View {
                     // the persistent session view is re-attached.
                     TerminalPanel()
                         .environmentObject(vm)
-                        .frame(width: min(vm.terminalWidth, vm.availablePanelWidth()))
+                        // A PROPOSAL, not a minimum. A hard `minWidth` here
+                        // propagates up as the window's minimum content size, so
+                        // macOS grew the window to fit the panels — past the edge
+                        // of the display — and because the wider window then
+                        // satisfied the budget, it never shrank back. Priority is
+                        // what makes the panels win against the editor; the
+                        // budget in `panelWidths()` is what keeps them honest.
+                        .frame(width: vm.panelWidths().terminal)
+                        .layoutPriority(2)
                 }
                 if vm.isBrowserVisible {
                     BrowserResizeHandle()
@@ -3331,7 +3477,8 @@ struct EditorView: View {
                     // on hide costs nothing — same contract as the terminal.
                     BrowserPanel()
                         .environmentObject(vm)
-                        .frame(width: min(vm.browserWidth, vm.availableBrowserWidth()))
+                        .frame(width: vm.panelWidths().browser)
+                        .layoutPriority(2)
                 }
             }
             Divider()
@@ -3426,7 +3573,7 @@ struct TerminalResizeHandle: View {
                     if !isDragging { isDragging = true; startWidth = vm.terminalWidth }
                     // Drag-left → wider (subtract dx); cap to the window.
                     let dx = value.translation.width
-                    let cap = min(maxWidth, max(minWidth, vm.availablePanelWidth()))
+                    let cap = min(maxWidth, max(minWidth, vm.maxTerminalWidth()))
                     vm.terminalWidth = min(cap, max(minWidth, startWidth - dx))
                 }
                 .onEnded { _ in isDragging = false }
@@ -3463,7 +3610,11 @@ struct TerminalPanel: View {
                     VStack(spacing: 0) {
                         if vm.transcriptMode == .split {
                             TranscriptPane()
-                                .frame(height: max(180, geo.size.height * vm.transcriptSplitFraction))
+                                // One clamp, shared with the handle, so a stored
+                                // fraction can never render a terminal without an
+                                // output area — or a transcript too short to read.
+                                .frame(height: TranscriptSplitHandle.transcriptHeight(
+                                    in: geo.size.height, fraction: vm.transcriptSplitFraction))
                             TranscriptSplitHandle(totalHeight: geo.size.height)
                         }
                         terminalSurface(tab)
@@ -4729,8 +4880,9 @@ struct FormatToolbar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Leading: sidebar toggle (fixed, always visible)
+            // Leading: the two column toggles (fixed, always visible)
             sidebarToggle
+            editorToggle
 
             thinDivider()
 
@@ -4960,6 +5112,32 @@ struct FormatToolbar: View {
         .buttonStyle(.plain)
         .onHover { hoveredButton = $0 ? "sidebar" : nil }
         .help(vm.isSidebarCollapsed ? "Show notes sidebar" : "Hide notes sidebar")
+    }
+
+    /// Hide the note column itself. Disabled while it is the only thing left —
+    /// a window showing nothing but a sidebar is a dead end you would have to
+    /// hunt for the way out of.
+    private var editorToggle: some View {
+        let canToggle = vm.canHideEditor || !vm.isEditorVisible
+        return Button(action: {
+            withAnimation(.easeInOut(duration: 0.18)) { vm.toggleEditor() }
+        }) {
+            Image(systemName: vm.isEditorVisible ? "note.text" : "note")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(canToggle ? (vm.isEditorVisible ? .secondary : .accentColor)
+                                           : Color.secondary.opacity(0.35))
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "editorColumn" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(!canToggle)
+        .onHover { hoveredButton = $0 ? "editorColumn" : nil }
+        .help(canToggle
+              ? (vm.isEditorVisible ? "Hide the note" : "Show the note")
+              : "Open the terminal or the browser first")
     }
 
     private var micButton: some View {
