@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.69.5"
+let APP_VERSION = "v1.71.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -93,6 +93,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 vm.startClaudeEventWatcher()
                 HandsfreeManager.shared.vm = vm
             }
+        }
+        // Sync Claude Code's own light/dark theme to the terminal palette at
+        // launch, so a pane opened later doesn't start in the wrong one.
+        MainActor.assumeIsolated {
+            TerminalSessions.syncClaudeCodeTheme(TerminalSessions.currentPalette())
         }
 
         // Poll tabs + folders files for external changes (e.g. from MCP server)
@@ -3054,6 +3059,9 @@ struct EditorView: View {
                 }
                 .onChange(of: vm.theme) { _, newTheme in
                     applyWindowTheme(newTheme)
+                    // Terminal panes follow the app theme unless overridden;
+                    // this also re-syncs Claude Code's own light/dark setting.
+                    TerminalSessions.shared.applyAppearance()
                 }
         }
         .preferredColorScheme(vm.theme.swiftUIScheme)
@@ -3243,6 +3251,14 @@ struct TerminalResizeHandle: View {
 struct TerminalPanel: View {
     @EnvironmentObject var vm: EditorViewModel
     @ObservedObject private var handsfree = HandsfreeManager.shared
+    /// Bumped by `.floatnoteTerminalPaletteChanged` purely to re-evaluate the
+    /// body — the palette lives in `TerminalSessions`, not in SwiftUI state.
+    @State private var paletteGeneration = 0
+
+    private var palette: TerminalPalette {
+        _ = paletteGeneration
+        return TerminalSessions.currentPalette()
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3256,14 +3272,19 @@ struct TerminalPanel: View {
                let tab = vm.terminalTabs.first(where: { $0.id == activeId }) {
                 SwiftTermContainer(id: tab.id, cwd: tab.path, freshClaude: tab.freshClaude)
                     .id(tab.id)
-                    .background(Color.black)
+                    .background(palette.backgroundColor)
                     // Scrolled up? Say how far behind the live output we are.
                     .overlay(alignment: .bottomTrailing) {
                         TerminalScrollPill(terminalId: tab.id)
                     }
             } else {
-                Color.black
+                palette.backgroundColor
             }
+        }
+        // Repaint when the palette changes under us (appearance menu, or the
+        // app theme flipping): TerminalSessions owns the colors, not this view.
+        .onReceive(NotificationCenter.default.publisher(for: .floatnoteTerminalPaletteChanged)) { _ in
+            paletteGeneration &+= 1
         }
     }
 
@@ -3284,26 +3305,47 @@ struct TerminalPanel: View {
             .buttonStyle(.plain)
             .help("New terminal at current route")
             Spacer(minLength: 0)
+            terminalFontButton
         }
         .background(vm.theme.chromeBackground)
     }
 
+    /// Font/size picker for every pane. Trailing edge of the tab bar, away from
+    /// the chips so it can't be hit while switching terminals.
+    private var terminalFontButton: some View {
+        Button(action: {
+            TerminalFontMenuTarget.shared.makeMenu()
+                .popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        }) {
+            Image(systemName: "textformat.size")
+                .font(.system(size: 11))
+                .frame(width: 28, height: 28)
+                .foregroundColor(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help("Terminal font")
+    }
+
     private func tabChip(_ tab: TerminalTab) -> some View {
         let isActive = vm.activeTerminalId == tab.id
+        // The active chip reads as the top edge of the terminal surface, so it
+        // is painted in the *terminal's* palette — not a hardcoded black slab,
+        // which under a light app theme left black-on-black label text.
+        let onSurface = palette.foregroundColor
         return HStack(spacing: 6) {
             Image(systemName: "terminal")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(isActive ? .accentColor : .secondary)
             Text(tab.label)
                 .font(.system(size: 12, weight: isActive ? .semibold : .regular))
-                .foregroundColor(isActive ? .primary : .secondary)
+                .foregroundColor(isActive ? onSurface : .secondary)
                 .lineLimit(1)
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.18)) { vm.closeTerminal(tab.id) }
             }) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9))
-                    .foregroundColor(.secondary)
+                    .foregroundColor(isActive ? onSurface.opacity(0.6) : .secondary)
                     .frame(width: 16, height: 16)
             }
             .buttonStyle(.plain)
@@ -3312,7 +3354,7 @@ struct TerminalPanel: View {
         .padding(.horizontal, 10)
         .frame(height: 28)
         .frame(maxWidth: 180)
-        .background(isActive ? Color.black : Color.clear)
+        .background(isActive ? palette.backgroundColor : Color.clear)
         .overlay(alignment: .top) {
             if isActive { Rectangle().fill(Color.accentColor).frame(height: 2) }
         }
