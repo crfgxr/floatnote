@@ -1389,16 +1389,23 @@ server.tool(
       .optional()
       .describe("Preset name or a fragment of one, e.g. 'iPhone 15', 'Pixel', 'iPad mini', 'Desktop', 'Responsive' (full panel width)"),
     landscape: z.boolean().optional().describe("Rotate: swap width and height"),
+    reload: z
+      .boolean()
+      .optional()
+      .describe("Reload the page so a server that decides mobile-vs-desktop serves its mobile version. Default false — the page keeps its current state (forms, scroll, open widgets), and a responsive site re-lays out from the new width anyway"),
   },
-  async ({ name, landscape }) => {
-    const res = await browserRPC("device", compact({ name, landscape }));
+  async ({ name, landscape, reload }) => {
+    const res = await browserRPC("device", compact({ name, landscape, reload }));
     if (!res.ok) return textResult(rpcError("device", res));
     const r = res.result || {};
     const size = r.width ? `${r.width}×${r.height}${r.landscape ? " (landscape)" : ""}` : "full panel width";
     const list = Array.isArray(r.available) ? `\n\nPresets: ${r.available.join(", ")}` : "";
+    const stale = r.userAgentStale
+      ? "\nThe page on screen was loaded under the previous user agent — pass reload: true if you need the server's mobile version (its current state is lost)."
+      : "";
     return textResult(
       `Viewport: ${r.name} — ${size}\nUser agent: ${r.userAgent}` +
-        `\nThe tab reloaded, so browser_read / browser_screenshot now show that rendering.${list}`
+        `\nbrowser_read / browser_screenshot now show that rendering.${stale}${list}`
     );
   }
 );

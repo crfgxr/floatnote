@@ -600,9 +600,11 @@ final class BrowserSessions: ObservableObject {
                     let names = BrowserDevice.all.map(\.name).joined(separator: ", ")
                     return done(.failure("no such device \"\(name)\" — try one of: \(names)"))
                 }
-                setDevice(match, landscape: Self.boolOrNil(params, "landscape") ?? deviceLandscape)
+                setDevice(match, landscape: Self.boolOrNil(params, "landscape") ?? deviceLandscape,
+                          reload: Self.boolOrNil(params, "reload") ?? false)
             } else if let landscape = Self.boolOrNil(params, "landscape") {
-                setDevice(device, landscape: landscape)
+                setDevice(device, landscape: landscape,
+                          reload: Self.boolOrNil(params, "reload") ?? false)
             }
             requestVisible()
             let size = deviceSize
@@ -611,6 +613,7 @@ final class BrowserSessions: ObservableObject {
                       "height": size == .zero ? 0 : Int(size.height),
                       "landscape": deviceLandscape,
                       "userAgent": device.userAgent ?? "default (macOS Safari)",
+                      "userAgentStale": userAgentIsStale(tab: resolve(params)),
                       "available": BrowserDevice.all.map(\.name)]))
 
         case "annotations":
@@ -906,18 +909,34 @@ final class BrowserSessions: ObservableObject {
     /// Switch viewport. The user agent goes on every live page and each one
     /// reloads: a site that decides mobile-vs-desktop on the server would
     /// otherwise keep serving what it decided before the switch.
-    func setDevice(_ device: BrowserDevice, landscape: Bool? = nil) {
+    /// Switch viewport. The user agent is swapped on every live page but the
+    /// pages are NOT reloaded: a responsive site re-lays out from the new width
+    /// on its own, and reloading threw away whatever you had on screen — a
+    /// half-filled form, a scroll position, an open chat widget. Server-side
+    /// mobile detection needs the reload, so it stays available explicitly (the
+    /// ↻ in the device bar, or `reload: true` over MCP) rather than being the
+    /// price of every switch.
+    func setDevice(_ device: BrowserDevice, landscape: Bool? = nil, reload: Bool = false) {
         self.device = device
         if let landscape { deviceLandscape = landscape }
         UserDefaults.standard.set(device.name, forKey: "fn.browserDevice")
         UserDefaults.standard.set(deviceLandscape, forKey: "fn.browserDeviceLandscape")
         for page in pages.values {
             page.webView.customUserAgent = device.userAgent
-            if page.currentURL.isEmpty == false, page.currentURL != "about:blank" {
-                page.webView.reload()
-            }
+            guard reload, !page.currentURL.isEmpty, page.currentURL != "about:blank" else { continue }
+            page.webView.reload()
         }
-        dbg("browser: device → \(device.name)\(deviceLandscape ? " (landscape)" : "")")
+        dbg("browser: device → \(device.name)\(deviceLandscape ? " (landscape)" : "")"
+            + (reload ? " (reloaded)" : ""))
+    }
+
+    /// True when the page in this tab was loaded under a different user agent
+    /// than the current device implies — i.e. a reload would change what the
+    /// server sends. Drives the device bar's ↻ hint.
+    func userAgentIsStale(tab id: UUID?) -> Bool {
+        guard let id, let page = page(for: id),
+              !page.currentURL.isEmpty, page.currentURL != "about:blank" else { return false }
+        return page.loadedUserAgent != device.userAgent
     }
 
     /// Turn the pane's pencil on or off for a page (the user-drawn path).
@@ -1507,6 +1526,23 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     // delegate stays silent — a file input, an alert, a confirm and a prompt all
     // look like dead buttons in a pane that never implemented them.
 
+    /// Who is actually asking.
+    ///
+    /// NOT `webView.url`: that is the TOP-LEVEL page, so an alert raised by an
+    /// embedded third-party frame would be labelled with the main site's host —
+    /// the exact shape of a phishing prompt ("your-bank.example says: re-enter
+    /// your password"). `WKFrameInfo.securityOrigin` is the real one, and a
+    /// non-main frame is called out as embedded rather than named as the site.
+    private func dialogSource(_ frame: WKFrameInfo) -> String {
+        let origin = frame.securityOrigin
+        var host = origin.host
+        if host.isEmpty { host = frame.request.url?.host ?? "" }
+        if host.isEmpty { host = "this page" }
+        let port = (origin.port == 0 || origin.port == 80 || origin.port == 443)
+            ? "" : ":\(origin.port)"
+        return frame.isMainFrame ? "\(host)\(port)" : "Embedded content from \(host)\(port)"
+    }
+
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
                  initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping ([URL]?) -> Void) {
@@ -1514,6 +1550,9 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         panel.allowsMultipleSelection = parameters.allowsMultipleSelection
         panel.canChooseDirectories = parameters.allowsDirectories
         panel.canChooseFiles = true
+        // Say who wants the file — a picker with no attribution is a picker you
+        // cannot make a safe decision in.
+        panel.message = "\(dialogSource(frame)) is asking for a file"
         panel.begin { response in
             completionHandler(response == .OK ? panel.urls : nil)
             dbg("browser: file picker → \(response == .OK ? "\(panel.urls.count) file(s)" : "cancelled")")
@@ -1523,7 +1562,7 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
         let alert = NSAlert()
-        alert.messageText = webView.url?.host ?? "Page"
+        alert.messageText = dialogSource(frame)
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -1533,7 +1572,7 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
         let alert = NSAlert()
-        alert.messageText = webView.url?.host ?? "Page"
+        alert.messageText = dialogSource(frame)
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
@@ -1544,7 +1583,7 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                  defaultText: String?, initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping (String?) -> Void) {
         let alert = NSAlert()
-        alert.messageText = webView.url?.host ?? "Page"
+        alert.messageText = dialogSource(frame)
         alert.informativeText = prompt
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
@@ -1584,7 +1623,11 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
 
     // MARK: WKNavigationDelegate
 
+    /// The user agent this page's current document was fetched with.
+    private(set) var loadedUserAgent: String?
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        loadedUserAgent = webView.customUserAgent
         sessions?.pageChanged(id)
     }
 
@@ -1645,11 +1688,39 @@ extension Notification.Name {
 /// `makeNSView` returns a FRESH container each time (SwiftUI doesn't reliably
 /// re-display a reused representable view) and re-parents the persistent web
 /// view into it.
+/// Lays the page out itself: full width in Responsive, or centred at the
+/// device's CSS width when a viewport is selected.
+///
+/// The device switch used to swap between two different SwiftUI branches (a
+/// plain container vs one inside a ScrollView), which made SwiftUI rebuild the
+/// representable and re-parent the shared `WKWebView`. A re-parented web view
+/// keeps its size and its document but stops drawing — the blank pane you got
+/// coming back from iPhone SE to Responsive. One container, one parent, forever.
+final class BrowserPageContainer: NSView {
+    /// 0 = fill the container (Responsive).
+    var pageWidth: CGFloat = 0 {
+        didSet { guard pageWidth != oldValue else { return }; needsLayout = true }
+    }
+
+    override func layout() {
+        super.layout()
+        guard let page = subviews.first else { return }
+        let width = pageWidth > 0 ? min(pageWidth, bounds.width) : bounds.width
+        let frame = NSRect(x: ((bounds.width - width) / 2).rounded(), y: 0,
+                           width: width, height: bounds.height)
+        guard page.frame != frame else { return }
+        page.frame = frame
+    }
+}
+
 struct BrowserWebContainer: NSViewRepresentable {
     let id: UUID
+    /// The selected viewport's CSS width; 0 fills the panel.
+    var pageWidth: CGFloat = 0
 
-    func makeNSView(context: Context) -> NSView {
-        let container = NSView()
+    func makeNSView(context: Context) -> BrowserPageContainer {
+        let container = BrowserPageContainer()
+        container.pageWidth = pageWidth
         container.wantsLayer = true
         // Clipping is load-bearing: the full-page screenshot path resizes the
         // web view to the whole document height for a moment, and an NSView
@@ -1660,8 +1731,9 @@ struct BrowserWebContainer: NSViewRepresentable {
         return container
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
+    func updateNSView(_ nsView: BrowserPageContainer, context: Context) {
         BrowserSessions.attach(BrowserSessions.shared.webView(for: id), to: nsView)
+        nsView.pageWidth = pageWidth
     }
 }
 
@@ -1669,18 +1741,27 @@ extension BrowserSessions {
     /// Parent `webView` in `container`, filling it. Shared by the representable
     /// and the rebuild-on-profile-change path, which has to swap one web view
     /// for another under a container SwiftUI won't recreate.
+    /// Frame-based, deliberately, not autolayout.
+    ///
+    /// One web view moves between containers: the device-viewport branch wraps it
+    /// in a fixed-width frame inside a scroller, the responsive branch does not,
+    /// and switching between them makes SwiftUI rebuild the representable. With
+    /// constraints, the ones pinning the view to its PREVIOUS container survived
+    /// the move and collapsed it to nothing — a blank page the moment you went
+    /// back to Responsive. A container that frames its subview in `layout()`
+    /// cannot get into that state, and it also coexists with the full-page
+    /// screenshot path, which resizes the web view's frame on purpose.
     static func attach(_ webView: WKWebView, to container: NSView) {
         guard webView.superview !== container else { return }
         for stale in container.subviews where stale !== webView { stale.removeFromSuperview() }
         webView.removeFromSuperview()
-        webView.translatesAutoresizingMaskIntoConstraints = false
+        webView.translatesAutoresizingMaskIntoConstraints = true
+        // The container positions it in `layout()`, so no autoresizing: an
+        // autoresized width would fight the device viewport's centred column.
+        webView.autoresizingMask = []
+        webView.frame = container.bounds
         container.addSubview(webView)
-        NSLayoutConstraint.activate([
-            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            webView.topAnchor.constraint(equalTo: container.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        ])
+        container.needsLayout = true
     }
 }
 
@@ -1808,26 +1889,16 @@ struct BrowserPanel: View {
     /// centred on a gutter; a wider one (an iPad in a 500pt panel) scrolls
     /// horizontally rather than being scaled — a scaled viewport reports the
     /// wrong CSS width and stops being an emulation.
-    @ViewBuilder
     private func page(_ tab: BrowserTab) -> some View {
-        let size = sessions.deviceSize
-        if size == .zero {
-            BrowserWebContainer(id: tab.id)
-                .id(tab.id)
-                .background(palette.backgroundColor)
-        } else {
-            GeometryReader { geo in
-                ScrollView(size.width > geo.size.width ? .horizontal : [], showsIndicators: true) {
-                    BrowserWebContainer(id: tab.id)
-                        .id(tab.id)
-                        .frame(width: size.width, height: geo.size.height)
-                        .background(Color.white)
-                        .shadow(color: .black.opacity(0.25), radius: 6)
-                        .frame(minWidth: geo.size.width, alignment: .center)
-                }
-                .background(palette.backgroundColor.opacity(0.6))
-            }
-        }
+        // ONE branch, whatever the viewport: the container centres the page at
+        // the device width itself. Switching branches re-parented the web view
+        // and left it blank (see `BrowserPageContainer`). A device wider than the
+        // panel is capped rather than scrolled — losing horizontal scroll for an
+        // iPad in a 480pt panel is a cheap trade for never blanking the page.
+        BrowserWebContainer(id: tab.id, pageWidth: sessions.deviceSize.width)
+            .id(tab.id)
+            .background(sessions.device.isResponsive
+                        ? palette.backgroundColor : palette.backgroundColor.opacity(0.6))
     }
 
     /// States what you are looking at. Without it a mobile-width page in a wide
@@ -1839,6 +1910,19 @@ struct BrowserPanel: View {
             Text(sessions.device.label + (sessions.deviceLandscape ? " · landscape" : ""))
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
             Spacer()
+            if sessions.userAgentIsStale(tab: sessions.activeTabId) {
+                Button(action: {
+                    sessions.setDevice(sessions.device, reload: true)
+                }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.clockwise")
+                        Text("mobile UA").font(.system(size: 9, weight: .semibold))
+                    }
+                    .font(.system(size: 10))
+                }
+                .buttonStyle(.plain)
+                .help("This page was loaded with the previous user agent. Reload to let the server serve its mobile version — the page's current state is lost.")
+            }
             Button(action: { sessions.setDevice(sessions.device, landscape: !sessions.deviceLandscape) }) {
                 Image(systemName: "rotate.right").font(.system(size: 10))
             }
