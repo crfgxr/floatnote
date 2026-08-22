@@ -1,38 +1,21 @@
-From 18f292a00fc1bc48afaff8ee31b485514930eb68 Mon Sep 17 00:00:00 2001
+From 5696953cd912f235108796b5e5ef462a3e7ca574 Mon Sep 17 00:00:00 2001
 From: FloatNote <noreply@anthropic.com>
 Date: Sat, 15 Aug 2026 13:19:33 +0300
 Subject: [PATCH] FloatNote patch: sticky scroll, selection stability, deeper
- scrollback
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+ scrollback, line spacing
 
-1. Set Terminal.userScrolling from scrollTo() so incoming output stops
-   yanking the viewport to the bottom. The flag is honored by
-   Terminal.scroll() but never set upstream — the view's identically-named
-   property is a different variable.
-
-2. Notify on scrollback trim (new TerminalDelegate.linesTrimmed, default
-   no-op) and shift the selection by the same amount. start/end are line-ring
-   indices, so without this the highlight walks down through the text while
-   output streams — you select a line and copy a different one.
-
-3. TerminalView.defaultScrollback, because upstream hardcodes TerminalOptions'
-   500-line default and rebuilds options on every resize.
-
-Adds linesBelowViewport / scrollToBottom() for the scroll-back pill.
 ---
- .../SwiftTerm/Apple/AppleTerminalView.swift   | 41 ++++++++++++++++++-
- Sources/SwiftTerm/Mac/MacTerminalView.swift   | 25 +++++++----
- Sources/SwiftTerm/SelectionService.swift      | 28 +++++++++++++
- Sources/SwiftTerm/Terminal.swift              | 22 ++++++++++
- 4 files changed, 108 insertions(+), 8 deletions(-)
+ .../SwiftTerm/Apple/AppleTerminalView.swift   | 56 ++++++++++++++++++-
+ Sources/SwiftTerm/Mac/MacTerminalView.swift   | 25 ++++++---
+ Sources/SwiftTerm/SelectionService.swift      | 28 ++++++++++
+ Sources/SwiftTerm/Terminal.swift              | 22 ++++++++
+ 4 files changed, 121 insertions(+), 10 deletions(-)
 
 diff --git a/Sources/SwiftTerm/Apple/AppleTerminalView.swift b/Sources/SwiftTerm/Apple/AppleTerminalView.swift
-index 2b50935..d4c7cce 100644
+index 2b50935..220d59e 100644
 --- a/Sources/SwiftTerm/Apple/AppleTerminalView.swift
 +++ b/Sources/SwiftTerm/Apple/AppleTerminalView.swift
-@@ -123,6 +123,15 @@ extension TerminalView {
+@@ -123,6 +123,26 @@ extension TerminalView {
          return caretView?.frame ?? CGRect.zero
      }
      
@@ -45,10 +28,21 @@ index 2b50935..d4c7cce 100644
 +    /// scroll back through.
 +    public static var defaultScrollback = 500
 +
++    /// Extra points added to every cell's height, split evenly above and below
++    /// the glyphs. Upstream packs rows at exactly ascent+descent+leading, which
++    /// is denser than the line height a rendered-markdown UI uses; this opens
++    /// the text up without touching the font.
++    ///
++    /// Static because this file is an `extension` (no stored properties) — and
++    /// because the host app runs every pane at one spacing anyway. Assign it
++    /// BEFORE setting `font`: the font setter is what re-lays out the terminal
++    /// with the new metrics.
++    public static var extraLineSpacing: CGFloat = 0
++
      func setupOptions(width: CGFloat, height: CGFloat)
      {
          resetCaches ()
-@@ -131,7 +140,8 @@ extension TerminalView {
+@@ -131,7 +151,8 @@ extension TerminalView {
          self.cellDimension = computeFontDimensions ()
          
          let terminalOptions = TerminalOptions(cols: Int(width / cellDimension.width),
@@ -58,7 +52,25 @@ index 2b50935..d4c7cce 100644
          
          if terminal == nil {
              terminal = Terminal(delegate: self, options: terminalOptions)
-@@ -1820,6 +1830,21 @@ extension TerminalView {
+@@ -197,7 +218,7 @@ extension TerminalView {
+         let lineAscent = CTFontGetAscent (fontSet.normal)
+         let lineDescent = CTFontGetDescent (fontSet.normal)
+         let lineLeading = CTFontGetLeading (fontSet.normal)
+-        let cellHeight = ceil(lineAscent + lineDescent + lineLeading)
++        let cellHeight = ceil(lineAscent + lineDescent + lineLeading) + max(0, TerminalView.extraLineSpacing)
+         #if os(macOS)
+         // The following is a more robust way of getting the largest ascii character width, but comes with a performance hit.
+         // See: https://github.com/migueldeicaza/SwiftTerm/issues/286
+@@ -1140,7 +1161,7 @@ extension TerminalView {
+     {
+         let lineDescent = CTFontGetDescent(fontSet.normal)
+         let lineLeading = CTFontGetLeading(fontSet.normal)
+-        let yOffset = ceil(lineDescent+lineLeading)
++        let yOffset = ceil(lineDescent+lineLeading) + max(0, TerminalView.extraLineSpacing) / 2
+         let displayBuffer = terminal.displayBuffer
+ 
+         func calcLineOffset (forRow: Int) -> CGFloat {
+@@ -1820,6 +1841,21 @@ extension TerminalView {
                  displayBuffer.lines.count > displayBuffer.rows
          }
      }
@@ -80,7 +92,7 @@ index 2b50935..d4c7cce 100644
      
      public func scroll (toPosition: Double)
      {
-@@ -1846,6 +1871,20 @@ extension TerminalView {
+@@ -1846,6 +1882,20 @@ extension TerminalView {
      public func scrollTo (row: Int, notifyAccessibility: Bool = true)
      {
          let displayBuffer = terminal.displayBuffer

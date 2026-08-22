@@ -129,6 +129,7 @@ final class TerminalSessions {
     static let fontFamilyKey = "fn.terminalFontFamily"
     static let fontSizeKey = "fn.terminalFontSize"
     static let fontWeightKey = "fn.terminalFontWeight"
+    static let lineSpacingKey = "fn.terminalLineSpacing"
     /// Sentinel family meaning `NSFont.monospacedSystemFont` — i.e. real SF
     /// Mono. macOS ships SF Mono as a system-restricted face, so it is NOT in
     /// `availableFontFamilies` and `NSFont(name: "SF Mono")` fails on a stock
@@ -155,6 +156,15 @@ final class TerminalSessions {
 
     static var selectedFontFamily: String {
         UserDefaults.standard.string(forKey: fontFamilyKey) ?? systemMonoFamily
+    }
+
+    /// Extra points per row. Normal (2pt) is the default: upstream SwiftTerm
+    /// packs rows at exactly the font's ascent+descent+leading, which reads
+    /// tighter than a rendered-markdown UI. Vendored-fork knob — see
+    /// `TerminalView.extraLineSpacing`.
+    static var selectedLineSpacing: CGFloat {
+        guard UserDefaults.standard.object(forKey: lineSpacingKey) != nil else { return 2 }
+        return CGFloat(UserDefaults.standard.double(forKey: lineSpacingKey))
     }
 
     static var selectedFontWeight: NSFont.Weight {
@@ -187,14 +197,20 @@ final class TerminalSessions {
 
     /// Persist a new font and apply it to every open pane — including the ones
     /// that aren't on screen, so switching chips never shows the old face.
-    func setFont(family: String? = nil, size: CGFloat? = nil, weight: NSFont.Weight? = nil) {
+    func setFont(family: String? = nil, size: CGFloat? = nil, weight: NSFont.Weight? = nil,
+                 lineSpacing: CGFloat? = nil) {
         let defaults = UserDefaults.standard
         if let family { defaults.set(family, forKey: Self.fontFamilyKey) }
         if let size { defaults.set(Double(size), forKey: Self.fontSizeKey) }
         if let weight { defaults.set(weight == .regular ? "regular" : "medium", forKey: Self.fontWeightKey) }
+        if let lineSpacing { defaults.set(Double(lineSpacing), forKey: Self.lineSpacingKey) }
         let font = Self.currentFont()
+        let spacing = Self.selectedLineSpacing
+        // Spacing is read during the font setter's relayout, so it must be in
+        // place first; assigning the font is then what repaints every pane.
+        TerminalView.extraLineSpacing = spacing
         for session in sessions.values { session.view.font = font }
-        dbg("terminal font: \(font.fontName) \(Int(font.pointSize))pt (\(sessions.count) pane(s))")
+        dbg("terminal font: \(font.fontName) \(Int(font.pointSize))pt +\(Int(spacing))pt line (\(sessions.count) pane(s))")
     }
 
     /// Permanently end a session: terminate its shell and forget it. Called only
@@ -246,6 +262,7 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
         // this ("This poses a problem for selection"). Claude Code is
         // keyboard-driven, so forwarding mouse events to it buys us little.
         view.allowMouseReporting = false
+        TerminalView.extraLineSpacing = TerminalSessions.selectedLineSpacing
         view.font = TerminalSessions.currentFont()
         TerminalSessions.apply(TerminalSessions.currentPalette(), to: view)
         startShell()
@@ -483,6 +500,17 @@ final class TerminalFontMenuTarget: NSObject {
         TerminalSessions.shared.setFont(size: CGFloat(size))
     }
 
+    /// Points added per row. Beyond ~8 the block caret starts to look detached
+    /// from its line.
+    static let lineSpacings: [(String, Double)] = [
+        ("Tight", 0), ("Normal", 2), ("Relaxed", 5), ("Airy", 8),
+    ]
+
+    @objc func selectLineSpacing(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Double else { return }
+        TerminalSessions.shared.setFont(lineSpacing: CGFloat(value))
+    }
+
     @objc func selectWeight(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String else { return }
         TerminalSessions.shared.setFont(weight: raw == "regular" ? .regular : .medium)
@@ -566,6 +594,18 @@ final class TerminalFontMenuTarget: NSObject {
         }
         weightItem.submenu = weightMenu
         menu.addItem(weightItem)
+
+        let spacingItem = NSMenuItem(title: "Line Spacing", action: nil, keyEquivalent: "")
+        let spacingMenu = NSMenu()
+        for (title, value) in Self.lineSpacings {
+            let item = NSMenuItem(title: title, action: #selector(selectLineSpacing(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = value
+            item.state = abs(TerminalSessions.selectedLineSpacing - CGFloat(value)) < 0.01 ? .on : .off
+            spacingMenu.addItem(item)
+        }
+        spacingItem.submenu = spacingMenu
+        menu.addItem(spacingItem)
         return menu
     }
 }
