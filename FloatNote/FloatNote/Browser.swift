@@ -2036,8 +2036,11 @@ struct BrowserResizeHandle: View {
             DragGesture(minimumDistance: 0, coordinateSpace: .global)
                 .onChanged { value in
                     if !isDragging { isDragging = true; startWidth = vm.browserWidth }
-                    // Drag-left → wider (subtract dx); cap to the window.
-                    vm.browserWidth = min(widthCap, max(minWidth, startWidth - value.translation.width))
+                    // Drag-left → wider (subtract dx). The view model does the
+                    // clamping AND takes the space out of the terminal panel when
+                    // the pair would exceed the window — otherwise the renderer
+                    // just scales both back and the drag has no visible effect.
+                    vm.setBrowserWidth(min(maxWidth, max(minWidth, startWidth - value.translation.width)))
                 }
                 .onEnded { _ in isDragging = false }
         )

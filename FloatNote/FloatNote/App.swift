@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.85.1"
+let APP_VERSION = "v1.86.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -117,6 +117,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 vm.checkClaudeEvents()
                 vm.sweepExpiredJobStatuses()
                 TranscriptStore.shared.poll()
+                vm.checkPaneActivity()
                 BrowserSessions.shared.pollRPC()
             }
         }
@@ -219,6 +220,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 MainActor.assumeIsolated {
                     if let id = TerminalSessions.shared.id(containing: NSApp.keyWindow?.firstResponder) {
                         TranscriptStore.shared.noteInterrupted(paneId: id)
+                        vm.clearPaneActivity(id)
                     }
                 }
                 return event
@@ -787,6 +789,39 @@ class EditorViewModel: ObservableObject {
         return ((wantTerminal * scale).rounded(), (wantBrowser * scale).rounded())
     }
 
+    /// Total width the two panels may occupy together.
+    func panelBudget() -> CGFloat {
+        guard windowContentWidth > 0 else { return 3200 }
+        let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
+        let handles: CGFloat = 20
+        let floor: CGFloat = isEditorVisible ? Self.editorFloorWidth : 0
+        return max(320, windowContentWidth - sidebar - handles - floor)
+    }
+
+    /// Resize the terminal panel, taking the difference out of the browser when
+    /// the two would exceed the budget.
+    ///
+    /// Without the push, a drag on a pair of panels that already filled the
+    /// window did nothing visible: `panelWidths()` simply scaled both back down
+    /// in proportion, so the panel you were dragging ended up the same width it
+    /// started. A drag has to move space from one side to the other.
+    func setTerminalWidth(_ proposed: CGFloat) {
+        let budget = panelBudget()
+        let width = min(proposed, budget - (isBrowserVisible ? 280 : 0))
+        terminalWidth = max(Self.minTerminalColumnWidth, width)
+        guard isBrowserVisible, terminalWidth + browserWidth > budget else { return }
+        browserWidth = max(280, budget - terminalWidth)
+    }
+
+    func setBrowserWidth(_ proposed: CGFloat) {
+        let budget = panelBudget()
+        let terminalOpen = isTerminalVisible && !terminalTabs.isEmpty
+        let width = min(proposed, budget - (terminalOpen ? Self.minTerminalColumnWidth : 0))
+        browserWidth = max(280, width)
+        guard terminalOpen, terminalWidth + browserWidth > budget else { return }
+        terminalWidth = max(Self.minTerminalColumnWidth, budget - browserWidth)
+    }
+
     /// Drag ceilings: each panel may grow into the editor's slack, never into
     /// the other panel's stored width.
     func maxTerminalWidth() -> CGFloat {
@@ -892,6 +927,39 @@ class EditorViewModel: ObservableObject {
         }
         isTerminalVisible = true
     }
+
+    /// Last time each pane's Claude session FILE grew. The transcript only tails
+    /// the pane you are looking at, so this is the one signal that exists for the
+    /// others: Claude writes a record for every step it takes, and a file that is
+    /// growing means a turn is running.
+    @Published var paneActivity: [UUID: Date] = [:]
+    private var paneFileSizes: [UUID: UInt64] = [:]
+
+    /// Long enough to ride out a slow tool call that emits nothing, short enough
+    /// that a finished turn stops spinning before you wonder about it.
+    static let paneWorkingWindow: TimeInterval = 25
+
+    /// Sweep the panes' session files. Cheap: one `stat` per open pane, on the
+    /// existing 2s timer.
+    func checkPaneActivity() {
+        for tab in terminalTabs {
+            guard let path = tab.claudeTranscriptPath,
+                  let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                  let size = (attrs[.size] as? NSNumber)?.uint64Value else { continue }
+            defer { paneFileSizes[tab.id] = size }
+            guard let previous = paneFileSizes[tab.id] else { continue }
+            if size > previous { paneActivity[tab.id] = Date() }
+        }
+    }
+
+    /// A pane is working while its file is still growing — unless a hook, or an
+    /// escape, has already said the turn is over.
+    func isPaneWorking(_ id: UUID, now: Date = Date()) -> Bool {
+        guard let last = paneActivity[id] else { return false }
+        return now.timeIntervalSince(last) < Self.paneWorkingWindow
+    }
+
+    func clearPaneActivity(_ id: UUID) { paneActivity[id] = nil }
 
     /// The pane bound to this note, if one is open. Drives the sidebar's terminal
     /// glyph — "this note has a shell running against it" is worth seeing from
@@ -1309,6 +1377,7 @@ class EditorViewModel: ObservableObject {
             if stale {
                 if event == "Stop" || event == "Notification" {
                     TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
+                    clearPaneActivity(tab.id)
                 }
                 dbg("claude event [\(event)] stale — spinner cleared, no banner")
                 continue
@@ -1333,6 +1402,7 @@ class EditorViewModel: ObservableObject {
             // the turn, Notification means Claude is waiting on the human.
             if event == "Stop" || event == "Notification" {
                 TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
+                clearPaneActivity(tab.id)
             }
             if event == "Stop", !turnText.isEmpty {
                 HandsfreeManager.shared.handleTurnEnd(message: turnText, tab: tab)
@@ -3592,8 +3662,7 @@ struct TerminalResizeHandle: View {
                     if !isDragging { isDragging = true; startWidth = vm.terminalWidth }
                     // Drag-left → wider (subtract dx); cap to the window.
                     let dx = value.translation.width
-                    let cap = min(maxWidth, max(minWidth, vm.maxTerminalWidth()))
-                    vm.terminalWidth = min(cap, max(minWidth, startWidth - dx))
+                    vm.setTerminalWidth(min(maxWidth, max(minWidth, startWidth - dx)))
                 }
                 .onEnded { _ in isDragging = false }
         )
@@ -3744,6 +3813,12 @@ struct TerminalPanel: View {
         .help("Terminal font")
     }
 
+    private func chipGlyph(isActive: Bool) -> some View {
+        Image(systemName: "terminal")
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundColor(isActive ? .accentColor : .secondary)
+    }
+
     private func tabChip(_ tab: TerminalTab) -> some View {
         let isActive = vm.activeTerminalId == tab.id
         // The active chip reads as the top edge of the terminal surface, so it
@@ -3751,9 +3826,21 @@ struct TerminalPanel: View {
         // which under a light app theme left black-on-black label text.
         let onSurface = palette.foregroundColor
         return HStack(spacing: 6) {
-            Image(systemName: "terminal")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(isActive ? .accentColor : .secondary)
+            // A spinner in place of the glyph while that pane's Claude is
+            // working — including panes you are not looking at, which is the
+            // whole point: two agents running and you can see which one is busy.
+            if let since = vm.paneActivity[tab.id] {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    if vm.isPaneWorking(tab.id, now: context.date) {
+                        TerminalChipSpinner(active: isActive)
+                    } else {
+                        chipGlyph(isActive: isActive)
+                    }
+                }
+                .id(since)
+            } else {
+                chipGlyph(isActive: isActive)
+            }
             Text(tab.label)
                 .font(.system(size: 12, weight: isActive ? .semibold : .regular))
                 .foregroundColor(isActive ? onSurface : .secondary)
@@ -3790,6 +3877,23 @@ struct TerminalPanel: View {
 
 /// Reorders terminal chips as the drag passes over them, so the bar rearranges
 /// under the cursor instead of waiting for the drop.
+/// The chip's working indicator: the same rotating asterisk the transcript pill
+/// uses, so "busy" looks the same wherever it appears.
+struct TerminalChipSpinner: View {
+    let active: Bool
+    @State private var spin = false
+
+    var body: some View {
+        Image(systemName: "asterisk")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundColor(active ? .accentColor : .secondary)
+            .rotationEffect(.degrees(spin ? 360 : 0))
+            .onAppear {
+                withAnimation(.linear(duration: 2.4).repeatForever(autoreverses: false)) { spin = true }
+            }
+    }
+}
+
 struct TerminalTabDropDelegate: DropDelegate {
     let tab: TerminalTab
     let vm: EditorViewModel
