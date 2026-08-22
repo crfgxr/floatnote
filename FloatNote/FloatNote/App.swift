@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.72.0"
+let APP_VERSION = "v1.73.3"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -109,6 +109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 vm.checkExternalBoardChanges()
                 vm.checkClaudeEvents()
                 vm.sweepExpiredJobStatuses()
+                TranscriptStore.shared.poll()
             }
         }
 
@@ -543,6 +544,15 @@ struct TerminalTab: Identifiable, Equatable, Codable {
     /// this binding does. At most one pane is bound to a given note (the most
     /// recent binding wins); nil = unbound, reachable only by path fallback.
     var noteId: UUID? = nil
+    /// Which Claude Code conversation this pane is running, learned from the
+    /// hook (`session_id` / `transcript_path`, stamped in `checkClaudeEvents`).
+    /// `TerminalTab.path` cannot identify a conversation — several panes share
+    /// one project directory and `freshClaude` deliberately starts a second
+    /// `.jsonl` in the same store. Persisted, so a restored pane shows the
+    /// right transcript before any new hook event arrives; nil = fall back to
+    /// the provisional resolution ladder.
+    var claudeSessionId: String? = nil
+    var claudeTranscriptPath: String? = nil
 }
 
 // MARK: - ViewModel
@@ -565,7 +575,14 @@ class EditorViewModel: ObservableObject {
            let t = AppTheme(rawValue: raw) { return t }
         return .obsidian
     }() {
-        didSet { UserDefaults.standard.set(theme.rawValue, forKey: "fn.theme") }
+        didSet {
+            UserDefaults.standard.set(theme.rawValue, forKey: "fn.theme")
+            // Repaint the terminal panel HERE, not from an .onChange: the palette
+            // is resolved by reading `fn.theme` back out of UserDefaults, and a
+            // view-side observer can run before this line has written it — which
+            // left the terminal and the transcript one theme behind.
+            TerminalSessions.shared.applyAppearance()
+        }
     }
     @Published var isSidebarCollapsed: Bool = UserDefaults.standard.bool(forKey: "fn.sidebarCollapsed") {
         didSet { UserDefaults.standard.set(isSidebarCollapsed, forKey: "fn.sidebarCollapsed") }
@@ -582,7 +599,11 @@ class EditorViewModel: ObservableObject {
     }
     /// Whether the embedded terminal panel is shown on the right edge.
     @Published var isTerminalVisible: Bool = UserDefaults.standard.bool(forKey: "fn.terminalVisible") {
-        didSet { UserDefaults.standard.set(isTerminalVisible, forKey: "fn.terminalVisible") }
+        didSet {
+            UserDefaults.standard.set(isTerminalVisible, forKey: "fn.terminalVisible")
+            guard isTerminalVisible != oldValue else { return }
+            syncTranscriptBinding()
+        }
     }
     /// Terminals shown in the panel, one visible at a time via the tab bar. Each
     /// tab maps to a mounted SwiftTermContainer (and its shell process), kept
@@ -593,7 +614,11 @@ class EditorViewModel: ObservableObject {
     }
     /// The currently visible terminal tab.
     @Published var activeTerminalId: UUID? {
-        didSet { saveTerminalTabs() }
+        didSet {
+            saveTerminalTabs()
+            guard activeTerminalId != oldValue else { return }
+            syncTranscriptBinding()
+        }
     }
     /// True while restoring panes at launch, so the restore doesn't write back
     /// over the very state it is reading.
@@ -775,18 +800,36 @@ class EditorViewModel: ObservableObject {
     func selectTerminal(_ id: UUID) {
         activeTerminalId = id
         focusActiveTerminal()
+        syncTranscriptBinding()
         guard let tab = terminalTabs.first(where: { $0.id == id }) else { return }
         dbg("selectTerminal \(tab.label) noteId=\(tab.noteId?.uuidString.prefix(8) ?? "nil")")
-        // A pane bound to a live note goes straight back to it; the note→terminal
-        // route then resolves to this same pane, so there is no ping-pong.
+        // A pane bound to a live note goes straight back to it. Pin the reverse
+        // map to THIS pane first: several panes can share one project, and if
+        // `terminalForNote` still pointed at a sibling, the note→terminal route
+        // fired by `switchTab` would hand the note straight back to it — the
+        // chip you tapped would lose to the last pane on the path.
         if let boundId = tab.noteId, let bound = tabs.first(where: { $0.id == boundId }),
            bound.folderId != TRASH_FOLDER_ID {
+            terminalForNote[boundId] = id
             if bound.id != activeTabId { switchTab(bound.id) }
             return
         }
-        // Unbound (or its note is gone): fall back to the folder's last note.
+        // Unbound (or its note is gone): fall back to the folder's last note —
+        // but only when no sibling pane already claims it. Navigating there
+        // anyway is what made the second `floatnote` chip open the last one; and
+        // stealing the note instead would just make the two chips trade it back
+        // and forth on every tap. So an unclaimed note is adopted (the chip
+        // gains a home), a claimed one leaves the editor alone and the tapped
+        // pane simply becomes active.
         guard let folder = folderForTerminalPath(tab.path),
               let note = noteToActivate(forTerminalFolder: folder) else { return }
+        if terminalTabs.contains(where: { $0.id != id && $0.noteId == note.id }) {
+            dbg("selectTerminal \(tab.label): note claimed by another pane — staying put")
+            return
+        }
+        bindTerminal(id, toNote: note.id)
+        terminalForNote[note.id] = id
+        saveTerminalTabs()
         if note.id != activeTabId { switchTab(note.id) }
     }
 
@@ -954,6 +997,50 @@ class EditorViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Transcript pane
+
+    /// Which surface the terminal panel is showing. Deliberately NOT a
+    /// visibility flag: the panel's own show/hide rules (route gate, pin stash)
+    /// still decide whether anything is on screen at all.
+    /// Split is the default: the pane is what the panel is FOR, and a terminal
+    /// with no transcript beside it reads as the old panel.
+    @Published var transcriptMode: TranscriptMode = {
+        UserDefaults.standard.string(forKey: "fn.transcriptMode")
+            .flatMap(TranscriptMode.init(rawValue:)) ?? .split
+    }() {
+        didSet {
+            UserDefaults.standard.set(transcriptMode.rawValue, forKey: "fn.transcriptMode")
+            syncTranscriptBinding()
+        }
+    }
+
+    @Published var transcriptSplitFraction: Double = {
+        let stored = UserDefaults.standard.double(forKey: "fn.transcriptSplitFraction")
+        return stored > 0 ? stored : 0.6
+    }() {
+        didSet { UserDefaults.standard.set(transcriptSplitFraction, forKey: "fn.transcriptSplitFraction") }
+    }
+
+    func cycleTranscriptMode() {
+        withAnimation(.easeInOut(duration: 0.16)) {
+            transcriptMode = transcriptMode.next
+        }
+        dbg("transcript: mode → \(transcriptMode.rawValue)")
+    }
+
+    /// Point the store at the active pane — or at nothing, when the transcript
+    /// isn't showing. Only the active pane tails; background panes keep their
+    /// binding on `TerminalTab` but hold no file descriptor.
+    func syncTranscriptBinding() {
+        guard transcriptMode != .terminal, isTerminalVisible,
+              let id = activeTerminalId,
+              let tab = terminalTabs.first(where: { $0.id == id }) else {
+            TranscriptStore.shared.unbind()
+            return
+        }
+        TranscriptStore.shared.bind(to: tab)
+    }
+
     /// Toggle hands-free voice. Everything that can turn it on goes through
     /// here — toolbar button, ⌘⇧M, menu item — so the route gate and its
     /// logging live in one place instead of being duplicated per affordance.
@@ -1025,7 +1112,24 @@ class EditorViewModel: ObservableObject {
             // Claude's last turn, for hands-free voice. Empty when the hook
             // install predates the field, or the event carries no turn text.
             let turnText = obj["last_assistant_message"] as? String ?? ""
+            // Bind this pane to its conversation. Authoritative — Claude Code
+            // itself named the session — and cheap: two string fields the hook
+            // already had and threw away.
+            if let sid = obj["session_id"] as? String, !sid.isEmpty,
+               let idx = terminalTabs.firstIndex(where: { $0.id == tab.id }),
+               terminalTabs[idx].claudeSessionId != sid {
+                terminalTabs[idx].claudeSessionId = sid
+                terminalTabs[idx].claudeTranscriptPath = obj["transcript_path"] as? String
+                saveTerminalTabs()
+                dbg("transcript: pane \(tab.label) bound to session \(sid.prefix(8))")
+                if tab.id == activeTerminalId { TranscriptStore.shared.rebind(to: terminalTabs[idx]) }
+            }
             dbg("claude event [\(event)] → pane \(tab.label) turnText=\(turnText.count)ch")
+            // Both events mean the transcript's spinner should stop: Stop ends
+            // the turn, Notification means Claude is waiting on the human.
+            if event == "Stop" || event == "Notification" {
+                TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
+            }
             if event == "Stop", !turnText.isEmpty {
                 HandsfreeManager.shared.handleTurnEnd(message: turnText, tab: tab)
             } else if event == "Notification" {
@@ -3059,9 +3163,6 @@ struct EditorView: View {
                 }
                 .onChange(of: vm.theme) { _, newTheme in
                     applyWindowTheme(newTheme)
-                    // Terminal panes follow the app theme unless overridden;
-                    // this also re-syncs Claude Code's own light/dark setting.
-                    TerminalSessions.shared.applyAppearance()
                 }
         }
         .preferredColorScheme(vm.theme.swiftUIScheme)
@@ -3270,13 +3371,19 @@ struct TerminalPanel: View {
             }
             if let activeId = vm.activeTerminalId,
                let tab = vm.terminalTabs.first(where: { $0.id == activeId }) {
-                SwiftTermContainer(id: tab.id, cwd: tab.path, freshClaude: tab.freshClaude)
-                    .id(tab.id)
-                    .background(palette.backgroundColor)
-                    // Scrolled up? Say how far behind the live output we are.
-                    .overlay(alignment: .bottomTrailing) {
-                        TerminalScrollPill(terminalId: tab.id)
+                // Transcript above, terminal below — the split is vertical
+                // because a side-by-side one would drop the terminal under 80
+                // columns and wreck Claude Code's own box drawing.
+                GeometryReader { geo in
+                    VStack(spacing: 0) {
+                        if vm.transcriptMode == .split {
+                            TranscriptPane()
+                                .frame(height: max(180, geo.size.height * vm.transcriptSplitFraction))
+                            TranscriptSplitHandle(totalHeight: geo.size.height)
+                        }
+                        terminalSurface(tab)
                     }
+                }
             } else {
                 palette.backgroundColor
             }
@@ -3286,6 +3393,17 @@ struct TerminalPanel: View {
         .onReceive(NotificationCenter.default.publisher(for: .floatnoteTerminalPaletteChanged)) { _ in
             paletteGeneration &+= 1
         }
+    }
+
+    /// The terminal itself, unchanged — just lifted out so the split can place it.
+    private func terminalSurface(_ tab: TerminalTab) -> some View {
+        SwiftTermContainer(id: tab.id, cwd: tab.path, freshClaude: tab.freshClaude)
+            .id(tab.id)
+            .background(palette.backgroundColor)
+            // Scrolled up? Say how far behind the live output we are.
+            .overlay(alignment: .bottomTrailing) {
+                TerminalScrollPill(terminalId: tab.id)
+            }
     }
 
     private var tabBar: some View {
@@ -3305,9 +3423,27 @@ struct TerminalPanel: View {
             .buttonStyle(.plain)
             .help("New terminal at current route")
             Spacer(minLength: 0)
-            terminalFontButton
+            transcriptModeControl
+            // `terminalFontButton` is deliberately not in the bar: the palette
+            // follows the app theme and SF Mono 13 is settled, so the menu was
+            // only clutter. The menu itself still builds — put the button back
+            // here to expose it again.
         }
         .background(vm.theme.chromeBackground)
+    }
+
+    /// Terminal / split / transcript. Three states, one button — cycling beats a
+    /// segmented control here because the tab bar is already crowded and this is
+    /// a view toggle, not a setting.
+    private var transcriptModeControl: some View {
+        Button(action: { vm.cycleTranscriptMode() }) {
+            Image(systemName: vm.transcriptMode.symbol)
+                .font(.system(size: 11))
+                .frame(width: 28, height: 28)
+                .foregroundColor(vm.transcriptMode == .terminal ? .secondary : .accentColor)
+        }
+        .buttonStyle(.plain)
+        .help(vm.transcriptMode.help)
     }
 
     /// Font/size picker for every pane. Trailing edge of the tab bar, away from

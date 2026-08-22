@@ -167,8 +167,15 @@ final class TerminalSessions {
         return CGFloat(UserDefaults.standard.double(forKey: lineSpacingKey))
     }
 
+    /// Weight names → `NSFont.Weight`. Kept as strings in defaults so the
+    /// stored value survives a change of cuts.
+    static let fontWeights: [(String, NSFont.Weight)] = [
+        ("Light", .light), ("Regular", .regular), ("Medium", .medium), ("Semibold", .semibold),
+    ]
+
     static var selectedFontWeight: NSFont.Weight {
-        UserDefaults.standard.string(forKey: fontWeightKey) == "regular" ? .regular : .medium
+        guard let name = UserDefaults.standard.string(forKey: fontWeightKey) else { return .medium }
+        return fontWeights.first { $0.0.lowercased() == name }?.1 ?? .medium
     }
 
     static var selectedFontSize: CGFloat {
@@ -184,6 +191,13 @@ final class TerminalSessions {
         let weight = selectedFontWeight
         let family = selectedFontFamily
         if family != systemMonoFamily, let font = NSFont(name: family, size: size) {
+            // Apple's SF Mono ships one file per cut; asking for the PostScript
+            // name gets the real face instead of a synthesised weight.
+            if family == "SF Mono",
+               let name = fontWeights.first(where: { $0.1 == weight })?.0,
+               let exact = NSFont(name: "SFMono-\(name)", size: size) {
+                return exact
+            }
             guard weight != .regular else { return font }
             // Named families don't take a weight directly; go through the
             // descriptor so e.g. Menlo picks up its Bold-ish cut when asked.
@@ -202,7 +216,9 @@ final class TerminalSessions {
         let defaults = UserDefaults.standard
         if let family { defaults.set(family, forKey: Self.fontFamilyKey) }
         if let size { defaults.set(Double(size), forKey: Self.fontSizeKey) }
-        if let weight { defaults.set(weight == .regular ? "regular" : "medium", forKey: Self.fontWeightKey) }
+        if let weight, let name = Self.fontWeights.first(where: { $0.1 == weight })?.0 {
+            defaults.set(name.lowercased(), forKey: Self.fontWeightKey)
+        }
         if let lineSpacing { defaults.set(Double(lineSpacing), forKey: Self.lineSpacingKey) }
         let font = Self.currentFont()
         let spacing = Self.selectedLineSpacing
@@ -512,8 +528,10 @@ final class TerminalFontMenuTarget: NSObject {
     }
 
     @objc func selectWeight(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String else { return }
-        TerminalSessions.shared.setFont(weight: raw == "regular" ? .regular : .medium)
+        guard let raw = sender.representedObject as? String,
+              let weight = TerminalSessions.fontWeights.first(where: { $0.0.lowercased() == raw })?.1
+        else { return }
+        TerminalSessions.shared.setFont(weight: weight)
     }
 
     /// Sizes worth offering: below 10 the block caret stops being legible,
@@ -585,11 +603,11 @@ final class TerminalFontMenuTarget: NSObject {
 
         let weightItem = NSMenuItem(title: "Weight", action: nil, keyEquivalent: "")
         let weightMenu = NSMenu()
-        for (title, isRegular) in [("Regular", true), ("Medium", false)] {
+        for (title, weight) in TerminalSessions.fontWeights {
             let item = NSMenuItem(title: title, action: #selector(selectWeight(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = isRegular ? "regular" : "medium"
-            item.state = (TerminalSessions.selectedFontWeight == .regular) == isRegular ? .on : .off
+            item.representedObject = title.lowercased()
+            item.state = TerminalSessions.selectedFontWeight == weight ? .on : .off
             weightMenu.addItem(item)
         }
         weightItem.submenu = weightMenu

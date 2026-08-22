@@ -33,6 +33,11 @@ evt = {
     # Claude last turn text, for hands-free voice. Absent on older hook
     # installs and on events that carry no assistant message.
     "last_assistant_message": data.get("last_assistant_message", ""),
+    # Which conversation this pane is running, for the transcript pane. Claude
+    # Code puts both on every hook event; cwd alone cannot identify a session
+    # (two panes on one project are two different .jsonl files).
+    "session_id": data.get("session_id", ""),
+    "transcript_path": data.get("transcript_path", ""),
     "ts": time.time(),
 }
 spool = sys.argv[1]
