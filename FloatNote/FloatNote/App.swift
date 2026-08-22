@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.87.0"
+let APP_VERSION = "v1.87.2"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -5013,9 +5013,13 @@ struct FormatToolbar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Leading: the two column toggles (fixed, always visible)
+            // Leading: the column toggles and the note's working directory
+            // (fixed, always visible). The folder chip belongs here, at the
+            // start: it says WHERE this note works, which is context for
+            // everything to its right, not another action at the end of the row.
             sidebarToggle
             editorToggle
+            folderChip
 
             thinDivider()
 
@@ -5115,7 +5119,6 @@ struct FormatToolbar: View {
             handsfreeButton
             themeButton
             pinButton
-            folderChip
         }
         .layoutPriority(1)
     }
