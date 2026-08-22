@@ -576,15 +576,34 @@ final class TerminalFontMenuTarget: NSObject {
         return next
     }
 
+    /// Step BOTH surfaces of the panel. The A−/A+ buttons sit in the panel's own
+    /// tab bar, above a transcript and a terminal — scaling only one of them made
+    /// the pair drift apart, and you then had to go into the menu to fix the
+    /// other. Each side is clamped to its own range: a terminal below 10pt loses
+    /// its block caret, a reading column above 24pt holds four words.
+    @discardableResult
+    static func stepPanelText(_ delta: CGFloat) -> (transcript: CGFloat, terminal: CGFloat) {
+        let transcript = stepTranscriptSize(delta)
+        let current = TerminalSessions.selectedFontSize
+        let terminal = min(18, max(10, current + delta))
+        if terminal != current { TerminalSessions.shared.setFont(size: terminal) }
+        return (transcript, terminal)
+    }
+
+    static func resetPanelText() {
+        resetTranscriptSize()
+        TerminalSessions.shared.setFont(size: 13)
+    }
+
     static func resetTranscriptSize() {
         UserDefaults.standard.set(Double(transcriptDefaultSize), forKey: TranscriptStyle.sizeKey)
         NotificationCenter.default.post(name: .floatnoteTerminalPaletteChanged, object: nil)
         dbg("transcript: size → \(Int(transcriptDefaultSize))pt (reset)")
     }
 
-    @objc func stepTranscriptSmaller(_ sender: NSMenuItem) { Self.stepTranscriptSize(-1) }
-    @objc func stepTranscriptBigger(_ sender: NSMenuItem) { Self.stepTranscriptSize(1) }
-    @objc func resetTranscriptSizeAction(_ sender: NSMenuItem) { Self.resetTranscriptSize() }
+    @objc func stepTranscriptSmaller(_ sender: NSMenuItem) { Self.stepPanelText(-1) }
+    @objc func stepTranscriptBigger(_ sender: NSMenuItem) { Self.stepPanelText(1) }
+    @objc func resetTranscriptSizeAction(_ sender: NSMenuItem) { Self.resetPanelText() }
 
     @objc func selectTranscriptSize(_ sender: NSMenuItem) {
         guard let size = sender.representedObject as? Double else { return }
@@ -694,21 +713,21 @@ final class TerminalFontMenuTarget: NSObject {
         menu.addItem(transcriptHeader)
 
         // Steppers first: "one notch bigger" is the request, not "15pt".
-        let smaller = NSMenuItem(title: "Smaller Text", action: #selector(stepTranscriptSmaller(_:)),
+        let smaller = NSMenuItem(title: "Smaller Text (both)", action: #selector(stepTranscriptSmaller(_:)),
                                  keyEquivalent: "-")
         smaller.target = self
         smaller.keyEquivalentModifierMask = [.command]
         smaller.isEnabled = TranscriptStyle.selectedSize > Self.transcriptSizeRange.lowerBound
         menu.addItem(smaller)
 
-        let bigger = NSMenuItem(title: "Bigger Text", action: #selector(stepTranscriptBigger(_:)),
+        let bigger = NSMenuItem(title: "Bigger Text (both)", action: #selector(stepTranscriptBigger(_:)),
                                 keyEquivalent: "+")
         bigger.target = self
         bigger.keyEquivalentModifierMask = [.command]
         bigger.isEnabled = TranscriptStyle.selectedSize < Self.transcriptSizeRange.upperBound
         menu.addItem(bigger)
 
-        let reset = NSMenuItem(title: "Reset Text Size (\(Int(Self.transcriptDefaultSize)) pt)",
+        let reset = NSMenuItem(title: "Reset Text Size (both)",
                                action: #selector(resetTranscriptSizeAction(_:)), keyEquivalent: "0")
         reset.target = self
         reset.keyEquivalentModifierMask = [.command]

@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.86.1"
+let APP_VERSION = "v1.87.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -234,9 +234,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 MainActor.assumeIsolated {
                     guard vm.isTerminalVisible, vm.transcriptMode == .split else { return }
                     switch key {
-                    case "-": TerminalFontMenuTarget.stepTranscriptSize(-1); handled = true
-                    case "=", "+": TerminalFontMenuTarget.stepTranscriptSize(1); handled = true
-                    case "0": TerminalFontMenuTarget.resetTranscriptSize(); handled = true
+                    case "-": TerminalFontMenuTarget.stepPanelText(-1); handled = true
+                    case "=", "+": TerminalFontMenuTarget.stepPanelText(1); handled = true
+                    case "0": TerminalFontMenuTarget.resetPanelText(); handled = true
                     default: break
                     }
                 }
@@ -3776,11 +3776,11 @@ struct TerminalPanel: View {
     /// digging two levels into a popup for it is the wrong shape.
     private var transcriptSizeControls: some View {
         HStack(spacing: 0) {
-            stepButton("textformat.size.smaller", help: "Smaller transcript text (⌘−)") {
-                TerminalFontMenuTarget.stepTranscriptSize(-1)
+            stepButton("textformat.size.smaller", help: "Smaller text — transcript and terminal (⌘−)") {
+                TerminalFontMenuTarget.stepPanelText(-1)
             }
-            stepButton("textformat.size.larger", help: "Bigger transcript text (⌘+)") {
-                TerminalFontMenuTarget.stepTranscriptSize(1)
+            stepButton("textformat.size.larger", help: "Bigger text — transcript and terminal (⌘+)") {
+                TerminalFontMenuTarget.stepPanelText(1)
             }
         }
     }
