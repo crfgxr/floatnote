@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.77.1"
+let APP_VERSION = "v1.78.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -63,6 +63,8 @@ struct FloatNoteApp: App {
             CommandGroup(after: .toolbar) {
                 Button(handsfree.isEnabled ? "Turn Off Hands-Free Voice"
                                            : "Hands-Free Voice") { vm.toggleHandsfree() }
+                Button(vm.isBrowserVisible ? "Hide Browser" : "Browser") { vm.toggleBrowser() }
+                    .keyboardShortcut("b", modifiers: [.command, .shift])
             }
         }
     }
@@ -73,6 +75,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var fileWatchTimer: Timer?
     private var terminalKeyMonitor: Any?
     private var terminalExitObserver: NSObjectProtocol?
+    private var browserVisibilityObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
@@ -92,6 +95,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             MainActor.assumeIsolated {
                 vm.startClaudeEventWatcher()
                 HandsfreeManager.shared.vm = vm
+                // Claude's browser calls arrive as files; the watcher runs them
+                // the moment they land, the 2s timer below sweeps as a net.
+                BrowserSessions.shared.startRPCWatcher()
             }
         }
         // Sync Claude Code's own light/dark theme to the terminal palette at
@@ -110,6 +116,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 vm.checkClaudeEvents()
                 vm.sweepExpiredJobStatuses()
                 TranscriptStore.shared.poll()
+                BrowserSessions.shared.pollRPC()
+            }
+        }
+
+        // An agent that opens a page means to show it: the panel comes up on
+        // its own rather than loading a page nobody can see.
+        browserVisibilityObserver = NotificationCenter.default.addObserver(
+            forName: .floatnoteBrowserRequestedVisible, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let vm = self?.vm else { return }
+            MainActor.assumeIsolated {
+                guard !vm.isBrowserVisible else { return }
+                withAnimation(.easeInOut(duration: 0.18)) { vm.isBrowserVisible = true }
             }
         }
 
@@ -687,7 +706,17 @@ class EditorViewModel: ObservableObject {
     /// sidebar (when open) and the resize handles flanking the panel.
     func availablePanelWidth() -> CGFloat {
         let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
-        return max(0, windowContentWidth - sidebar - 10)
+        let browser: CGFloat = isBrowserVisible ? browserWidth + 6 : 0
+        return max(0, windowContentWidth - sidebar - browser - 10)
+    }
+
+    /// Room the browser panel may occupy: everything the sidebar and the
+    /// terminal panel are not using. Same rule as `availablePanelWidth` —
+    /// neither panel may be rendered wider than the window it sits in.
+    func availableBrowserWidth() -> CGFloat {
+        let sidebar: CGFloat = isSidebarCollapsed ? 0 : sidebarWidth + 6
+        let terminal: CGFloat = (isTerminalVisible && !terminalTabs.isEmpty) ? terminalWidth + 6 : 0
+        return max(0, windowContentWidth - sidebar - terminal - 10)
     }
 
     /// Make the active terminal's view first responder. Focus moves only at
@@ -1031,6 +1060,27 @@ class EditorViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Browser panel
+
+    /// A fourth column, right of the terminal: a tabbed `WKWebView` the agent in
+    /// the terminal can read and drive over MCP. App-global, not per note —
+    /// whichever pane's Claude opens a page, it lands here.
+    @Published var isBrowserVisible: Bool = UserDefaults.standard.bool(forKey: "fn.browserVisible") {
+        didSet { UserDefaults.standard.set(isBrowserVisible, forKey: "fn.browserVisible") }
+    }
+
+    @Published var browserWidth: CGFloat = {
+        let stored = UserDefaults.standard.double(forKey: "fn.browserWidth")
+        return stored > 0 ? CGFloat(stored) : 520
+    }() {
+        didSet { UserDefaults.standard.set(Double(browserWidth), forKey: "fn.browserWidth") }
+    }
+
+    func toggleBrowser() {
+        isBrowserVisible.toggle()
+        dbg("browser: panel \(isBrowserVisible ? "shown" : "hidden")")
+    }
+
     @Published var transcriptSplitFraction: Double = {
         let stored = UserDefaults.standard.double(forKey: "fn.transcriptSplitFraction")
         return stored > 0 ? stored : 0.6
@@ -1113,17 +1163,26 @@ class EditorViewModel: ObservableObject {
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let cwd = obj["cwd"] as? String, !cwd.isEmpty
             else { continue }
-            // Ignore events that pre-date this app run by a lot (e.g. spooled
-            // while FloatNote wasn't running) — a banner about a long-finished
-            // turn is just noise.
-            if let ts = obj["ts"] as? Double,
-               Date().timeIntervalSince1970 - ts > 120 { continue }
+            // A banner about a long-finished turn is noise, so stale events get
+            // none. The transcript's spinner is another matter: "this turn
+            // ended" stays true however late the news arrives, and dropping the
+            // whole event left the pane spinning after every app restart — the
+            // hook fires while FloatNote is down, and it is down on every
+            // rebuild. So a stale event still stops the spinner, then stops.
+            let stale = (obj["ts"] as? Double).map { Date().timeIntervalSince1970 - $0 > 120 } ?? false
             let event = obj["event"] as? String ?? ""
             let std = URL(fileURLWithPath: cwd).standardizedFileURL.path
             guard let tab = terminalTabs.first(where: {
                 URL(fileURLWithPath: $0.path).standardizedFileURL.path == std
             }) else {
                 dbg("claude event [\(event)] dropped — no open pane for \(std)")
+                continue
+            }
+            if stale {
+                if event == "Stop" || event == "Notification" {
+                    TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
+                }
+                dbg("claude event [\(event)] stale — spinner cleared, no banner")
                 continue
             }
             // Claude's last turn, for hands-free voice. Empty when the hook
@@ -3265,6 +3324,15 @@ struct EditorView: View {
                         .environmentObject(vm)
                         .frame(width: min(vm.terminalWidth, vm.availablePanelWidth()))
                 }
+                if vm.isBrowserVisible {
+                    BrowserResizeHandle()
+                        .environmentObject(vm)
+                    // Pages live in `BrowserSessions`, so unmounting the panel
+                    // on hide costs nothing — same contract as the terminal.
+                    BrowserPanel()
+                        .environmentObject(vm)
+                        .frame(width: min(vm.browserWidth, vm.availableBrowserWidth()))
+                }
             }
             Divider()
             StatusBar()
@@ -4758,6 +4826,7 @@ struct FormatToolbar: View {
             boardButton
             terminalButton
             newTerminalButton
+            browserButton
             handsfreeButton
             themeButton
             pinButton
@@ -5017,6 +5086,26 @@ struct FormatToolbar: View {
         .disabled(!hasRoute)
         .onHover { hoveredButton = $0 ? "terminal" : nil }
         .help(hasRoute ? (vm.isTerminalVisible ? "Hide terminal" : "Show terminal") : "Link a folder to use the terminal")
+    }
+
+    /// Browser panel toggle. NOT route-gated: a page has nothing to do with a
+    /// project folder, and looking something up is useful from any note.
+    private var browserButton: some View {
+        Button(action: {
+            withAnimation(.easeInOut(duration: 0.18)) { vm.toggleBrowser() }
+        }) {
+            Image(systemName: "globe")
+                .font(.system(size: 11))
+                .frame(width: 26, height: 22)
+                .foregroundColor(vm.isBrowserVisible ? .accentColor : .secondary)
+                .background(
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(hoveredButton == "browser" ? Color.primary.opacity(0.08) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "browser" : nil }
+        .help(vm.isBrowserVisible ? "Hide browser (⌘⇧B)" : "Show browser (⌘⇧B)")
     }
 
     /// Hands-free voice toggle. Route-gated exactly like `terminalButton` —

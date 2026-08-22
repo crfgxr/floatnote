@@ -18,6 +18,10 @@ import SwiftUI
 /// the text storage on every turn, and it would scroll out of sight.
 struct TranscriptWorkingIndicator: View {
     let style: TranscriptStyle
+    /// When the turn started. The elapsed count is what makes this pill
+    /// trustworthy: "Working… 4s" is obviously live and "Working… 3m 20s"
+    /// obviously is not, and there was no way to tell them apart before.
+    let since: Date?
     @State private var spin = false
     @State private var pulse = false
 
@@ -27,9 +31,18 @@ struct TranscriptWorkingIndicator: View {
                 .font(.system(size: 10, weight: .bold))
                 .rotationEffect(.degrees(spin ? 360 : 0))
                 .opacity(pulse ? 1 : 0.45)
-            Text("Working…")
-                .font(.system(size: 11, weight: .semibold))
-                .kerning(0.5)
+            if let since {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text("Working… \(Self.elapsed(from: since, to: context.date))")
+                        .font(.system(size: 11, weight: .semibold))
+                        .kerning(0.5)
+                        .monospacedDigit()
+                }
+            } else {
+                Text("Working…")
+                    .font(.system(size: 11, weight: .semibold))
+                    .kerning(0.5)
+            }
         }
         .foregroundColor(Color(nsColor: style.muted))
         .padding(.horizontal, 10)
@@ -43,6 +56,12 @@ struct TranscriptWorkingIndicator: View {
             withAnimation(.linear(duration: 2.4).repeatForever(autoreverses: false)) { spin = true }
             withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { pulse = true }
         }
+    }
+
+    private static func elapsed(from start: Date, to now: Date) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        guard seconds >= 60 else { return "\(seconds)s" }
+        return "\(seconds / 60)m \(seconds % 60)s"
     }
 }
 
@@ -575,9 +594,12 @@ final class TranscriptStore: ObservableObject {
     /// landed and neither hook (Stop, or Notification = waiting on the human)
     /// has said the turn is over. The JSONL has no "turn started" record, so a
     /// recent `.user` turn IS the start signal.
+    /// When the current turn started, for the pill's elapsed count.
+    @Published private(set) var workingSince: Date?
     @Published private(set) var isWorking = false {
         didSet {
             guard isWorking != oldValue else { return }
+            workingSince = isWorking ? Date() : nil
             dbg("transcript: working=\(isWorking) pane=\(paneLabel) [\(workingReason)]")
         }
     }
@@ -1869,7 +1891,7 @@ struct TranscriptPane: View {
                     guessChip
                 }
                 if store.isWorking {
-                    TranscriptWorkingIndicator(style: style)
+                    TranscriptWorkingIndicator(style: style, since: store.workingSince)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                         // Aligned to the text column, not the pane edge: the
                         // view centres its measure and grows the gutters.

@@ -55,12 +55,11 @@ function findFolder(folders, identifier) {
   );
 }
 
-/// Base64 PNG for an image id, downscaled via macOS `sips` when it's larger
-/// than MAX_IMAGE_EDGE so a 4K screenshot doesn't cost a fortune in tokens.
+/// Base64 PNG for a file on disk, downscaled via macOS `sips` when it's larger
+/// than MAX_IMAGE_EDGE so a 4K capture doesn't cost a fortune in tokens.
 /// Returns null when the file is missing or unreadable.
-function imageBase64(id) {
-  const src = path.join(IMAGES_DIR, `${id.toUpperCase()}.png`);
-  if (!fs.existsSync(src)) return null;
+function pngBase64AtPath(src) {
+  if (!src || !fs.existsSync(src)) return null;
   let tmp = null;
   try {
     const { execFileSync } = require("child_process");
@@ -76,6 +75,11 @@ function imageBase64(id) {
   } finally {
     if (tmp) { try { fs.unlinkSync(tmp); } catch {} }
   }
+}
+
+/// Base64 PNG for one of a note's inline images, by image id.
+function imageBase64(id) {
+  return pngBase64AtPath(path.join(IMAGES_DIR, `${id.toUpperCase()}.png`));
 }
 
 /// Split a note's text into readable text (markers replaced by [image N]
@@ -346,7 +350,7 @@ function describeElement(el, elements) {
 
 // --- MCP Server ---
 
-const MCP_VERSION = "1.5.0";
+const MCP_VERSION = "1.6.0";
 
 // Sentinel folder ID for loose-trashed notes (notes moved to Trash by themselves).
 // Mirrors `TRASH_FOLDER_ID` in App.swift — must stay in sync.
@@ -996,6 +1000,332 @@ server.tool(
           `\n\nShape ids can be used as arrow start/end in draw_on_board (mode 'add').`,
       }],
     };
+  }
+);
+
+// --- Browser panel (RPC into the running app) ---
+//
+// FloatNote's browser panel is a WKWebView living inside the app, so the APP —
+// not this node process — is what can drive it. Calls travel over the same
+// file-spool pattern the rest of FloatNote uses (see External File Sync in
+// CLAUDE.md), in ~/.floatnote-browser-rpc/:
+//
+//   <uuid>.req.json   written here, temp+rename
+//   <uuid>.res.json   written by FloatNote, which then deletes the request
+//
+// Request:  { id, action, params, ts }              ts in epoch SECONDS
+// Response: { id, ok: true, result } | { id, ok: false, error }
+//
+// Write actions (click/type/eval) can be refused by the app itself when
+// fn.browserAllowClaudeWrites is off; that arrives as ok:false and is surfaced
+// verbatim rather than swallowed.
+
+// FLOATNOTE_BROWSER_RPC_DIR exists so a test harness can stand in for the app
+// without touching the real spool; unset (the normal case) means the app's dir.
+const BROWSER_RPC_DIR =
+  process.env.FLOATNOTE_BROWSER_RPC_DIR || path.join(os.homedir(), ".floatnote-browser-rpc");
+const RPC_TIMEOUT_MS = 20000;      // default: navigation resolves on didFinish
+const RPC_SLOW_TIMEOUT_MS = 35000; // screenshot / wait legitimately block longer
+const RPC_POLL_MS = 60;            // sleep between checks — never a busy spin
+const RPC_STALE_MS = 120000;       // > the longest timeout, so only real orphans
+const BROWSER_UNREACHABLE =
+  "FloatNote isn't running, or its browser panel has never been opened.";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/// Drop undefined entries so an omitted optional param isn't sent as null.
+function compact(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) if (v !== undefined) out[k] = v;
+  return out;
+}
+
+function textResult(text) {
+  return { content: [{ type: "text", text }] };
+}
+
+/// Delete request/response files nobody can still be waiting on. Keeps a
+/// crashed call from leaving a request the app would answer minutes later, or
+/// an answer that would never be read.
+function sweepStaleRPC() {
+  let names;
+  try { names = fs.readdirSync(BROWSER_RPC_DIR); } catch { return; }
+  const cutoff = Date.now() - RPC_STALE_MS;
+  for (const name of names) {
+    if (!/\.(req|res)\.json$/.test(name)) continue;
+    const p = path.join(BROWSER_RPC_DIR, name);
+    try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch {}
+  }
+}
+
+/// One request/response round trip. Never throws and never reports a silent
+/// success: returns {ok:true, result} or {ok:false, error, unreachable?}.
+async function browserRPC(action, params = {}, timeoutMs = RPC_TIMEOUT_MS) {
+  const id = require("crypto").randomUUID().toUpperCase();
+  const reqPath = path.join(BROWSER_RPC_DIR, `${id}.req.json`);
+  // The app may name the reply from Swift's UUID.uuidString (uppercase) or echo
+  // the id verbatim — watch both spellings so a case-sensitive volume still works.
+  const resPaths = [`${id}.res.json`, `${id.toLowerCase()}.res.json`]
+    .map((n) => path.join(BROWSER_RPC_DIR, n));
+
+  try {
+    fs.mkdirSync(BROWSER_RPC_DIR, { recursive: true });
+    sweepStaleRPC();
+    // temp+rename: a plain writeFileSync fails silently under sandboxing, and a
+    // half-written request would be parsed by the app's watcher mid-write.
+    writeJSON(reqPath, { id, action, params, ts: Math.floor(Date.now() / 1000) });
+  } catch (e) {
+    return { ok: false, error: `could not queue the request: ${e.message}` };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(RPC_POLL_MS);
+    for (const resPath of resPaths) {
+      let raw;
+      try { raw = fs.readFileSync(resPath, "utf8"); } catch { continue; }
+      // The reply is ours to clean up (the app only deletes the request).
+      try { fs.unlinkSync(resPath); } catch {}
+      try { fs.unlinkSync(reqPath); } catch {}
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch (e) {
+        return { ok: false, error: `FloatNote wrote an unreadable response (${e.message})` };
+      }
+      if (msg && msg.ok) return { ok: true, result: msg.result || {} };
+      return { ok: false, error: (msg && msg.error) || "no reason given" };
+    }
+  }
+
+  // Nothing answered: retract the request so a late-waking app can't replay it.
+  try { fs.unlinkSync(reqPath); } catch {}
+  return { ok: false, unreachable: true, error: BROWSER_UNREACHABLE };
+}
+
+/// Readable text for a failed call, carrying the app's own error string.
+function rpcError(action, res) {
+  return res.unreachable ? BROWSER_UNREACHABLE : `browser ${action} failed: ${res.error}`;
+}
+
+/// Best-effort URL for labelling a screenshot when the app's result omits one.
+/// Never fails the caller — a null just means "no URL to print".
+async function browserTabURL(id) {
+  const res = await browserRPC("tabs", {}, 5000);
+  if (!res.ok) return null;
+  const tabs = Array.isArray(res.result.tabs) ? res.result.tabs : [];
+  const tab = id ? tabs.find((t) => t.id === id) : tabs.find((t) => t.active) || tabs[0];
+  return tab ? tab.url || null : null;
+}
+
+const TAB_ID_PARAM = "Tab id from browser_tabs. Omit to act on the active tab";
+
+server.tool(
+  "browser_tabs",
+  "List the tabs open in FloatNote's own browser panel — the WKWebView column beside the terminal, NOT Safari/Chrome/Playwright. Returns each tab's id, URL, title and which one is active. Pass `activate` with a tab id to switch to that tab first. The ids returned here are what every other browser_* tool takes as `id`.",
+  {
+    activate: z.string().optional().describe("Tab id to make the active tab before listing (optional)"),
+  },
+  async ({ activate }) => {
+    let prefix = "";
+    if (activate) {
+      const act = await browserRPC("activate", { id: activate });
+      if (!act.ok) return textResult(rpcError("activate", act));
+      prefix = `Activated tab ${act.result.id || activate}.\n\n`;
+    }
+    const res = await browserRPC("tabs");
+    if (!res.ok) return textResult(rpcError("tabs", res));
+    const tabs = Array.isArray(res.result.tabs) ? res.result.tabs : [];
+    if (tabs.length === 0) {
+      return textResult(`${prefix}FloatNote's browser panel has no open tabs — use browser_open to open a page.`);
+    }
+    const list = tabs
+      .map((t, i) => `${i + 1}. [${t.id}]${t.active ? " (active)" : ""} ${t.title || "(untitled)"}\n   ${t.url || ""}`)
+      .join("\n");
+    return textResult(`${prefix}FloatNote browser — ${tabs.length} tab(s):\n\n${list}`);
+  }
+);
+
+server.tool(
+  "browser_open",
+  "Open a URL in FloatNote's own browser panel (the browser column inside the app, not the system browser) and wait until the page has finished loading, so a following browser_read/browser_screenshot needs no sleep. The panel appears in the app if it was hidden.",
+  {
+    url: z.string().describe("URL to open. A bare host gets https:// prepended; text that isn't a URL becomes a DuckDuckGo search"),
+    newTab: z.boolean().optional().describe("Open in a new tab (default true). false navigates the active tab instead"),
+  },
+  async ({ url, newTab }) => {
+    const res = await browserRPC("open", compact({ url, newTab }));
+    if (!res.ok) return textResult(rpcError("open", res));
+    const r = res.result;
+    return textResult(`Opened ${r.url || url} in FloatNote's browser panel (tab ${r.id || "?"}). The page has finished loading.`);
+  }
+);
+
+server.tool(
+  "browser_read",
+  "Read the current page in FloatNote's own browser panel as text (default) or raw HTML. Use this after browser_open/browser_click to see what the page actually says. Long pages are cut at maxChars and the result says so.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    format: z.enum(["text", "html"]).optional().describe("'text' (default) = the page's visible text; 'html' = its serialized DOM"),
+    maxChars: z.number().optional().describe("Maximum characters of content to return (default 60000)"),
+  },
+  async ({ id, format, maxChars }) => {
+    const fmt = format || "text";
+    const cap = maxChars === undefined ? 60000 : maxChars;
+    const res = await browserRPC("read", compact({ id, format: fmt, maxChars: cap }));
+    if (!res.ok) return textResult(rpcError("read", res));
+    const r = res.result;
+    const body = typeof r.content === "string" ? r.content : JSON.stringify(r.content ?? "");
+    const head =
+      `${r.title || "(untitled)"}\n${r.url || ""}\nformat: ${r.format || fmt}` +
+      (r.truncated
+        ? `\ntruncated: true — content was cut at ${cap} chars. Re-read with a larger maxChars, or use browser_eval to pull just the part you need.`
+        : "");
+    const tail = r.truncated ? `\n\n[… TRUNCATED at ${cap} chars …]` : "";
+    return textResult(`${head}\n\n${body || "(no content)"}${tail}`);
+  }
+);
+
+server.tool(
+  "browser_click",
+  "Click an element on the page in FloatNote's own browser panel, either by CSS selector or by its visible text (case-insensitive, over links, buttons, [role=button], submit inputs, summary and [onclick]). A miss is reported as a failure with the selector echoed, never as a silent success. Refused when write access is disabled in FloatNote's browser settings.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    selector: z.string().optional().describe("CSS selector of the element to click"),
+    text: z.string().optional().describe("Visible text to match instead of a selector"),
+  },
+  async ({ id, selector, text }) => {
+    if (!selector && !text) {
+      return textResult("browser_click needs either a `selector` or a `text` to match.");
+    }
+    const res = await browserRPC("click", compact({ id, selector, text }));
+    if (!res.ok) return textResult(rpcError("click", res));
+    const r = res.result;
+    return textResult(`Clicked ${r.matched || selector || text}. Use browser_read to see the resulting page.`);
+  }
+);
+
+server.tool(
+  "browser_type",
+  "Type text into a form field on the page in FloatNote's own browser panel, optionally submitting the form afterwards. Refused when write access is disabled in FloatNote's browser settings.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    selector: z.string().describe("CSS selector of the input/textarea/contenteditable to type into"),
+    text: z.string().describe("Text to enter (replaces the field's current value)"),
+    submit: z.boolean().optional().describe("Submit the field's form after typing (default false)"),
+  },
+  async ({ id, selector, text, submit }) => {
+    const res = await browserRPC("type", compact({ id, selector, text, submit }));
+    if (!res.ok) return textResult(rpcError("type", res));
+    const n = res.result.typed;
+    return textResult(
+      `Typed ${n === undefined ? text.length : n} character(s) into ${selector}` +
+        (submit ? " and submitted the form." : ".")
+    );
+  }
+);
+
+server.tool(
+  "browser_eval",
+  "Run JavaScript in the page loaded in FloatNote's own browser panel and return its value (JSON-encoded, capped at ~20k chars). Good for pulling one value out of a page instead of reading the whole thing. Refused when write access is disabled in FloatNote's browser settings.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    js: z.string().describe("JavaScript expression or statement block; the completion value is returned"),
+  },
+  async ({ id, js }) => {
+    const res = await browserRPC("eval", compact({ id, js }));
+    if (!res.ok) return textResult(rpcError("eval", res));
+    const v = res.result.value;
+    const shown = v === undefined || v === null ? "(no value)" : typeof v === "string" ? v : JSON.stringify(v);
+    return textResult(shown);
+  }
+);
+
+server.tool(
+  "browser_screenshot",
+  "Screenshot the page in FloatNote's own browser panel and return the PNG inline, so you see the rendered page rather than a file path. Use it to check layout, or when a page's text alone doesn't tell you what happened.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    fullPage: z.boolean().optional().describe("Capture the whole scrollable page instead of just the visible area (default false)"),
+  },
+  async ({ id, fullPage }) => {
+    const res = await browserRPC("screenshot", compact({ id, fullPage }), RPC_SLOW_TIMEOUT_MS);
+    if (!res.ok) return textResult(rpcError("screenshot", res));
+    const shotPath = res.result.path;
+    // Same downscale guardrail as a note's inline images (MAX_IMAGE_EDGE).
+    const data = shotPath ? pngBase64AtPath(shotPath) : null;
+    const url = res.result.url || (await browserTabURL(id));
+    if (!data) {
+      return textResult(
+        `FloatNote reported a screenshot${shotPath ? ` at ${shotPath}` : ""} but the PNG could not be read.`
+      );
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Screenshot of ${url || "FloatNote's browser panel"}${fullPage ? " (full page)" : ""} — ${shotPath}`,
+        },
+        { type: "image", data, mimeType: "image/png" },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "browser_navigate",
+  "Move around in FloatNote's own browser panel: pass `url` to go to a page in the current tab, or `direction` ('back', 'forward', 'reload') to move through that tab's history. Exactly one of the two. Resolves once the page has finished loading.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    url: z.string().optional().describe("Navigate the tab to this URL. Mutually exclusive with `direction`"),
+    direction: z.enum(["back", "forward", "reload"]).optional().describe("History move instead of a URL. Mutually exclusive with `url`"),
+  },
+  async ({ id, url, direction }) => {
+    if (url && direction) {
+      return textResult("browser_navigate takes either `url` or `direction`, not both.");
+    }
+    if (!url && !direction) {
+      return textResult("browser_navigate needs a `url` to go to, or a `direction` ('back', 'forward', 'reload').");
+    }
+    const action = url ? "navigate" : direction;
+    const res = await browserRPC(action, compact({ id, url }));
+    if (!res.ok) return textResult(rpcError(action, res));
+    const r = res.result;
+    const where = r.url || url || "(unknown URL)";
+    return textResult(url ? `Navigated to ${where}.` : `Went ${direction} — now at ${where}.`);
+  }
+);
+
+server.tool(
+  "browser_wait",
+  "Wait for something on the page in FloatNote's own browser panel: for a selector to appear, or just for a number of milliseconds. Use it when a click kicks off client-side rendering that browser_open's load-finished signal doesn't cover.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    selector: z.string().optional().describe("CSS selector to wait for. Omit to simply wait out `ms`"),
+    ms: z.number().optional().describe("Milliseconds to wait / give up after (default 1000, max 15000)"),
+  },
+  async ({ id, selector, ms }) => {
+    const res = await browserRPC("wait", compact({ id, selector, ms }), RPC_SLOW_TIMEOUT_MS);
+    if (!res.ok) return textResult(rpcError("wait", res));
+    const r = res.result;
+    const waited = r.waitedMs === undefined ? "" : ` after ${r.waitedMs}ms`;
+    if (!selector) return textResult(`Waited${waited}.`);
+    return textResult(r.found ? `Found ${selector}${waited}.` : `Did not find ${selector}${waited}.`);
+  }
+);
+
+server.tool(
+  "browser_close",
+  "Close a tab in FloatNote's own browser panel. Takes the tab id from browser_tabs.",
+  {
+    id: z.string().describe("Tab id to close (from browser_tabs)"),
+  },
+  async ({ id }) => {
+    const res = await browserRPC("close", { id });
+    if (!res.ok) return textResult(rpcError("close", res));
+    return textResult(`Closed tab ${res.result.closed || id} in FloatNote's browser panel.`);
   }
 );
 
