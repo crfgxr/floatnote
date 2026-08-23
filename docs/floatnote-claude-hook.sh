@@ -16,6 +16,21 @@ SPOOL="$HOME/.floatnote-claude-events"
 mkdir -p "$SPOOL" 2>/dev/null || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
+# WHICH PANE this event came from. `cwd` cannot say — two FloatNote terminal
+# panes can each run their own Claude in one project directory — and neither can
+# the session file's open fd: Claude does not hold it open between turns, and a
+# subagent inherits its parent session's descriptor. Ancestry can: this hook runs
+# as a child of the pane's own shell, so the pane's shell pid is somewhere up
+# this chain. One `ps` snapshot, walked in awk, so a hook stays cheap.
+FN_PID_CHAIN="$(ps -eo pid=,ppid= 2>/dev/null | awk -v start=$$ '
+  { parent[$1] = $2 }
+  END {
+    p = start; out = p
+    for (i = 0; i < 24; i++) { q = parent[p]; if (q == "" || q + 0 <= 1) break; out = out "," q; p = q }
+    print out
+  }')"
+export FN_PID_CHAIN
+
 python3 -c '
 import json, sys, os, time, uuid
 try:
@@ -38,6 +53,9 @@ evt = {
     # (two panes on one project are two different .jsonl files).
     "session_id": data.get("session_id", ""),
     "transcript_path": data.get("transcript_path", ""),
+    # This hook process and its ancestors, nearest first. FloatNote finds the
+    # pane whose shell pid appears in the chain — exact, and free on its side.
+    "pid_chain": [int(x) for x in os.environ.get("FN_PID_CHAIN", "").split(",") if x.strip().isdigit()],
     "ts": time.time(),
 }
 spool = sys.argv[1]

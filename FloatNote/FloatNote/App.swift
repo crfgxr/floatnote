@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.93.2"
+let APP_VERSION = "v1.94.3"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -181,7 +181,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                TerminalSessions.shared.id(containing: NSApp.keyWindow?.firstResponder) == nil {
                 var handled = false
                 MainActor.assumeIsolated {
-                    guard !vm.isBoardVisible, let tv = vm.editorCoordinator?.textView else { return }
+                    guard !BoardWindowController.shared.isBoardWindow(NSApp.keyWindow),
+                          let tv = vm.editorCoordinator?.textView else { return }
                     tv.window?.makeFirstResponder(tv)
                     let action = NSMenuItem()
                     action.tag = NSTextFinder.Action.showFindInterface.rawValue
@@ -202,7 +203,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     let pb = NSPasteboard.general
                     let hasText = !(pb.string(forType: .string) ?? "").isEmpty
                     let hasImage = pb.availableType(from: [.tiff, .png]) != nil
-                    guard !vm.isBoardVisible, !hasText, hasImage,
+                    guard !BoardWindowController.shared.isBoardWindow(NSApp.keyWindow),
+                          !hasText, hasImage,
                           let img = NSImage(pasteboard: pb),
                           let tv = vm.editorCoordinator?.textView as? BlockCaretTextView
                     else { return }
@@ -648,6 +650,7 @@ class EditorViewModel: ObservableObject {
     }() {
         didSet {
             UserDefaults.standard.set(theme.rawValue, forKey: "fn.theme")
+            BoardWindowController.shared.applyTheme(theme)
             // Repaint the terminal panel HERE, not from an .onChange: the palette
             // is resolved by reading `fn.theme` back out of UserDefaults, and a
             // view-side observer can run before this line has written it — which
@@ -950,9 +953,15 @@ class EditorViewModel: ObservableObject {
         activeTerminalId = chosen
         if let note = activeTabId {
             terminalForNote[note] = chosen
-            // Give an unclaimed pane an owner so its chip can navigate back.
+            // Re-home the pane on the note that is using it NOW — not only when
+            // it has no owner at all. A claim goes stale on its own: a `+` fork
+            // hands the note to the new pane, and the old one then adopts
+            // whatever note its folder happens to list first. That wrong note
+            // is persisted, so its chip kept opening it forever and nothing in
+            // normal use ever corrected the binding. The note you are working
+            // in is the better answer, every time.
             if let i = terminalTabs.firstIndex(where: { $0.id == chosen }),
-               terminalTabs[i].noteId == nil {
+               terminalTabs[i].noteId != note {
                 terminalTabs[i].noteId = note
             }
         }
@@ -1144,9 +1153,18 @@ class EditorViewModel: ObservableObject {
                                         label: route?.label ?? "terminal",
                                         freshClaude: true))
         // The pane the user just asked for becomes this note's pane, so
-        // returning to the note comes back here rather than to the older one.
-        bindTerminal(id, toNote: activeTabId)
-        if let note = activeTabId { terminalForNote[note] = id }
+        // returning to the note comes back here rather than to the older one —
+        // but the older pane KEEPS its own claim. Clearing it (which is what an
+        // exclusive `bindTerminal` did) orphaned the terminal that was already
+        // open: its chip had no note to navigate back to, and every route for
+        // that note went to the new pane forever. `terminalForNote` is the
+        // tie-breaker, so routing still prefers this one.
+        if let note = activeTabId {
+            if let i = terminalTabs.firstIndex(where: { $0.id == id }) {
+                terminalTabs[i].noteId = note
+            }
+            terminalForNote[note] = id
+        }
         activeTerminalId = id
         isTerminalVisible = true
         focusActiveTerminal()
@@ -1407,6 +1425,59 @@ class EditorViewModel: ObservableObject {
     /// ~/.claude/hooks/floatnote-notify.sh. Only events whose cwd matches an
     /// OPEN terminal tab produce a banner — claude runs in external terminals
     /// are silently dropped. Registered on the AppDelegate 2s timer.
+    /// Which pane a hook event belongs to, and whether that is more than a
+    /// guess. `cwd` alone is not an answer: several panes can each run their own
+    /// Claude in one project directory, and matching on the path sent every
+    /// event to whichever pane came first in the list — stamping it with the
+    /// sibling's session id, which the transcript treats as authoritative and
+    /// then never re-checks, so the pane silently showed the other
+    /// conversation. The session id is the identity; an open fd settles a
+    /// session nobody has claimed yet; a pane with no conversation of its own is
+    /// the better guess when neither answers.
+    private func paneForClaudeEvent(cwd: String, sessionId: String?,
+                                    transcriptPath: String?,
+                                    pidChain: [Int]) -> (tab: TerminalTab, identified: Bool)? {
+        let onPath = terminalTabs.filter {
+            URL(fileURLWithPath: $0.path).standardizedFileURL.path == cwd
+        }
+        guard let first = onPath.first else { return nil }
+        if onPath.count == 1 { return (first, true) }
+        if let sid = sessionId, !sid.isEmpty,
+           let known = onPath.first(where: { $0.claudeSessionId == sid }) {
+            return (known, true)
+        }
+        // The hook ran as a child of the pane's own shell, so the pane's shell
+        // pid is somewhere up the chain it recorded. Exact, and free on this
+        // side — no `lsof`, no guessing. This is the signal that actually
+        // identifies a fork: the open-fd probe below cannot, because Claude does
+        // not hold its session file open between turns and a subagent inherits
+        // its parent session's descriptor.
+        if !pidChain.isEmpty {
+            let chain = Set(pidChain)
+            if let match = onPath.first(where: { tab in
+                guard let pid = TerminalSessions.shared.existing(tab.id)?.view.process.shellPid,
+                      pid > 0 else { return false }
+                return chain.contains(Int(pid))
+            }) {
+                return (match, true)
+            }
+        }
+        // A session this app has not seen before, with siblings in the running:
+        // ask the shells which one is holding the file open. Same probe the
+        // transcript uses (~16ms), and only ever on this path.
+        if let path = transcriptPath, !path.isEmpty {
+            let store = (path as NSString).deletingLastPathComponent
+            for tab in onPath {
+                guard let pid = TerminalSessions.shared.existing(tab.id)?.view.process.shellPid,
+                      pid > 0 else { continue }
+                if TranscriptResolver.openTranscript(shellPid: pid, storeDir: store) == path {
+                    return (tab, true)
+                }
+            }
+        }
+        return (onPath.first(where: { $0.claudeSessionId == nil }) ?? first, false)
+    }
+
     func checkClaudeEvents() {
         let dir = Self.CLAUDE_EVENTS_DIR
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir),
@@ -1427,12 +1498,15 @@ class EditorViewModel: ObservableObject {
             let stale = (obj["ts"] as? Double).map { Date().timeIntervalSince1970 - $0 > 120 } ?? false
             let event = obj["event"] as? String ?? ""
             let std = URL(fileURLWithPath: cwd).standardizedFileURL.path
-            guard let tab = terminalTabs.first(where: {
-                URL(fileURLWithPath: $0.path).standardizedFileURL.path == std
-            }) else {
+            guard let resolved = paneForClaudeEvent(cwd: std,
+                                                    sessionId: obj["session_id"] as? String,
+                                                    transcriptPath: obj["transcript_path"] as? String,
+                                                    pidChain: (obj["pid_chain"] as? [Int]) ?? [])
+            else {
                 dbg("claude event [\(event)] dropped — no open pane for \(std)")
                 continue
             }
+            let tab = resolved.tab
             if stale {
                 if event == "Stop" || event == "Notification" {
                     TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
@@ -1447,7 +1521,15 @@ class EditorViewModel: ObservableObject {
             // Bind this pane to its conversation. Authoritative — Claude Code
             // itself named the session — and cheap: two string fields the hook
             // already had and threw away.
-            if let sid = obj["session_id"] as? String, !sid.isEmpty,
+            // Only a pane we actually IDENTIFIED may be re-stamped. Guessing
+            // between siblings on one directory is how a pane ended up showing
+            // the other one's conversation: the transcript trusts these two
+            // fields above everything else and stops re-checking.
+            if !resolved.identified {
+                dbg("claude event [\(event)] on \(std): two panes share it and nothing named the session — pane \(tab.label) keeps its own")
+            }
+            if resolved.identified,
+               let sid = obj["session_id"] as? String, !sid.isEmpty,
                let idx = terminalTabs.firstIndex(where: { $0.id == tab.id }),
                terminalTabs[idx].claudeSessionId != sid {
                 terminalTabs[idx].claudeSessionId = sid
@@ -1516,9 +1598,14 @@ class EditorViewModel: ObservableObject {
 
     // MARK: - Excalidraw boards
 
-    /// Whether the active note's Excalidraw board is shown in place of the editor.
-    /// Global view flag (not persisted); reset to false when switching notes.
-    @Published var isBoardVisible: Bool = false
+    /// Note ids whose board window is on screen. The board lives in its own
+    /// window now instead of swapping into the editor column, so "the board is
+    /// showing" is a fact about a note, not one global view flag — several can
+    /// be open at once. Kept in sync from `BoardWindowController.onChange`.
+    @Published var openBoardIds: Set<UUID> = []
+
+    /// Whether this note's board window is open.
+    func isBoardOpen(_ id: UUID?) -> Bool { id.map { openBoardIds.contains($0) } ?? false }
     /// Note IDs whose board currently has at least one element. Drives the toolbar
     /// button's active/passive state. Seeded at launch, updated whenever a board saves.
     @Published var boardContentIds: Set<UUID> = []
@@ -1530,16 +1617,29 @@ class EditorViewModel: ObservableObject {
     private var lastBoardModDates: [UUID: Date] = [:]
 
     func toggleBoard() {
-        isBoardVisible.toggle()
-        persistBoardVisibility()
+        guard let tab = activeTab else { return }
+        BoardWindowController.shared.toggle(noteId: tab.id, title: tab.title, theme: theme)
+    }
+
+    /// Mirror the window controller's state into `openBoardIds` and onto the
+    /// notes. Registered once at launch.
+    func startBoardWindowTracking() {
+        BoardWindowController.shared.onChange = { [weak self] _ in
+            guard let self else { return }
+            self.openBoardIds = BoardWindowController.shared.openNoteIds
+            self.persistBoardVisibility()
+        }
     }
 
     /// Remember on the active note whether its board is showing, so the next
     /// visit (and the next launch) restores the same view.
     func persistBoardVisibility() {
-        guard let tab = activeTab, tab.isBoardOpen != isBoardVisible else { return }
-        tab.isBoardOpen = isBoardVisible
-        saveTabsLocal()
+        var changed = false
+        for tab in tabs {
+            let open = openBoardIds.contains(tab.id)
+            if tab.isBoardOpen != open { tab.isBoardOpen = open; changed = true }
+        }
+        if changed { saveTabsLocal() }
     }
 
     /// True when the given note has a non-empty board.
@@ -1551,6 +1651,7 @@ class EditorViewModel: ObservableObject {
     /// Seed `boardContentIds` from disk and start listening for board saves so the
     /// toolbar button's active/passive state stays current.
     private func startBoardTracking() {
+        startBoardWindowTracking()
         boardContentIds = ExcalidrawStore.scanContentIds()
         lastBoardModDates = ExcalidrawStore.scanModDates()
         boardSaveObserver = NotificationCenter.default.addObserver(
@@ -1582,11 +1683,12 @@ class EditorViewModel: ObservableObject {
             if ExcalidrawStore.hasContent(for: id) { boardContentIds.insert(id) }
             else { boardContentIds.remove(id) }
             guard id == activeTabId else { continue }
-            if isBoardVisible {
+            if isBoardOpen(id) {
                 NotificationCenter.default.post(name: .floatnoteBoardExternallyChanged, object: id)
-            } else {
-                isBoardVisible = true
-                persistBoardVisibility()
+            } else if let tab = tabs.first(where: { $0.id == id }) {
+                // Claude drew on the note you are looking at: raise its board so
+                // the drawing is not a change nobody sees.
+                BoardWindowController.shared.open(noteId: id, title: tab.title, theme: theme)
             }
         }
     }
@@ -1735,7 +1837,6 @@ class EditorViewModel: ObservableObject {
         // end of this load then dedups onto them rather than opening duplicates.
         restoreTerminalTabs()
         activeTabId = firstTab.id
-        isBoardVisible = firstTab.isBoardOpen  // cold start lands on the view the note was left on
         currentHTML = firstTab.html
         lastSavedHTML = firstTab.lastSavedHTML
         currentRecordingPath = firstTab.recordingPaths.last
@@ -2246,10 +2347,6 @@ class EditorViewModel: ObservableObject {
     func switchTab(_ id: UUID) {
         guard id != activeTabId, let newTab = tabs.first(where: { $0.id == id }) else { return }
 
-        // Restore whichever view this note was last left on — the board stays
-        // "the view" for notes that are really diagrams.
-        isBoardVisible = newTab.isBoardOpen
-
         // Commit any active rename
         if let editId = editingTabId {
             if let tab = tabs.first(where: { $0.id == editId }) {
@@ -2316,7 +2413,6 @@ class EditorViewModel: ObservableObject {
 
         let tab = NoteTab(title: "Untitled")
         tabs.append(tab)
-        isBoardVisible = false
         activeTabId = tab.id
         currentHTML = ""
         currentRecordingPath = nil
@@ -2386,6 +2482,7 @@ class EditorViewModel: ObservableObject {
     }
 
     func renameTab(_ id: UUID, title: String) {
+        BoardWindowController.shared.retitle(noteId: id, to: title)
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         tab.title = title
         editingTabId = nil
@@ -3585,13 +3682,10 @@ struct EditorView: View {
                             .id(tab.id)
                         Divider()
                     }
-                    if vm.isBoardVisible, let activeId = vm.activeTabId {
-                        ExcalidrawBoardView(tabId: activeId, theme: vm.theme)
-                            .id(activeId)
-                    } else {
-                        RichTextEditor()
-                            .environmentObject(vm)
-                    }
+                    // The board is a window of its own (see BoardWindowController);
+                    // the editor column always shows the note's text.
+                    RichTextEditor()
+                        .environmentObject(vm)
                 }
                 // The editor is the flexible column and must be the one that
                 // yields — in BOTH directions. `.frame(width:)` on a panel is
@@ -4373,6 +4467,16 @@ struct SidebarNoteItemView: View {
                     .help(isJobRunningHere ? (tab.jobStatus ?? "") : "")
             }
             Spacer(minLength: 4)
+            if vm.boardHasContent(tab.id) || vm.isBoardOpen(tab.id) {
+                // Same grammar as the terminal glyph next to it: accent while
+                // this note's board window is up, muted when the note simply
+                // has a diagram waiting behind the toolbar button.
+                Image(systemName: "pencil.and.outline")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(vm.isBoardOpen(tab.id)
+                                     ? .accentColor : .secondary.opacity(0.55))
+                    .help(vm.isBoardOpen(tab.id) ? "Diagram window is open" : "Has a diagram")
+            }
             if let pane = vm.terminalTab(forNote: tab.id) {
                 // Accent when it is the pane on screen, muted when it is one of
                 // the others: the difference between "this note's terminal is
@@ -5426,10 +5530,10 @@ struct FormatToolbar: View {
 
     /// Per-note Excalidraw board toggle. Three states:
     /// • passive (gray) — note has no diagram yet
-    /// • has content (green) — a board with drawings exists, currently closed
-    /// • open (blue/accent + filled background) — the board is showing
+    /// • has content (green) — a board with drawings exists, its window closed
+    /// • open (blue/accent + filled background) — the board window is up
     private var boardButton: some View {
-        let isOpen = vm.isBoardVisible
+        let isOpen = vm.isBoardOpen(vm.activeTabId)
         let hasContent = vm.boardHasContent(vm.activeTabId)
         let tint: Color = isOpen ? .accentColor : (hasContent ? Tokens.SUI.boardHasContent : .secondary)
         return Button(action: {
@@ -5447,7 +5551,7 @@ struct FormatToolbar: View {
         }
         .buttonStyle(.plain)
         .onHover { hoveredButton = $0 ? "board" : nil }
-        .help(isOpen ? "Back to note" : (hasContent ? "Open diagram" : "Add a diagram"))
+        .help(isOpen ? "Close diagram window" : (hasContent ? "Open diagram" : "Add a diagram"))
     }
 
     private var terminalButton: some View {

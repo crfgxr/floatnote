@@ -216,3 +216,126 @@ struct ExcalidrawBoardView: NSViewRepresentable {
         }
     }
 }
+
+// MARK: - Board window
+
+/// One window per note, holding that note's board.
+///
+/// The board used to swap into the editor column, which made the note and its
+/// diagram the same piece of screen — you could not read the text you were
+/// drawing about, and only one board could be open at a time. A window can sit
+/// beside the app, on a second display, or full-screen on its own, and several
+/// notes' boards can be open at once.
+@MainActor
+final class BoardWindowController: NSObject, NSWindowDelegate {
+    static let shared = BoardWindowController()
+
+    private struct Board {
+        let window: NSWindow
+        let host: NSHostingView<ExcalidrawBoardView>
+    }
+    private var boards: [UUID: Board] = [:]
+
+    /// Called whenever a board window opens or closes, so the view model can
+    /// republish the toolbar button's state.
+    var onChange: ((UUID) -> Void)?
+
+    var openNoteIds: Set<UUID> { Set(boards.keys) }
+    func isOpen(_ id: UUID?) -> Bool { id.map { boards[$0] != nil } ?? false }
+
+    /// True when `window` is one of the board windows. The app-wide key monitors
+    /// ask this before claiming Cmd+F / Cmd+V — with focus on a canvas, an image
+    /// paste belongs to the canvas, not to the note behind it.
+    func isBoardWindow(_ window: NSWindow?) -> Bool {
+        guard let window else { return false }
+        return boards.values.contains { $0.window === window }
+    }
+
+    func open(noteId: UUID, title: String, theme: AppTheme) {
+        if let existing = boards[noteId] {
+            existing.window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let host = NSHostingView(rootView: ExcalidrawBoardView(tabId: noteId, theme: theme))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 720),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered, defer: false)
+        window.title = Self.windowTitle(title)
+        window.contentView = host
+        window.delegate = self
+        window.isReleasedWhenClosed = false   // this controller owns the reference
+        window.tabbingMode = .disallowed      // a board is not a document tab
+        window.minSize = NSSize(width: 480, height: 360)
+        Self.applyAppearance(theme, to: window)
+        // Per-note frame: a diagram you sized and placed once comes back that
+        // way, and two boards don't land on top of each other. AppKit only
+        // restores a frame it has saved before, so a first open is centred.
+        let name = "fn.board.\(noteId.uuidString)"
+        let hadSavedFrame = UserDefaults.standard.object(forKey: "NSWindow Frame \(name)") != nil
+        window.setFrameAutosaveName(name)
+        if !hadSavedFrame { window.center() }
+        boards[noteId] = Board(window: window, host: host)
+        window.makeKeyAndOrderFront(nil)
+        onChange?(noteId)
+    }
+
+    func close(noteId: UUID) {
+        boards[noteId]?.window.performClose(nil)   // → windowWillClose
+    }
+
+    func toggle(noteId: UUID, title: String, theme: AppTheme) {
+        isOpen(noteId) ? close(noteId: noteId) : open(noteId: noteId, title: title, theme: theme)
+    }
+
+    /// Repaint every open board in the app's palette. `theme` is a `let` on the
+    /// representable, so the root view is replaced rather than mutated.
+    func applyTheme(_ theme: AppTheme) {
+        for (id, board) in boards {
+            board.host.rootView = ExcalidrawBoardView(tabId: id, theme: theme)
+            Self.applyAppearance(theme, to: board.window)
+        }
+    }
+
+    /// The window is titled with the note, so a rename has to reach it.
+    func retitle(noteId: UUID, to title: String) {
+        boards[noteId]?.window.title = Self.windowTitle(title)
+    }
+
+    private static func windowTitle(_ noteTitle: String) -> String {
+        let trimmed = noteTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Board" : trimmed
+    }
+
+    /// The canvas draws with `drawsBackground == false`, so the window's own
+    /// background and titlebar are what the theme has to reach.
+    private static func applyAppearance(_ theme: AppTheme, to window: NSWindow) {
+        let dark = theme.swiftUIScheme == .dark
+        window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        window.backgroundColor = dark ? NSColor(white: 0.09, alpha: 1) : NSColor(white: 0.98, alpha: 1)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              let id = boards.first(where: { $0.value.window === window })?.key,
+              let board = boards[id] else { return }
+        // Saves are debounced inside the page, so the last stroke before a close
+        // would never reach disk. Flush by hand rather than trusting SwiftUI's
+        // teardown: `dismantleNSView` can run after the web view is gone, and
+        // JavaScript evaluated then goes nowhere.
+        Self.flush(in: board.host)
+        boards.removeValue(forKey: id)
+        onChange?(id)
+        // Hold the view (and its web process) alive long enough for the flushed
+        // scene to make the round trip back through the message handler.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { _ = board.host }
+    }
+
+    private static func flush(in view: NSView) {
+        if let web = view as? WKWebView {
+            web.evaluateJavaScript("window.floatnoteFlush && window.floatnoteFlush();",
+                                   completionHandler: nil)
+            return
+        }
+        for sub in view.subviews { flush(in: sub) }
+    }
+}
