@@ -476,7 +476,7 @@ final class BrowserSessions: ObservableObject {
                 ? "document.documentElement ? document.documentElement.outerHTML : ''"
                 : "(document.body || document.documentElement || {}).innerText || ''"
             page.webView.evaluateJavaScript(js) { value, error in
-                if let error { return done(.failure("read failed — \(error.localizedDescription)")) }
+                if let error { return done(.failure("read failed — \(Self.jsErrorText(error))")) }
                 let full = value as? String ?? ""
                 let truncated = full.count > maxChars
                 let content = truncated
@@ -498,8 +498,36 @@ final class BrowserSessions: ObservableObject {
                 return done(.failure("click needs a selector or text"))
             }
             let what = selector.map { "selector \($0)" } ?? "visible text \"\(text ?? "")\""
+            // Native by default: a scripted `.click()` is ignored by anything
+            // that listens for the real pointer sequence. `native: false` forces
+            // the DOM path for the rare page that only has an onclick handler
+            // and is scrolled somewhere unreachable.
+            if Self.boolOrNil(params, "native") ?? true {
+                present(id)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.locate(page, selector: selector, text: text) { found in
+                        guard let found else {
+                            let seen = self.lastLocateCandidates
+                            let hint = seen.isEmpty ? "" :
+                                " — clickable things on this page: " + seen.map { "\"\($0)\"" }.joined(separator: ", ")
+                            return done(.failure("nothing matched \(what)\(hint)"))
+                        }
+                        self.nativeClick(page, at: found.point) { landed in
+                            guard landed else {
+                                // Off-screen after scrolling, or the panel is not
+                                // in a window: say so instead of reporting a hit.
+                                return done(.failure("could not press \(what) — the page area is not on screen"))
+                            }
+                            self.settle(page) {
+                                done(.ok(["hit": true, "matched": found.label, "how": "native"]))
+                            }
+                        }
+                    }
+                }
+                return
+            }
             page.webView.evaluateJavaScript(Self.clickJS(selector: selector, text: text)) { value, error in
-                if let error { return done(.failure("click failed — \(error.localizedDescription)")) }
+                if let error { return done(.failure("click failed — \(Self.jsErrorText(error))")) }
                 // A miss is an error with the target echoed back, never a silent
                 // success — an agent that believes it clicked reads the wrong page.
                 guard let matched = value as? String else {
@@ -518,9 +546,36 @@ final class BrowserSessions: ObservableObject {
             }
             let text = params["text"] as? String ?? ""
             let submit = Self.bool(params, "submit", default: false)
+            if Self.boolOrNil(params, "native") ?? true {
+                present(id)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.locate(page, selector: selector, text: nil) { found in
+                        guard let found else {
+                            return done(.failure("nothing matched selector \(selector)"))
+                        }
+                        // Click it for real first: focus that a framework believes
+                        // in, and any mask/autocomplete armed the way a human arms it.
+                        self.nativeClick(page, at: found.point) { landed in
+                            guard landed else {
+                                return done(.failure("could not focus \(selector) — the page area is not on screen"))
+                            }
+                            page.webView.evaluateJavaScript(Self.clearFieldJS(selector: selector)) { _, _ in
+                                var keys = text.map { (String($0), UInt16(0)) }
+                                if submit, let enter = Self.namedKeys["enter"] { keys.append(enter) }
+                                self.nativeKeys(page, characters: keys) { _ in
+                                    self.settle(page) {
+                                        done(.ok(["typed": text.count, "how": "native"]))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return
+            }
             let js = Self.typeJS(selector: selector, text: text, submit: submit)
             page.webView.evaluateJavaScript(js) { value, error in
-                if let error { return done(.failure("type failed — \(error.localizedDescription)")) }
+                if let error { return done(.failure("type failed — \(Self.jsErrorText(error))")) }
                 guard let typed = (value as? NSNumber)?.intValue, typed >= 0 else {
                     return done(.failure("nothing matched selector \(selector)"))
                 }
@@ -531,6 +586,82 @@ final class BrowserSessions: ObservableObject {
                 }
             }
 
+        case "fill":
+            guard Self.allowClaudeWrites else { return done(.failure(Self.writesDisabled)) }
+            guard let id = resolve(params), let page = page(for: id) else {
+                return done(.failure(Self.noTabError))
+            }
+            let raw = (params["fields"] as? [[String: Any]]) ?? []
+            let fields: [(String, String)] = raw.compactMap { field in
+                guard let selector = field["selector"] as? String else { return nil }
+                return (selector, (field["text"] as? String) ?? "")
+            }
+            guard !fields.isEmpty else {
+                return done(.failure("fill needs fields: [{selector, text}, …]"))
+            }
+            let submitLast = Self.bool(params, "submit", default: false)
+            present(id)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                // Sequential on purpose: each field is focused with a real click
+                // before its keystrokes, and a masked or autocompleting input
+                // re-renders between fields.
+                var results: [[String: Any]] = []
+                var index = 0
+                func next() {
+                    guard index < fields.count else {
+                        self.settle(page) { done(.ok(["filled": results])) }
+                        return
+                    }
+                    let (selector, text) = fields[index]
+                    index += 1
+                    self.locate(page, selector: selector, text: nil) { found in
+                        guard let found else {
+                            results.append(["selector": selector, "ok": false,
+                                            "error": "nothing matched"])
+                            return next()
+                        }
+                        self.nativeClick(page, at: found.point) { landed in
+                            guard landed else {
+                                results.append(["selector": selector, "ok": false,
+                                                "error": "not on screen"])
+                                return next()
+                            }
+                            page.webView.evaluateJavaScript(Self.clearFieldJS(selector: selector)) { _, _ in
+                                var keys = text.map { (String($0), UInt16(0)) }
+                                if submitLast, index == fields.count, let enter = Self.namedKeys["enter"] {
+                                    keys.append(enter)
+                                }
+                                self.nativeKeys(page, characters: keys) { _ in
+                                    results.append(["selector": selector, "ok": true,
+                                                    "typed": text.count])
+                                    next()
+                                }
+                            }
+                        }
+                    }
+                }
+                next()
+            }
+
+        case "key":
+            guard Self.allowClaudeWrites else { return done(.failure(Self.writesDisabled)) }
+            guard let id = resolve(params), let page = page(for: id) else {
+                return done(.failure(Self.noTabError))
+            }
+            guard let raw = Self.str(params, "key") else { return done(.failure("key needs a key")) }
+            let named = Self.namedKeys[raw.lowercased()]
+            let keys: [(String, UInt16)] = named.map { [$0] } ?? raw.map { (String($0), UInt16(0)) }
+            guard !keys.isEmpty else { return done(.failure("key \"\(raw)\" means nothing")) }
+            present(id)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                self.nativeKeys(page, characters: keys) { sent in
+                    guard sent else {
+                        return done(.failure("could not send \(raw) — the page area is not on screen"))
+                    }
+                    self.settle(page) { done(.ok(["sent": raw])) }
+                }
+            }
+
         case "eval":
             guard Self.allowClaudeWrites else { return done(.failure(Self.writesDisabled)) }
             guard let js = Self.str(params, "js") else { return done(.failure("eval needs js")) }
@@ -538,7 +669,7 @@ final class BrowserSessions: ObservableObject {
                 return done(.failure(Self.noTabError))
             }
             page.webView.evaluateJavaScript(js) { value, error in
-                if let error { return done(.failure("eval failed — \(error.localizedDescription)")) }
+                if let error { return done(.failure("eval failed — \(Self.jsErrorText(error))")) }
                 done(.ok(["value": String(Self.jsonFragment(value).prefix(20_000))]))
             }
 
@@ -549,12 +680,25 @@ final class BrowserSessions: ObservableObject {
             let fullPage = Self.bool(params, "fullPage", default: false)
             // Unlike `read`, this one does need the panel up: a web view that
             // isn't in a window has nothing rendered to capture.
-            requestVisible()
+            present(id)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 // The annotation tool bar is OUR chrome. It has no business in a
                 // picture of the user's page, whoever asked for the picture.
                 page.webView.evaluateJavaScript("window.__fnAnn && window.__fnAnn.chrome(false)") { _, _ in
                     self.capture(page, fullPage: fullPage) { outcome in
+                        // A panel that was hidden a moment ago has no rendered
+                        // pixels yet, and `takeSnapshot` hands back an empty image
+                        // that fails to encode. Give it a beat and try once more
+                        // rather than reporting a broken screenshot.
+                        if case .failure(let reason) = outcome, reason.contains("could not encode") {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                self.capture(page, fullPage: fullPage) { second in
+                                    page.webView.evaluateJavaScript("window.__fnAnn && window.__fnAnn.chrome(true)") { _, _ in }
+                                    done(second)
+                                }
+                            }
+                            return
+                        }
                         page.webView.evaluateJavaScript("window.__fnAnn && window.__fnAnn.chrome(true)") { _, _ in }
                         done(outcome)
                     }
@@ -642,14 +786,24 @@ final class BrowserSessions: ObservableObject {
             guard let id = resolve(params), let page = page(for: id) else {
                 return done(.failure(Self.noTabError))
             }
-            let ms = min(15_000, max(0, Self.num(params, "ms") ?? 1_000))
+            // A predicate wait returns the moment the page says yes, which is
+            // what a blind `ms` sleep cannot do: 15s of "probably done" turns
+            // into ~1s of "actually done", and a slow turn is still caught.
+            if let js = Self.str(params, "js") {
+                let ms = min(60_000, max(100, Self.num(params, "ms") ?? 15_000))
+                pollFor(predicate: "!!(\(js))", in: page, deadlineMs: ms, waitedMs: 0,
+                        describe: "js", done: done)
+                return
+            }
+            let ms = min(60_000, max(0, Self.num(params, "ms") ?? 1_000))
             guard let selector = Self.str(params, "selector") else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + Double(ms) / 1000) {
                     done(.ok(["found": true, "waitedMs": ms]))
                 }
                 return
             }
-            pollFor(selector: selector, in: page, deadlineMs: ms, waitedMs: 0, done: done)
+            pollFor(predicate: "!!document.querySelector(\(Self.jsLiteral(selector)))",
+                    in: page, deadlineMs: ms, waitedMs: 0, describe: selector, done: done)
 
         default:
             done(.failure("unknown action \"\(action)\""))
@@ -691,21 +845,27 @@ final class BrowserSessions: ObservableObject {
     /// evaluation error (a bad selector, a document swapped under us) counts as
     /// "not yet" and lands as `found: false` at the deadline — the spec's shape
     /// for a wait that times out.
-    private func pollFor(selector: String, in page: BrowserPage,
-                         deadlineMs: Int, waitedMs: Int,
+    /// Poll a boolean expression in the page. Used for both selector waits and
+    /// caller-supplied predicates — the only difference is the expression.
+    private func pollFor(predicate js: String, in page: BrowserPage,
+                         deadlineMs: Int, waitedMs: Int, describe: String,
                          done: @escaping (BrowserRPCOutcome) -> Void) {
-        let js = "!!document.querySelector(\(Self.jsLiteral(selector)))"
-        page.webView.evaluateJavaScript(js) { value, _ in
-            if (value as? Bool) == true {
-                return done(.ok(["found": true, "waitedMs": waitedMs]))
+        page.webView.evaluateJavaScript(js) { value, error in
+            if (value as? Bool) == true || (value as? NSNumber)?.boolValue == true {
+                return done(.ok(["found": true, "waitedMs": waitedMs, "waitedFor": describe]))
+            }
+            // A predicate that throws is a caller mistake, not a slow page: say
+            // so immediately instead of burning the whole timeout on it.
+            if let error, waitedMs == 0 {
+                return done(.failure("wait predicate failed — \(Self.jsErrorText(error))"))
             }
             guard waitedMs < deadlineMs else {
-                return done(.ok(["found": false, "waitedMs": waitedMs]))
+                return done(.ok(["found": false, "waitedMs": waitedMs, "waitedFor": describe]))
             }
-            let step = min(100, deadlineMs - waitedMs)
+            let step = min(120, deadlineMs - waitedMs)
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) / 1000) {
-                self.pollFor(selector: selector, in: page, deadlineMs: deadlineMs,
-                             waitedMs: waitedMs + step, done: done)
+                self.pollFor(predicate: js, in: page, deadlineMs: deadlineMs,
+                             waitedMs: waitedMs + step, describe: describe, done: done)
             }
         }
     }
@@ -769,6 +929,9 @@ final class BrowserSessions: ObservableObject {
                                done: @escaping (BrowserRPCOutcome) -> Void) {
         guard let image else {
             return done(.failure("screenshot failed — \(error?.localizedDescription ?? "no image")"))
+        }
+        guard image.size.width >= 1, image.size.height >= 1 else {
+            return done(.failure("screenshot failed — could not encode PNG (the panel has no rendered pixels yet)"))
         }
         guard let tiff = image.tiffRepresentation,
               let rep = NSBitmapImageRep(data: tiff),
@@ -958,6 +1121,17 @@ final class BrowserSessions: ObservableObject {
     /// A bool param that may be absent — `bool(_:default:)` can't say "unset".
     private static func boolOrNil(_ params: [String: Any], _ key: String) -> Bool? {
         (params[key] as? NSNumber)?.boolValue ?? (params[key] as? Bool)
+    }
+
+    /// WebKit already knows what went wrong; "A JavaScript exception occurred"
+    /// throws that away and costs the caller a round trip to find out.
+    static func jsErrorText(_ error: Error) -> String {
+        let ns = error as NSError
+        if let message = ns.userInfo["WKJavaScriptExceptionMessage"] as? String, !message.isEmpty {
+            let line = ns.userInfo["WKJavaScriptExceptionLineNumber"] as? Int
+            return line.map { "\(message) (line \($0))" } ?? message
+        }
+        return ns.localizedDescription
     }
 
     private static func decodeJSON(_ text: String) -> [String: Any]? {
@@ -1330,6 +1504,217 @@ final class BrowserSessions: ObservableObject {
     })()
     """
 
+    /// Find an element, scroll it into view, WAIT for the scroll to settle, and
+    /// then measure it.
+    ///
+    /// The waiting is the point. `scrollIntoView` is asynchronous — smooth
+    /// behaviour, lazy layout, sticky headers reflowing — so a rect measured in
+    /// the same turn is stale by the time a mouse event goes in, and the press
+    /// lands on whatever moved into that spot. That is how a click on a button
+    /// ended up hitting a table row. `callAsyncJavaScript` lets the page tell us
+    /// when it has actually stopped moving.
+    private func locate(_ page: BrowserPage, selector: String?, text: String?,
+                        done: @escaping ((point: CGPoint, label: String)?) -> Void) {
+        let body = """
+        const sel = selector, wanted = wanted_;
+        const label = (el) => String(el.innerText || el.value || el.getAttribute('aria-label')
+                                     || el.title || '').replace(/\\s+/g, ' ').trim();
+        // Match on letters and digits only. A label like
+        // "Screenflow · Family with a lap infant (v1.52.2)" fails an exact
+        // substring test over punctuation and non-breaking spaces, and the caller
+        // has no way to know why.
+        const loose = (t) => String(t).toLowerCase()
+          .replace(/[^\\p{L}\\p{N}]+/gu, ' ').replace(/\\s+/g, ' ').trim();
+        const visible = (el) => { const r = el.getBoundingClientRect();
+                                  return r.width > 0 && r.height > 0; };
+        let el = null;
+        let candidates = [];
+        if (sel) {
+          el = document.querySelector(sel);
+        } else if (wanted) {
+          const needle = loose(wanted);
+          const nodes = document.querySelectorAll(
+            'a, button, [role=button], input, select, textarea, summary, [onclick], [tabindex]');
+          const seen = [];
+          for (const node of nodes) {
+            if (!visible(node)) continue;
+            const text = label(node);
+            if (!text) continue;
+            seen.push(text);
+            const hay = loose(text);
+            if (hay.includes(needle) || needle.includes(hay)) { el = node; break; }
+          }
+          if (!el) candidates = seen.slice(0, 8);
+        }
+        if (!el) return candidates.length ? { candidates } : null;
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+        await new Promise(r => setTimeout(r, 90));
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0) || !(r.height > 0)) return null;
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2,
+                 tag: (el.tagName || '').toLowerCase(), label: label(el).slice(0, 80) };
+        """
+        page.webView.callAsyncJavaScript(
+            body,
+            arguments: ["selector": selector ?? NSNull(), "wanted_": text ?? NSNull()],
+            in: nil, in: .page
+        ) { result in
+            guard case .success(let value) = result, let box = value as? [String: Any] else {
+                if case .failure(let error) = result {
+                    dbg("browser: locate failed — \(Self.jsErrorText(error))")
+                }
+                return done(nil)
+            }
+            // A miss carries the labels that ARE there, so the caller can fix the
+            // match instead of guessing at "nothing matched".
+            if let candidates = box["candidates"] as? [String] {
+                self.lastLocateCandidates = candidates
+                return done(nil)
+            }
+            guard let x = (box["x"] as? NSNumber)?.doubleValue,
+                  let y = (box["y"] as? NSNumber)?.doubleValue else { return done(nil) }
+            self.lastLocateCandidates = []
+            let tag = box["tag"] as? String ?? "element"
+            let text = box["label"] as? String ?? ""
+            done((CGPoint(x: x, y: y), "\(tag) \(text)".trimmingCharacters(in: .whitespaces)))
+        }
+    }
+
+    /// Clickable labels seen during the last failed `locate`, for the error text.
+    private var lastLocateCandidates: [String] = []
+
+    /// Where an element is, in CSS pixels relative to the viewport, after
+    /// scrolling it into view. Same matching rules as `clickJS` — a selector, or
+    /// a case-insensitive visible-text match over the clickable roles.
+    private static func locateJS(selector: String?, text: String?) -> String {
+        """
+        (function() {
+          var sel = \(jsLiteral(selector));
+          var wanted = \(jsLiteral(text));
+          function label(el) {
+            var t = el.innerText || el.value || el.getAttribute('aria-label') || el.title || '';
+            return String(t).replace(/\\s+/g, ' ').trim();
+          }
+          function visible(el) {
+            var r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          }
+          var el = null;
+          if (sel) {
+            el = document.querySelector(sel);
+          } else if (wanted) {
+            var needle = wanted.toLowerCase();
+            var nodes = document.querySelectorAll(
+              'a, button, [role=button], input, select, textarea, summary, [onclick], [tabindex]');
+            for (var i = 0; i < nodes.length; i++) {
+              if (!visible(nodes[i])) continue;
+              if (label(nodes[i]).toLowerCase().indexOf(needle) !== -1) { el = nodes[i]; break; }
+            }
+          }
+          if (!el) return null;
+          el.scrollIntoView({ block: 'center', inline: 'center' });
+          var r = el.getBoundingClientRect();
+          if (!(r.width > 0) || !(r.height > 0)) return null;
+          return JSON.stringify({
+            x: r.left + r.width / 2, y: r.top + r.height / 2,
+            w: r.width, h: r.height,
+            tag: (el.tagName || '').toLowerCase(), label: label(el).slice(0, 80),
+          });
+        })()
+        """
+    }
+
+    /// Click by driving the WINDOW, not the DOM.
+    ///
+    /// `element.click()` is a scripted event: it carries `isTrusted == false`,
+    /// skips the pointer sequence entirely, and never moves focus the way a real
+    /// press does. Angular Material and anything else built on pointer events
+    /// treats it as nothing happened — the button lights up, no request goes out,
+    /// the form resets. A real `NSEvent` through the web view's window comes back
+    /// out of WebKit as a trusted pointerdown → mousedown → focus → mouseup →
+    /// click, which is indistinguishable from a human.
+    /// A real mouse or key event needs its tab to be the one on screen — the
+    /// events go to the WINDOW, not to a detached view. The other session was
+    /// calling `tabs` + `activate` before every interaction to arrange that (99
+    /// and 13 times in one run); the action does it now.
+    private func present(_ id: UUID) {
+        if activeTabId != id { activeTabId = id }
+        requestVisible()
+    }
+
+    private func nativeClick(_ page: BrowserPage, at point: CGPoint,
+                             done: @escaping (Bool) -> Void) {
+        let webView = page.webView
+        guard let window = webView.window else { return done(false) }
+        // CSS pixels are top-left origin. Whether that needs flipping depends on
+        // the VIEW: `WKWebView` reports `isFlipped == true` (its own content is
+        // top-left too), and flipping anyway put the press as far from the target
+        // as the page is tall — a click on a header button landing on a table row
+        // halfway down. Ask the view instead of assuming.
+        let local = webView.isFlipped
+            ? NSPoint(x: point.x, y: point.y)
+            : NSPoint(x: point.x, y: webView.bounds.height - point.y)
+        guard webView.bounds.contains(local) else { return done(false) }
+        let inWindow = webView.convert(local, to: nil)
+
+        func event(_ type: NSEvent.EventType, clicks: Int) -> NSEvent? {
+            NSEvent.mouseEvent(with: type, location: inWindow, modifierFlags: [],
+                               timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: window.windowNumber, context: nil,
+                               eventNumber: 0, clickCount: clicks, pressure: clicks == 0 ? 0 : 1)
+        }
+        // Hover first: menus and Material ripples arm on pointerover, and a press
+        // with no preceding move lands on a control that never woke up.
+        if let move = event(.mouseMoved, clicks: 0) { window.sendEvent(move) }
+        guard let down = event(.leftMouseDown, clicks: 1),
+              let up = event(.leftMouseUp, clicks: 1) else { return done(false) }
+        window.sendEvent(down)
+        // A gap between down and up: a zero-length press is discarded by some
+        // gesture recognisers as an accidental tap.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            window.sendEvent(up)
+            done(true)
+        }
+    }
+
+    /// Real key events, for the same reason as `nativeClick`: a dispatched
+    /// `KeyboardEvent` never reaches a framework's value accessor, and setting
+    /// `.value` behind its back leaves the model and the field disagreeing.
+    private func nativeKeys(_ page: BrowserPage, characters: [(String, UInt16)],
+                            done: @escaping (Bool) -> Void) {
+        guard let window = page.webView.window else { return done(false) }
+        window.makeFirstResponder(page.webView)
+        var index = 0
+        func next() {
+            guard index < characters.count else { return done(true) }
+            let (chars, code) = characters[index]
+            index += 1
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                if let key = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [],
+                                              timestamp: ProcessInfo.processInfo.systemUptime,
+                                              windowNumber: window.windowNumber, context: nil,
+                                              characters: chars, charactersIgnoringModifiers: chars,
+                                              isARepeat: false, keyCode: code) {
+                    window.sendEvent(key)
+                }
+            }
+            // Per-character delay: a page that re-renders on every keystroke
+            // (autocomplete, masked input) drops a burst delivered in one tick.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.012, execute: next)
+        }
+        next()
+    }
+
+    /// Named keys the RPC accepts, with the keyCodes AppKit expects.
+    static let namedKeys: [String: (String, UInt16)] = [
+        "enter": ("\r", 36), "return": ("\r", 36), "tab": ("\t", 48),
+        "escape": ("\u{1b}", 53), "esc": ("\u{1b}", 53), "space": (" ", 49),
+        "backspace": ("\u{8}", 51), "delete": ("\u{8}", 51),
+        "up": ("\u{F700}", 126), "down": ("\u{F701}", 125),
+        "left": ("\u{F702}", 123), "right": ("\u{F703}", 124),
+    ]
+
     private static func clickJS(selector: String?, text: String?) -> String {
         """
         (function() {
@@ -1367,6 +1752,26 @@ final class BrowserSessions: ObservableObject {
     /// native value setter is used in preference to `el.value =` because React
     /// (and friends) track that setter to notice a change — assigning the
     /// property directly types text the framework never sees.
+    /// Empty a field through its own value setter, so the framework watching it
+    /// sees the change. Typing over stale text would otherwise append.
+    private static func clearFieldJS(selector: String) -> String {
+        """
+        (function() {
+          var el = document.querySelector(\(jsLiteral(selector)));
+          if (!el) return false;
+          if ('value' in el) {
+            var proto = (el.tagName === 'TEXTAREA') ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) { desc.set.call(el, ''); } else { el.value = ''; }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          } else if (el.isContentEditable) {
+            el.textContent = '';
+          }
+          return true;
+        })()
+        """
+    }
+
     private static func typeJS(selector: String, text: String, submit: Bool) -> String {
         """
         (function() {

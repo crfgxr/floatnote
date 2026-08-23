@@ -1190,17 +1190,21 @@ server.tool(
 
 server.tool(
   "browser_click",
-  "Click an element on the page in FloatNote's own browser panel, either by CSS selector or by its visible text (case-insensitive, over links, buttons, [role=button], submit inputs, summary and [onclick]). A miss is reported as a failure with the selector echoed, never as a silent success. Refused when write access is disabled in FloatNote's browser settings.",
+  "Click an element on the page in FloatNote's own browser panel, either by CSS selector or by its visible text (case-insensitive, over links, buttons, [role=button], inputs, summary, [onclick], [tabindex]). By default this is a REAL mouse press delivered to the web view — trusted pointerdown/mousedown/focus/mouseup/click — so Angular, React and Material controls that ignore scripted clicks respond to it. A miss is reported as a failure with the selector echoed, never as a silent success. Refused when write access is disabled in FloatNote's browser settings.",
   {
     id: z.string().optional().describe(TAB_ID_PARAM),
     selector: z.string().optional().describe("CSS selector of the element to click"),
     text: z.string().optional().describe("Visible text to match instead of a selector"),
+    native: z
+      .boolean()
+      .optional()
+      .describe("Default true: a real mouse event. false falls back to element.click(), which frameworks listening for pointer events ignore — only useful for an element that cannot be scrolled into view"),
   },
-  async ({ id, selector, text }) => {
+  async ({ id, selector, text, native }) => {
     if (!selector && !text) {
       return textResult("browser_click needs either a `selector` or a `text` to match.");
     }
-    const res = await browserRPC("click", compact({ id, selector, text }));
+    const res = await browserRPC("click", compact({ id, selector, text, native }));
     if (!res.ok) return textResult(rpcError("click", res));
     const r = res.result;
     return textResult(`Clicked ${r.matched || selector || text}. Use browser_read to see the resulting page.`);
@@ -1215,15 +1219,60 @@ server.tool(
     selector: z.string().describe("CSS selector of the input/textarea/contenteditable to type into"),
     text: z.string().describe("Text to enter (replaces the field's current value)"),
     submit: z.boolean().optional().describe("Submit the field's form after typing (default false)"),
+    native: z
+      .boolean()
+      .optional()
+      .describe("Default true: focus the field with a real click and send real keystrokes, which is what a framework's value accessor listens for. false sets .value and dispatches input/change instead"),
   },
-  async ({ id, selector, text, submit }) => {
-    const res = await browserRPC("type", compact({ id, selector, text, submit }));
+  async ({ id, selector, text, submit, native }) => {
+    const res = await browserRPC("type", compact({ id, selector, text, submit, native }));
     if (!res.ok) return textResult(rpcError("type", res));
     const n = res.result.typed;
     return textResult(
       `Typed ${n === undefined ? text.length : n} character(s) into ${selector}` +
         (submit ? " and submitted the form." : ".")
     );
+  }
+);
+
+server.tool(
+  "browser_fill",
+  "Fill several fields of a form on the page in FloatNote's own browser panel in ONE call. Each field is focused with a real mouse click and typed with real keystrokes, in order — which is what an Angular/React value accessor listens for, and what a masked or autocompleting input needs. Reports per-field success, so a single miss does not hide the rest.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    fields: z
+      .array(z.object({ selector: z.string(), text: z.string() }))
+      .describe("Fields in the order they should be filled, e.g. [{selector:'#name',text:'MARCO ROSSI'},{selector:'#card',text:'5549…'}]"),
+    submit: z.boolean().optional().describe("Press Enter after the LAST field (default false)"),
+  },
+  async ({ id, fields, submit }) => {
+    if (!fields || !fields.length) return textResult("browser_fill needs at least one field.");
+    const res = await browserRPC("fill", compact({ id, fields, submit }), RPC_SLOW_TIMEOUT_MS);
+    if (!res.ok) return textResult(rpcError("fill", res));
+    const filled = Array.isArray(res.result.filled) ? res.result.filled : [];
+    const lines = filled.map((f) =>
+      f.ok ? `✓ ${f.selector} — ${f.typed} char(s)` : `✗ ${f.selector} — ${f.error}`);
+    const missed = filled.filter((f) => !f.ok).length;
+    return textResult(
+      `${filled.length - missed}/${filled.length} field(s) filled${submit ? ", then Enter" : ""}:\n` +
+        lines.join("\n")
+    );
+  }
+);
+
+server.tool(
+  "browser_key",
+  "Send a real key press to the page in FloatNote's own browser panel — Enter, Tab, Escape, an arrow, or literal characters — as a trusted keyboard event to whatever has focus. Use it to submit a form the way a person would, move between fields, or dismiss an overlay, when a click alone doesn't do it.",
+  {
+    id: z.string().optional().describe(TAB_ID_PARAM),
+    key: z
+      .string()
+      .describe("'enter', 'tab', 'escape', 'space', 'backspace', 'up', 'down', 'left', 'right', or literal text to type into the focused element"),
+  },
+  async ({ id, key }) => {
+    const res = await browserRPC("key", compact({ id, key }));
+    if (!res.ok) return textResult(rpcError("key", res));
+    return textResult(`Sent ${res.result.sent || key}. Use browser_read or browser_screenshot to see what it did.`);
   }
 );
 
@@ -1300,15 +1349,26 @@ server.tool(
 
 server.tool(
   "browser_wait",
-  "Wait for something on the page in FloatNote's own browser panel: for a selector to appear, or just for a number of milliseconds. Use it when a click kicks off client-side rendering that browser_open's load-finished signal doesn't cover.",
+  "Wait for the page in FloatNote's own browser panel to reach a state: a JS predicate to become true (`js`), a selector to appear, or a flat number of milliseconds. PREFER `js` — it returns the moment the condition holds, so a reply you'd have slept 15s for comes back in about one, and a slow turn is still caught. Example: js: \"document.querySelectorAll('.chat__stream .msg').length > 4\".",
   {
     id: z.string().optional().describe(TAB_ID_PARAM),
+    js: z
+      .string()
+      .optional()
+      .describe("JavaScript expression polled in the page every ~120ms until it is truthy. A predicate that throws fails immediately instead of burning the timeout"),
     selector: z.string().optional().describe("CSS selector to wait for. Omit to simply wait out `ms`"),
-    ms: z.number().optional().describe("Milliseconds to wait / give up after (default 1000, max 15000)"),
+    ms: z.number().optional().describe("Give up after this long (default 1000 for a plain sleep, 15000 for js/selector; max 60000)"),
   },
-  async ({ id, selector, ms }) => {
-    const res = await browserRPC("wait", compact({ id, selector, ms }), RPC_SLOW_TIMEOUT_MS);
+  async ({ id, js, selector, ms }) => {
+    const res = await browserRPC("wait", compact({ id, js, selector, ms }), RPC_SLOW_TIMEOUT_MS);
     if (!res.ok) return textResult(rpcError("wait", res));
+    if (res.result.waitedFor === "js") {
+      return textResult(
+        res.result.found
+          ? `Predicate became true after ${res.result.waitedMs}ms.`
+          : `Predicate was still false after ${res.result.waitedMs}ms — read the page or widen the condition.`
+      );
+    }
     const r = res.result;
     const waited = r.waitedMs === undefined ? "" : ` after ${r.waitedMs}ms`;
     if (!selector) return textResult(`Waited${waited}.`);
