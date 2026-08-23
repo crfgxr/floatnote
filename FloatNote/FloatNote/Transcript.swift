@@ -1053,7 +1053,9 @@ enum TranscriptMarkdown {
                 continue
             }
 
-            if trimmed.isEmpty { listIndex = 0; continue }
+            // A blank line does NOT end the numbering: markdown's loose lists put
+            // one between every item, and resetting there restarted the count.
+            if trimmed.isEmpty { continue }
 
             // Thematic break.
             if trimmed.count >= 3, trimmed.allSatisfy({ $0 == "-" || $0 == "*" || $0 == "_" }) {
@@ -1101,7 +1103,15 @@ enum TranscriptMarkdown {
             // Lists (one nesting level), including task lists.
             if let item = listItem(line) {
                 let marker: String
-                if item.ordered { listIndex += 1; marker = "\(listIndex). " } else { listIndex = 0; marker = "•\t" }
+                if item.ordered {
+                    // The author's number wins; the counter is the fallback for a
+                    // list written entirely as "1." (which markdown allows).
+                    listIndex = item.number ?? (listIndex + 1)
+                    marker = "\(listIndex). "
+                } else {
+                    listIndex = 0
+                    marker = "•\t"
+                }
                 appendBlock(listLine(item, marker: marker, style: style, bubble: bubble))
                 continue
             }
@@ -1131,6 +1141,10 @@ enum TranscriptMarkdown {
         let ordered: Bool
         let indent: Int
         let checkbox: Bool?
+        /// The number the author actually typed. Preferred over an internal
+        /// counter: the counter was reset by every blank line and every wrapped
+        /// continuation paragraph, so a three-item list rendered "1. 1. 1.".
+        let number: Int?
     }
 
     private static func listItem(_ line: String) -> ListItem? {
@@ -1138,12 +1152,14 @@ enum TranscriptMarkdown {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         var rest: String
         var ordered = false
+        var number: Int?
         if let first = trimmed.first, "-*+".contains(first), trimmed.dropFirst().first == " " {
             rest = String(trimmed.dropFirst(2))
         } else if let dot = trimmed.firstIndex(of: "."),
                   trimmed[trimmed.startIndex..<dot].allSatisfy(\.isNumber),
                   trimmed.index(after: dot) < trimmed.endIndex,
                   trimmed[trimmed.index(after: dot)] == " " {
+            number = Int(trimmed[trimmed.startIndex..<dot])
             rest = String(trimmed[trimmed.index(dot, offsetBy: 2)...])
             ordered = true
         } else {
@@ -1152,7 +1168,8 @@ enum TranscriptMarkdown {
         var checkbox: Bool? = nil
         if rest.hasPrefix("[ ] ") { checkbox = false; rest = String(rest.dropFirst(4)) }
         else if rest.lowercased().hasPrefix("[x] ") { checkbox = true; rest = String(rest.dropFirst(4)) }
-        return ListItem(text: rest, ordered: ordered, indent: indent, checkbox: checkbox)
+        return ListItem(text: rest, ordered: ordered, indent: indent,
+                        checkbox: checkbox, number: number)
     }
 
     private static func paragraph(_ text: String, style: TranscriptStyle,

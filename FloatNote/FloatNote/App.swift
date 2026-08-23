@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.88.2"
+let APP_VERSION = "v1.89.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -1270,6 +1270,17 @@ class EditorViewModel: ObservableObject {
         guard canHideEditor || !isEditorVisible else { return }
         isEditorVisible.toggle()
         dbg("editor: note column \(isEditorVisible ? "shown" : "hidden")")
+    }
+
+    /// Browser fills the window, everything else stands down. Deliberately NOT
+    /// persisted: launching into a window that is nothing but a web page, with
+    /// no note and no terminal in sight, looks like the app failed to start.
+    @Published var isBrowserFullScreen = false
+
+    func toggleBrowserFullScreen() {
+        if !isBrowserVisible { isBrowserVisible = true }
+        isBrowserFullScreen.toggle()
+        dbg("browser: full screen \(isBrowserFullScreen ? "on" : "off")")
     }
 
     func toggleBrowser() {
@@ -3479,6 +3490,12 @@ struct EditorView: View {
             // something directly above the thing it belongs to.
             FormatToolbar()
             Divider()
+            if vm.isBrowserFullScreen && vm.isBrowserVisible {
+                // Everything else stands down; the toolbar stays, so the way
+                // back is where every other panel toggle already lives.
+                BrowserPanel()
+                    .environmentObject(vm)
+            } else {
             HStack(spacing: 0) {
                 if !vm.isSidebarCollapsed {
                     NotesSidebar()
@@ -3569,6 +3586,7 @@ struct EditorView: View {
                         .frame(width: vm.panelWidths().browser)
                         .layoutPriority(2)
                 }
+            }
             }
             Divider()
             StatusBar()

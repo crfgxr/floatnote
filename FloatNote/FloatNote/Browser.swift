@@ -1843,6 +1843,18 @@ struct BrowserPanel: View {
             .buttonStyle(.plain)
             .help("New tab")
             Spacer(minLength: 0)
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.18)) { vm.toggleBrowserFullScreen() }
+            }) {
+                Image(systemName: vm.isBrowserFullScreen
+                      ? "arrow.down.right.and.arrow.up.left"
+                      : "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 28, height: 28)
+                    .foregroundColor(vm.isBrowserFullScreen ? .accentColor : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help(vm.isBrowserFullScreen ? "Back to the split view" : "Fill the window with the browser")
         }
         .background(vm.theme.chromeBackground)
     }
