@@ -606,6 +606,18 @@ final class TranscriptStore: ObservableObject {
     @Published private(set) var paneLabel: String = ""
     /// Bumped whenever `turns` changes, so the view can append rather than rebuild.
     @Published private(set) var generation = 0
+
+    /// Which conversation the installed document belongs to — the bound pane and
+    /// the file it resolved to. A rebind (a pane switch, or the hook naming the
+    /// session after a guess) installs a document from a DIFFERENT file, and
+    /// length alone cannot see that: the new one is usually longer, which reads
+    /// as an append and leaves the reader at an offset that means nothing.
+    var documentIdentity: Int {
+        var hasher = Hasher()
+        hasher.combine(boundPaneId)
+        hasher.combine(resolvedPath)
+        return hasher.finalize()
+    }
     /// True while Claude looks mid-turn in the bound pane: a fresh user message
     /// landed and neither hook (Stop, or Notification = waiting on the human)
     /// has said the turn is over. The JSONL has no "turn started" record, so a
@@ -1754,6 +1766,8 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
     /// in the new colors, so the diff below has to notice — keying on `generation`
     /// alone left the text painted in the old theme until the next turn landed.
     let styleGeneration: Int
+    /// Which conversation this document is — see `TranscriptStore.documentIdentity`.
+    let documentId: Int
     /// Reading measure; the view centres it and grows its gutters, not its lines.
     let measure: CGFloat
     /// The pane's own width, straight from SwiftUI. The gutters are derived from
@@ -1773,6 +1787,9 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         var lastLength = 0
         /// The pane follows the tail only while the reader is already at it.
         var following = true
+        /// Identity of the conversation installed last time; a change means a
+        /// rebind, which has to re-anchor rather than scroll on.
+        var lastDocumentId = 0
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -1834,13 +1851,22 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
             }
         }
         scroll.contentView.postsBoundsChangedNotifications = true
+        context.coordinator.lastDocumentId = documentId
         apply(document, to: context.coordinator, animated: false)
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard context.coordinator.lastGeneration != generation
-                || context.coordinator.lastStyleGeneration != styleGeneration else { return }
+                || context.coordinator.lastStyleGeneration != styleGeneration
+                || context.coordinator.lastDocumentId != documentId else { return }
+        // A different conversation: open it the way a fresh read opens, on the
+        // newest turn, and start following its tail again.
+        if context.coordinator.lastDocumentId != documentId {
+            context.coordinator.lastDocumentId = documentId
+            context.coordinator.lastLength = 0
+            context.coordinator.following = true
+        }
         // A width change re-lays out everything, bubbles included, so it counts
         // as a restyle — otherwise resizing the panel left the old measure.
         if context.coordinator.lastMeasure != measure {
@@ -1958,6 +1984,7 @@ struct TranscriptPane: View {
                         style: style,
                         generation: store.generation,
                         styleGeneration: paletteGeneration,
+                        documentId: store.documentIdentity,
                         measure: measure,
                         available: available)
                 }
