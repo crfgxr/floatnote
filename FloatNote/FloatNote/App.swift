@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.91.1"
+let APP_VERSION = "v1.93.0"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -784,10 +784,41 @@ class EditorViewModel: ObservableObject {
         let floor: CGFloat = isEditorVisible ? Self.editorFloorWidth : 0
         let budget = max(0, windowContentWidth - sidebar - handles - floor)
         let wanted = wantTerminal + wantBrowser
-        guard wanted > budget, wanted > 0 else { return (wantTerminal, wantBrowser) }
+        guard wanted > 0 else { return (0, 0) }
+        // With the note hidden there is no flexible column left to absorb the
+        // slack, so an HStack of fixed-width panels centred itself and left a
+        // dead margin down the left edge — the terminal looked locked in place,
+        // unable to reach the window's edge. Stretch as well as shrink then:
+        // with no editor, the panels take the WHOLE budget, in proportion.
+        guard wanted > budget || !isEditorVisible else { return (wantTerminal, wantBrowser) }
         let scale = budget / wanted
-        return ((wantTerminal * scale).rounded(), (wantBrowser * scale).rounded())
+        guard showTerminal, showBrowser else {
+            return (showTerminal ? budget : 0, showBrowser ? budget : 0)
+        }
+        // Spend the rounding remainder on the browser so the pair adds up to
+        // the budget exactly; a leftover point reads as a misaligned edge.
+        let terminal = (wantTerminal * scale).rounded()
+        return (terminal, budget - terminal)
     }
+
+    /// While the note column is hidden the panels are RENDERED filling the
+    /// whole budget, which is wider than their stored widths. Write the
+    /// rendered widths back, so a drag on a resize handle moves the edge with
+    /// the cursor instead of at the stretch factor, and so the proportion the
+    /// user dragged them to survives a window resize. The pre-fill widths are
+    /// kept once, to be handed back when the note returns.
+    func normalizeFilledPanelWidths() {
+        guard !isEditorVisible, windowContentWidth > 0 else { return }
+        let filled = panelWidths()
+        guard filled.terminal > 0 || filled.browser > 0 else { return }
+        if widthsBeforeEditorHidden == nil {
+            widthsBeforeEditorHidden = (terminalWidth, browserWidth)
+        }
+        if showsTerminalPanel, filled.terminal > 0 { terminalWidth = filled.terminal }
+        if isBrowserVisible, filled.browser > 0 { browserWidth = filled.browser }
+    }
+
+    var showsTerminalPanel: Bool { isTerminalVisible && !terminalTabs.isEmpty }
 
     /// Total width the two panels may occupy together.
     func panelBudget() -> CGFloat {
@@ -889,7 +920,7 @@ class EditorViewModel: ObservableObject {
         tv.window?.makeFirstResponder(tv)
     }
     /// Hide the panel but keep all sessions mounted/alive (hide ≠ kill).
-    func hideTerminal() { isTerminalVisible = false }
+    func hideTerminal() { isTerminalVisible = false; normalizeFilledPanelWidths() }
     func toggleTerminal() { isTerminalVisible ? hideTerminal() : applyTerminalRouteForActiveNote() }
 
     /// Activate the tab for `path` if one exists, else create it. Opens the panel.
@@ -1266,9 +1297,23 @@ class EditorViewModel: ObservableObject {
         (isTerminalVisible && !terminalTabs.isEmpty) || isBrowserVisible
     }
 
+    /// Panel widths from before the note column was hidden. Hiding the note
+    /// grows the panels into its column; showing it again has to give that room
+    /// back, or the note reopens permanently pinned at its 260pt floor.
+    private var widthsBeforeEditorHidden: (terminal: CGFloat, browser: CGFloat)?
+
     func toggleEditor() {
         guard canHideEditor || !isEditorVisible else { return }
         isEditorVisible.toggle()
+        if isEditorVisible {
+            if let prev = widthsBeforeEditorHidden {
+                terminalWidth = prev.terminal
+                browserWidth = prev.browser
+                widthsBeforeEditorHidden = nil
+            }
+        } else {
+            normalizeFilledPanelWidths()
+        }
         dbg("editor: note column \(isEditorVisible ? "shown" : "hidden")")
     }
 
@@ -1285,6 +1330,9 @@ class EditorViewModel: ObservableObject {
 
     func toggleBrowser() {
         isBrowserVisible.toggle()
+        // With the note hidden the remaining panel takes the closed one's room;
+        // keep the stored widths on top of that so its handle still drags 1:1.
+        normalizeFilledPanelWidths()
         dbg("browser: panel \(isBrowserVisible ? "shown" : "hidden")")
     }
 
@@ -3440,11 +3488,13 @@ struct EditorView: View {
                 .onAppear {
                     vm.windowContentWidth = geo.size.width
                     evaluateAutoHide(width: geo.size.width)
+                    vm.normalizeFilledPanelWidths()
                     applyWindowTheme(vm.theme)
                 }
                 .onChange(of: geo.size.width) { _, newWidth in
                     vm.windowContentWidth = newWidth
                     evaluateAutoHide(width: newWidth)
+                    vm.normalizeFilledPanelWidths()
                 }
                 .onChange(of: vm.theme) { _, newTheme in
                     applyWindowTheme(newTheme)
