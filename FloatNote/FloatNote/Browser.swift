@@ -475,8 +475,12 @@ final class BrowserSessions: ObservableObject {
             let js = html
                 ? "document.documentElement ? document.documentElement.outerHTML : ''"
                 : "(document.body || document.documentElement || {}).innerText || ''"
-            page.webView.evaluateJavaScript(js) { value, error in
-                if let error { return done(.failure("read failed — \(Self.jsErrorText(error))")) }
+            let readFrame = page.frame(matching: Self.str(params, "frame"))
+            page.webView.evaluateJavaScript(js, in: readFrame, in: .page) { result in
+                if case .failure(let error) = result {
+                    return done(.failure("read failed — \(Self.jsErrorText(error))"))
+                }
+                guard case .success(let value) = result else { return }
                 let full = value as? String ?? ""
                 let truncated = full.count > maxChars
                 let content = truncated
@@ -497,6 +501,24 @@ final class BrowserSessions: ObservableObject {
             guard selector != nil || text != nil else {
                 return done(.failure("click needs a selector or text"))
             }
+            // Absolute page coordinates: the escape hatch for anything a
+            // selector cannot reach — most importantly a cross-origin iframe,
+            // whose DOM is invisible to the top document by design.
+            if let x = Self.dbl(params, "x"), let y = Self.dbl(params, "y") {
+                present(id)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.nativeClick(page, at: CGPoint(x: x, y: y)) { landed in
+                        guard landed else {
+                            return done(.failure("(\(Int(x)), \(Int(y))) is not inside the visible page area"))
+                        }
+                        self.settle(page) {
+                            done(.ok(["hit": true, "matched": "point (\(Int(x)), \(Int(y)))",
+                                      "how": "native"]))
+                        }
+                    }
+                }
+                return
+            }
             let what = selector.map { "selector \($0)" } ?? "visible text \"\(text ?? "")\""
             // Native by default: a scripted `.click()` is ignored by anything
             // that listens for the real pointer sequence. `native: false` forces
@@ -504,15 +526,17 @@ final class BrowserSessions: ObservableObject {
             // and is scrolled somewhere unreachable.
             if Self.boolOrNil(params, "native") ?? true {
                 present(id)
+                let framePattern = Self.str(params, "frame")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    self.locate(page, selector: selector, text: text) { found in
+                    self.locateAcrossFrames(page, selector: selector, text: text,
+                                            framePattern: framePattern) { found in
                         guard let found else {
                             let seen = self.lastLocateCandidates
                             let hint = seen.isEmpty ? "" :
                                 " — clickable things on this page: " + seen.map { "\"\($0)\"" }.joined(separator: ", ")
                             return done(.failure("nothing matched \(what)\(hint)"))
                         }
-                        self.nativeClick(page, at: found.point) { landed in
+                        self.nativeClick(page, at: Self.pressPoint(in: found.rect, params: params)) { landed in
                             guard landed else {
                                 // Off-screen after scrolling, or the panel is not
                                 // in a window: say so instead of reporting a hit.
@@ -549,13 +573,14 @@ final class BrowserSessions: ObservableObject {
             if Self.boolOrNil(params, "native") ?? true {
                 present(id)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    self.locate(page, selector: selector, text: nil) { found in
+                    self.locateAcrossFrames(page, selector: selector, text: nil,
+                                            framePattern: Self.str(params, "frame")) { found in
                         guard let found else {
                             return done(.failure("nothing matched selector \(selector)"))
                         }
                         // Click it for real first: focus that a framework believes
                         // in, and any mask/autocomplete armed the way a human arms it.
-                        self.nativeClick(page, at: found.point) { landed in
+                        self.nativeClick(page, at: CGPoint(x: found.rect.midX, y: found.rect.midY)) { landed in
                             guard landed else {
                                 return done(.failure("could not focus \(selector) — the page area is not on screen"))
                             }
@@ -586,6 +611,15 @@ final class BrowserSessions: ObservableObject {
                 }
             }
 
+        case "frames":
+            guard let id = resolve(params), let page = page(for: id) else {
+                return done(.failure(Self.noTabError))
+            }
+            page.webView.evaluateJavaScript(Self.frameListJS) { value, _ in
+                let inDocument = (value as? String).flatMap { Self.decodeJSONArray($0) } ?? []
+                done(.ok(["registered": page.frameSummaries, "elements": inDocument]))
+            }
+
         case "fill":
             guard Self.allowClaudeWrites else { return done(.failure(Self.writesDisabled)) }
             guard let id = resolve(params), let page = page(for: id) else {
@@ -600,6 +634,7 @@ final class BrowserSessions: ObservableObject {
                 return done(.failure("fill needs fields: [{selector, text}, …]"))
             }
             let submitLast = Self.bool(params, "submit", default: false)
+            let framePattern = Self.str(params, "frame")
             present(id)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 // Sequential on purpose: each field is focused with a real click
@@ -614,13 +649,14 @@ final class BrowserSessions: ObservableObject {
                     }
                     let (selector, text) = fields[index]
                     index += 1
-                    self.locate(page, selector: selector, text: nil) { found in
+                    self.locateAcrossFrames(page, selector: selector, text: nil,
+                                            framePattern: framePattern) { found in
                         guard let found else {
                             results.append(["selector": selector, "ok": false,
                                             "error": "nothing matched"])
                             return next()
                         }
-                        self.nativeClick(page, at: found.point) { landed in
+                        self.nativeClick(page, at: CGPoint(x: found.rect.midX, y: found.rect.midY)) { landed in
                             guard landed else {
                                 results.append(["selector": selector, "ok": false,
                                                 "error": "not on screen"])
@@ -668,9 +704,19 @@ final class BrowserSessions: ObservableObject {
             guard let id = resolve(params), let page = page(for: id) else {
                 return done(.failure(Self.noTabError))
             }
-            page.webView.evaluateJavaScript(js) { value, error in
-                if let error { return done(.failure("eval failed — \(Self.jsErrorText(error))")) }
-                done(.ok(["value": String(Self.jsonFragment(value).prefix(20_000))]))
+            // A frame pattern runs the script INSIDE that frame, cross-origin
+            // included: the only way to inspect a hosted payment form.
+            let frame = page.frame(matching: Self.str(params, "frame"))
+            if Self.str(params, "frame") != nil, frame == nil {
+                return done(.failure("no frame matching \"\(Self.str(params, "frame") ?? "")\" has announced itself — call frames to see what has"))
+            }
+            page.webView.evaluateJavaScript(js, in: frame, in: .page) { result in
+                switch result {
+                case .failure(let error):
+                    done(.failure("eval failed — \(Self.jsErrorText(error))"))
+                case .success(let value):
+                    done(.ok(["value": String(Self.jsonFragment(value).prefix(20_000))]))
+                }
             }
 
         case "screenshot":
@@ -1118,6 +1164,11 @@ final class BrowserSessions: ObservableObject {
         return text
     }
 
+    /// A CSS coordinate, which is fractional — `num` truncates to Int.
+    private static func dbl(_ params: [String: Any], _ key: String) -> CGFloat? {
+        (params[key] as? NSNumber).map { CGFloat($0.doubleValue) }
+    }
+
     /// A bool param that may be absent — `bool(_:default:)` can't say "unset".
     private static func boolOrNil(_ params: [String: Any], _ key: String) -> Bool? {
         (params[key] as? NSNumber)?.boolValue ?? (params[key] as? Bool)
@@ -1514,7 +1565,8 @@ final class BrowserSessions: ObservableObject {
     /// ended up hitting a table row. `callAsyncJavaScript` lets the page tell us
     /// when it has actually stopped moving.
     private func locate(_ page: BrowserPage, selector: String?, text: String?,
-                        done: @escaping ((point: CGPoint, label: String)?) -> Void) {
+                        frame: WKFrameInfo? = nil,
+                        done: @escaping ((rect: CGRect, label: String)?) -> Void) {
         let body = """
         const sel = selector, wanted = wanted_;
         const label = (el) => String(el.innerText || el.value || el.getAttribute('aria-label')
@@ -1552,13 +1604,13 @@ final class BrowserSessions: ObservableObject {
         await new Promise(r => setTimeout(r, 90));
         const r = el.getBoundingClientRect();
         if (!(r.width > 0) || !(r.height > 0)) return null;
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2,
+        return { x: r.left, y: r.top, w: r.width, h: r.height,
                  tag: (el.tagName || '').toLowerCase(), label: label(el).slice(0, 80) };
         """
         page.webView.callAsyncJavaScript(
             body,
             arguments: ["selector": selector ?? NSNull(), "wanted_": text ?? NSNull()],
-            in: nil, in: .page
+            in: frame, in: .page
         ) { result in
             guard case .success(let value) = result, let box = value as? [String: Any] else {
                 if case .failure(let error) = result {
@@ -1573,16 +1625,99 @@ final class BrowserSessions: ObservableObject {
                 return done(nil)
             }
             guard let x = (box["x"] as? NSNumber)?.doubleValue,
-                  let y = (box["y"] as? NSNumber)?.doubleValue else { return done(nil) }
+                  let y = (box["y"] as? NSNumber)?.doubleValue,
+                  let w = (box["w"] as? NSNumber)?.doubleValue,
+                  let h = (box["h"] as? NSNumber)?.doubleValue else { return done(nil) }
             self.lastLocateCandidates = []
             let tag = box["tag"] as? String ?? "element"
             let text = box["label"] as? String ?? ""
-            done((CGPoint(x: x, y: y), "\(tag) \(text)".trimmingCharacters(in: .whitespaces)))
+            done((CGRect(x: x, y: y, width: w, height: h),
+                  "\(tag) \(text)".trimmingCharacters(in: .whitespaces)))
         }
     }
 
     /// Clickable labels seen during the last failed `locate`, for the error text.
     private var lastLocateCandidates: [String] = []
+
+    /// Locate `selector`/`text` in the top document, or — when `framePattern` is
+    /// given, or when the top document has no match and exactly one child frame
+    /// exists — inside that frame, returning coordinates in the TOP document's
+    /// space so a real mouse event can reach it.
+    ///
+    /// The composition is the trick: a cross-origin frame cannot know where it
+    /// sits in its parent, and the parent cannot see inside it. Each half knows
+    /// one number, so we ask both and add them.
+    private func locateAcrossFrames(_ page: BrowserPage, selector: String?, text: String?,
+                                    framePattern: String?,
+                                    done: @escaping ((rect: CGRect, label: String)?) -> Void) {
+        func inFrame(_ frame: WKFrameInfo, _ url: String) {
+            locate(page, selector: selector, text: text, frame: frame) { found in
+                guard let found else { return done(nil) }
+                // Where the iframe ELEMENT is, from the top document's side.
+                page.webView.evaluateJavaScript(Self.frameRectJS(url: url)) { value, _ in
+                    guard let json = value as? String, let box = Self.decodeJSON(json),
+                          let fx = (box["x"] as? NSNumber)?.doubleValue,
+                          let fy = (box["y"] as? NSNumber)?.doubleValue else {
+                        return done(nil)
+                    }
+                    let composed = CGRect(x: fx + found.rect.minX, y: fy + found.rect.minY,
+                                          width: found.rect.width, height: found.rect.height)
+                    done((composed, found.label + " (in \((url as NSString).lastPathComponent))"))
+                }
+            }
+        }
+
+        if let framePattern, !framePattern.isEmpty {
+            guard let entry = page.childFrames.last(where: {
+                $0.url.lowercased().contains(framePattern.lowercased()) && $0.info.webView != nil
+            }) else { return done(nil) }
+            return inFrame(entry.info, entry.url)
+        }
+        // No frame asked for: try the top document, and fall into the single
+        // child frame if there is exactly one and the top has nothing. That makes
+        // the common case — one payment iframe — work without any new parameter.
+        locate(page, selector: selector, text: text) { found in
+            if let found { return done(found) }
+            let live = page.childFrames.filter { $0.info.webView != nil }
+            guard live.count == 1 else { return done(nil) }
+            inFrame(live[0].info, live[0].url)
+        }
+    }
+
+    /// Every frame element in the top document, with its rect — the caller can
+    /// aim `click({x, y})` inside one even when nothing else works.
+    private static let frameListJS = """
+    JSON.stringify([].map.call(document.querySelectorAll('iframe, frame'), function(f) {
+      var r = f.getBoundingClientRect();
+      return { src: (f.src || '').slice(0, 200), x: Math.round(r.left), y: Math.round(r.top),
+               w: Math.round(r.width), h: Math.round(r.height),
+               sameOrigin: (function() { try { return !!f.contentDocument; } catch (e) { return false; } })() };
+    }))
+    """
+
+    /// The rect of the `<iframe>` element whose src matches a registered frame.
+    private static func frameRectJS(url: String) -> String {
+        """
+        (function() {
+          var want = \(jsLiteral(url));
+          var frames = document.querySelectorAll('iframe, frame');
+          var best = null;
+          for (var i = 0; i < frames.length; i++) {
+            var src = frames[i].src || '';
+            // Compare on the path, not the whole URL: tokens and query strings
+            // are rewritten by the embedded app after it loads.
+            if (src && (want.indexOf(src.split('?')[0]) === 0 || src.split('?')[0].length === 0)) {
+              best = frames[i]; break;
+            }
+            if (src && want.split('?')[0] === src.split('?')[0]) { best = frames[i]; break; }
+          }
+          if (!best && frames.length === 1) best = frames[0];
+          if (!best) return null;
+          var r = best.getBoundingClientRect();
+          return JSON.stringify({ x: r.left, y: r.top, w: r.width, h: r.height });
+        })()
+        """
+    }
 
     /// Where an element is, in CSS pixels relative to the viewport, after
     /// scrolling it into view. Same matching rules as `clickJS` — a selector, or
@@ -1634,6 +1769,18 @@ final class BrowserSessions: ObservableObject {
     /// the form resets. A real `NSEvent` through the web view's window comes back
     /// out of WebKit as a trusted pointerdown → mousedown → focus → mouseup →
     /// click, which is indistinguishable from a human.
+    /// Where inside a located element to press: its centre, or the caller's
+    /// `dx`/`dy` offset from the element's top-left. The offset is what makes a
+    /// cross-origin iframe clickable at all — you can't select inside it, but you
+    /// can aim at a point in it.
+    private static func pressPoint(in rect: CGRect, params: [String: Any]) -> CGPoint {
+        let dx = dbl(params, "dx")
+        let dy = dbl(params, "dy")
+        guard dx != nil || dy != nil else { return CGPoint(x: rect.midX, y: rect.midY) }
+        return CGPoint(x: rect.minX + (dx ?? rect.width / 2),
+                       y: rect.minY + (dy ?? rect.height / 2))
+    }
+
     /// A real mouse or key event needs its tab to be the one on screen — the
     /// events go to the WINDOW, not to a detached view. The other session was
     /// calling `tabs` + `activate` before every interaction to arrange that (99
@@ -1641,6 +1788,49 @@ final class BrowserSessions: ObservableObject {
     private func present(_ id: UUID) {
         if activeTabId != id { activeTabId = id }
         requestVisible()
+    }
+
+    // MARK: Focus custody
+
+    /// Who held keyboard focus before a driven action borrowed it, and the
+    /// pending hand-back.
+    private weak var focusToReturn: NSResponder?
+    private var focusReturnWork: DispatchWorkItem?
+
+    /// Native events cannot avoid taking first-responder status: AppKit hands
+    /// focus to whatever a mouse-down hits, and a key event is delivered to the
+    /// responder it is sent to. But the user may be typing in the terminal or
+    /// the editor while an agent drives the pane, so remember who held focus
+    /// outside the page and give it back when the burst ends.
+    private func borrowFocus(from window: NSWindow, for webView: WKWebView) {
+        focusReturnWork?.cancel()
+        focusReturnWork = nil
+        if focusToReturn == nil,
+           let current = window.firstResponder as? NSView,
+           current !== webView, !current.isDescendant(of: webView) {
+            focusToReturn = current
+        }
+    }
+
+    /// Hand focus back on a short lease instead of immediately: `type` clicks a
+    /// field and then sends keys, and returning focus in between would blur the
+    /// element the click just focused (WebKit blurs the document when its view
+    /// resigns). Every further injection renews the lease, so focus goes home
+    /// once, after the last event of the action.
+    private func returnFocus(to window: NSWindow, after delay: TimeInterval = 0.4) {
+        focusReturnWork?.cancel()
+        focusReturnWork = nil
+        guard focusToReturn != nil else { return }
+        let work = DispatchWorkItem { [weak self, weak window] in
+            guard let self else { return }
+            self.focusReturnWork = nil
+            let target = self.focusToReturn
+            self.focusToReturn = nil
+            guard let window, let view = target as? NSView, view.window === window else { return }
+            window.makeFirstResponder(view)
+        }
+        focusReturnWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func nativeClick(_ page: BrowserPage, at point: CGPoint,
@@ -1664,16 +1854,25 @@ final class BrowserSessions: ObservableObject {
                                windowNumber: window.windowNumber, context: nil,
                                eventNumber: 0, clickCount: clicks, pressure: clicks == 0 ? 0 : 1)
         }
+        borrowFocus(from: window, for: webView)
+        // Delivered to the VIEW, not through `window.sendEvent`. A window that
+        // is handed a mouse-down makes itself key — which is how clicking an
+        // inactive window activates its app — so routing a driven click through
+        // the window yanked the user out of whatever they were typing in, in
+        // this app or another one. `WKWebView` forwards an `NSEvent` to the web
+        // process itself, so the event is every bit as real without the window
+        // ever learning a click happened.
         // Hover first: menus and Material ripples arm on pointerover, and a press
         // with no preceding move lands on a control that never woke up.
-        if let move = event(.mouseMoved, clicks: 0) { window.sendEvent(move) }
+        if let move = event(.mouseMoved, clicks: 0) { webView.mouseMoved(with: move) }
         guard let down = event(.leftMouseDown, clicks: 1),
               let up = event(.leftMouseUp, clicks: 1) else { return done(false) }
-        window.sendEvent(down)
+        webView.mouseDown(with: down)
         // A gap between down and up: a zero-length press is discarded by some
         // gesture recognisers as an accidental tap.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            window.sendEvent(up)
+            webView.mouseUp(with: up)
+            self.returnFocus(to: window)
             done(true)
         }
     }
@@ -1684,10 +1883,21 @@ final class BrowserSessions: ObservableObject {
     private func nativeKeys(_ page: BrowserPage, characters: [(String, UInt16)],
                             done: @escaping (Bool) -> Void) {
         guard let window = page.webView.window else { return done(false) }
-        window.makeFirstResponder(page.webView)
+        // First-responder status is what makes WebKit treat the page as focused,
+        // so the keys reach the element the click focused — but only take it
+        // while this window is already the key one. Moving focus inside a
+        // background window is pointless, and `borrowFocus` gives it back
+        // either way.
+        if window.isKeyWindow {
+            borrowFocus(from: window, for: page.webView)
+            window.makeFirstResponder(page.webView)
+        }
         var index = 0
         func next() {
-            guard index < characters.count else { return done(true) }
+            guard index < characters.count else {
+                self.returnFocus(to: window)
+                return done(true)
+            }
             let (chars, code) = characters[index]
             index += 1
             for type in [NSEvent.EventType.keyDown, .keyUp] {
@@ -1696,7 +1906,9 @@ final class BrowserSessions: ObservableObject {
                                               windowNumber: window.windowNumber, context: nil,
                                               characters: chars, charactersIgnoringModifiers: chars,
                                               isARepeat: false, keyCode: code) {
-                    window.sendEvent(key)
+                    // To the view, for the same reason as the mouse events.
+                    if type == .keyDown { page.webView.keyDown(with: key) }
+                    else { page.webView.keyUp(with: key) }
                 }
             }
             // Per-character delay: a page that re-renders on every keystroke
@@ -1848,6 +2060,17 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         // finished in the page, Swift hears about it and can ship the picture.
         let bridge = WKUserContentController()
         config.userContentController = bridge
+        // Every frame, not just the main one, announces itself. That handshake is
+        // the ONLY way to get a usable `WKFrameInfo` for a child frame, and a
+        // `WKFrameInfo` is what lets us run JS inside a CROSS-ORIGIN iframe —
+        // a hosted card form, a 3-D Secure step — whose DOM the top document
+        // cannot see at all. Without it a selector can never reach the Pay button.
+        bridge.addUserScript(WKUserScript(
+            source: """
+            try { window.webkit.messageHandlers.floatnote.postMessage(
+                { type: 'frame', url: location.href, w: innerWidth, h: innerHeight }); } catch (e) {}
+            """,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         bridge.add(self, name: "floatnote")
@@ -2002,6 +2225,14 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                                didReceive message: WKScriptMessage) {
         guard let body = message.body as? [String: Any] else { return }
         switch body["type"] as? String {
+        case "frame":
+            guard !message.frameInfo.isMainFrame, let url = body["url"] as? String else { return }
+            childFrames.removeAll { $0.url == url || $0.info == message.frameInfo }
+            childFrames.append((url: url, info: message.frameInfo))
+            // A page can host a lot of frames (ads, trackers); keep the recent
+            // ones and let the rest go.
+            if childFrames.count > 12 { childFrames.removeFirst(childFrames.count - 12) }
+            dbg("browser: frame registered \((url as NSString).lastPathComponent) (\(childFrames.count) live)")
         case "annotation":
             // "Add to chat": screenshot the page with the marks on it and drop
             // the picture into Claude Code's prompt.
@@ -2030,9 +2261,32 @@ final class BrowserPage: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
 
     /// The user agent this page's current document was fetched with.
     private(set) var loadedUserAgent: String?
+    /// Child frames that have announced themselves, newest last.
+    private(set) var childFrames: [(url: String, info: WKFrameInfo)] = []
+
+    /// The registered frame whose URL contains `pattern`.
+    ///
+    /// A nil pattern means the TOP document, never "the only frame you have":
+    /// treating it as a convenience made a plain `eval` run inside an embedded
+    /// example.com instead of the page, and silently answering about the wrong
+    /// document is worse than answering nothing. The auto-descend convenience
+    /// lives in `locateAcrossFrames`, where the top document has already missed.
+    func frame(matching pattern: String?) -> WKFrameInfo? {
+        guard let pattern, !pattern.isEmpty else { return nil }
+        let needle = pattern.lowercased()
+        return childFrames.filter { $0.info.webView != nil }
+            .last { $0.url.lowercased().contains(needle) }?.info
+    }
+
+    var frameSummaries: [[String: Any]] {
+        childFrames.filter { $0.info.webView != nil }.enumerated().map { index, entry in
+            ["index": index, "url": entry.url]
+        }
+    }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         loadedUserAgent = webView.customUserAgent
+        if navigation != nil, webView.url != nil { childFrames.removeAll() }
         sessions?.pageChanged(id)
     }
 

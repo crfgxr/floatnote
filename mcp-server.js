@@ -1170,11 +1170,15 @@ server.tool(
     id: z.string().optional().describe(TAB_ID_PARAM),
     format: z.enum(["text", "html"]).optional().describe("'text' (default) = the page's visible text; 'html' = its serialized DOM"),
     maxChars: z.number().optional().describe("Maximum characters of content to return (default 60000)"),
+    frame: z
+      .string()
+      .optional()
+      .describe("Act INSIDE an iframe whose URL contains this text (cross-origin included, e.g. 'mobilexpress'). With one iframe on the page and no top-document match it is used automatically. See browser_frames"),
   },
-  async ({ id, format, maxChars }) => {
+  async ({ id, format, maxChars, frame }) => {
     const fmt = format || "text";
     const cap = maxChars === undefined ? 60000 : maxChars;
-    const res = await browserRPC("read", compact({ id, format: fmt, maxChars: cap }));
+    const res = await browserRPC("read", compact({ id, format: fmt, maxChars: cap, frame }));
     if (!res.ok) return textResult(rpcError("read", res));
     const r = res.result;
     const body = typeof r.content === "string" ? r.content : JSON.stringify(r.content ?? "");
@@ -1190,21 +1194,30 @@ server.tool(
 
 server.tool(
   "browser_click",
-  "Click an element on the page in FloatNote's own browser panel, either by CSS selector or by its visible text (case-insensitive, over links, buttons, [role=button], inputs, summary, [onclick], [tabindex]). By default this is a REAL mouse press delivered to the web view — trusted pointerdown/mousedown/focus/mouseup/click — so Angular, React and Material controls that ignore scripted clicks respond to it. A miss is reported as a failure with the selector echoed, never as a silent success. Refused when write access is disabled in FloatNote's browser settings.",
+  "Click on the page in FloatNote's own browser panel — by CSS selector, by visible text, at page coordinates (`x`/`y`), or at an offset inside a matched element (`dx`/`dy`). Coordinates and `frame` are how you reach a CROSS-ORIGIN iframe such as a hosted card form, whose DOM no top-document selector can see. Matching by selector or visible text (case-insensitive, over links, buttons, [role=button], inputs, summary, [onclick], [tabindex]). By default this is a REAL mouse press delivered to the web view — trusted pointerdown/mousedown/focus/mouseup/click — so Angular, React and Material controls that ignore scripted clicks respond to it. A miss is reported as a failure with the selector echoed, never as a silent success. Refused when write access is disabled in FloatNote's browser settings.",
   {
     id: z.string().optional().describe(TAB_ID_PARAM),
     selector: z.string().optional().describe("CSS selector of the element to click"),
     text: z.string().optional().describe("Visible text to match instead of a selector"),
+    x: z.number().optional().describe("Page X coordinate to press, in CSS pixels — for anything no selector can reach. Requires y"),
+    y: z.number().optional().describe("Page Y coordinate to press. Requires x"),
+    dx: z.number().optional().describe("Offset from the matched element's LEFT edge instead of its centre — aim inside an iframe, e.g. selector:'iframe', dx:200, dy:560"),
+    dy: z.number().optional().describe("Offset from the matched element's TOP edge instead of its centre"),
+    frame: z
+      .string()
+      .optional()
+      .describe("Act INSIDE an iframe whose URL contains this text (cross-origin included, e.g. 'mobilexpress'). With one iframe on the page and no top-document match it is used automatically. See browser_frames"),
     native: z
       .boolean()
       .optional()
       .describe("Default true: a real mouse event. false falls back to element.click(), which frameworks listening for pointer events ignore — only useful for an element that cannot be scrolled into view"),
   },
-  async ({ id, selector, text, native }) => {
-    if (!selector && !text) {
-      return textResult("browser_click needs either a `selector` or a `text` to match.");
+  async ({ id, selector, text, x, y, dx, dy, frame, native }) => {
+    const hasPoint = typeof x === "number" && typeof y === "number";
+    if (!selector && !text && !hasPoint) {
+      return textResult("browser_click needs a `selector`, a `text` to match, or an `x`/`y` point.");
     }
-    const res = await browserRPC("click", compact({ id, selector, text, native }));
+    const res = await browserRPC("click", compact({ id, selector, text, x, y, dx, dy, frame, native }));
     if (!res.ok) return textResult(rpcError("click", res));
     const r = res.result;
     return textResult(`Clicked ${r.matched || selector || text}. Use browser_read to see the resulting page.`);
@@ -1219,19 +1232,54 @@ server.tool(
     selector: z.string().describe("CSS selector of the input/textarea/contenteditable to type into"),
     text: z.string().describe("Text to enter (replaces the field's current value)"),
     submit: z.boolean().optional().describe("Submit the field's form after typing (default false)"),
+    frame: z
+      .string()
+      .optional()
+      .describe("Act INSIDE an iframe whose URL contains this text (cross-origin included, e.g. 'mobilexpress'). With one iframe on the page and no top-document match it is used automatically. See browser_frames"),
     native: z
       .boolean()
       .optional()
       .describe("Default true: focus the field with a real click and send real keystrokes, which is what a framework's value accessor listens for. false sets .value and dispatches input/change instead"),
   },
-  async ({ id, selector, text, submit, native }) => {
-    const res = await browserRPC("type", compact({ id, selector, text, submit, native }));
+  async ({ id, selector, text, submit, frame, native }) => {
+    const res = await browserRPC("type", compact({ id, selector, text, submit, frame, native }));
     if (!res.ok) return textResult(rpcError("type", res));
     const n = res.result.typed;
     return textResult(
       `Typed ${n === undefined ? text.length : n} character(s) into ${selector}` +
         (submit ? " and submitted the form." : ".")
     );
+  }
+);
+
+server.tool(
+  "browser_frames",
+  "List the iframes on the page in FloatNote's own browser panel: which have announced themselves (so `frame:` can target them, cross-origin included) and where each iframe ELEMENT sits with its rect — so you can aim browser_click at a point inside one when nothing else reaches it. Use this the moment a selector inside an embedded form doesn't match.",
+  { id: z.string().optional().describe(TAB_ID_PARAM) },
+  async ({ id }) => {
+    const res = await browserRPC("frames", compact({ id }));
+    if (!res.ok) return textResult(rpcError("frames", res));
+    const registered = Array.isArray(res.result.registered) ? res.result.registered : [];
+    const elements = Array.isArray(res.result.elements) ? res.result.elements : [];
+    if (!registered.length && !elements.length) return textResult("No iframes on this page.");
+    const lines = [];
+    if (registered.length) {
+      lines.push("Targetable with frame: (matches any part of the URL)");
+      registered.forEach((f) => lines.push(`  ${f.url}`));
+    }
+    if (elements.length) {
+      lines.push("iframe elements in the top document:");
+      elements.forEach((f) =>
+        lines.push(
+          `  ${f.w}x${f.h} at ${f.x},${f.y} · ${f.sameOrigin ? "same-origin" : "cross-origin"} · ${f.src || "(no src)"}`
+        )
+      );
+      lines.push(
+        "Press something inside a cross-origin iframe with browser_click({frame:'<part of its url>', selector:'#id'}), " +
+          "or aim by point with browser_click({x, y}) using the rect above."
+      );
+    }
+    return textResult(lines.join("\n"));
   }
 );
 
@@ -1244,10 +1292,14 @@ server.tool(
       .array(z.object({ selector: z.string(), text: z.string() }))
       .describe("Fields in the order they should be filled, e.g. [{selector:'#name',text:'MARCO ROSSI'},{selector:'#card',text:'5549…'}]"),
     submit: z.boolean().optional().describe("Press Enter after the LAST field (default false)"),
+    frame: z
+      .string()
+      .optional()
+      .describe("Act INSIDE an iframe whose URL contains this text (cross-origin included, e.g. 'mobilexpress'). With one iframe on the page and no top-document match it is used automatically. See browser_frames"),
   },
-  async ({ id, fields, submit }) => {
+  async ({ id, fields, submit, frame }) => {
     if (!fields || !fields.length) return textResult("browser_fill needs at least one field.");
-    const res = await browserRPC("fill", compact({ id, fields, submit }), RPC_SLOW_TIMEOUT_MS);
+    const res = await browserRPC("fill", compact({ id, fields, submit, frame }), RPC_SLOW_TIMEOUT_MS);
     if (!res.ok) return textResult(rpcError("fill", res));
     const filled = Array.isArray(res.result.filled) ? res.result.filled : [];
     const lines = filled.map((f) =>
@@ -1282,9 +1334,13 @@ server.tool(
   {
     id: z.string().optional().describe(TAB_ID_PARAM),
     js: z.string().describe("JavaScript expression or statement block; the completion value is returned"),
+    frame: z
+      .string()
+      .optional()
+      .describe("Act INSIDE an iframe whose URL contains this text (cross-origin included, e.g. 'mobilexpress'). With one iframe on the page and no top-document match it is used automatically. See browser_frames"),
   },
-  async ({ id, js }) => {
-    const res = await browserRPC("eval", compact({ id, js }));
+  async ({ id, js, frame }) => {
+    const res = await browserRPC("eval", compact({ id, js, frame }));
     if (!res.ok) return textResult(rpcError("eval", res));
     const v = res.result.value;
     const shown = v === undefined || v === null ? "(no value)" : typeof v === "string" ? v : JSON.stringify(v);
