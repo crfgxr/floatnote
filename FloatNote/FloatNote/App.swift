@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.94.6"
+let APP_VERSION = "v1.94.7"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -3009,9 +3009,17 @@ struct DeepgramResult {
 
 class OpenRouterClient {
     private let apiKey: String
+    // Free tiers come and go — the gpt-oss pair this used to name lost theirs
+    // and answered every summary with a 404, so the whole chain reported "all
+    // models rate limited". These three were tested against a real Turkish
+    // meeting transcript (16k chars): plain-text output with no markdown leak,
+    // correct • bullets and ☐ action items, 7-11s each. `openrouter/free` is
+    // last on purpose: it auto-routes to whatever free model is up, so it
+    // survives the upstream 429s that take a named model down.
     private let models = [
-        "openai/gpt-oss-120b:free",
-        "openai/gpt-oss-20b:free"
+        "minimax/minimax-m3:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "openrouter/free"
     ]
 
     init?() {
