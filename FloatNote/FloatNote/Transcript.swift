@@ -804,6 +804,18 @@ final class TranscriptStore: ObservableObject {
         isWorking = false
     }
 
+    /// The human submitted a prompt in this pane (the `UserPromptSubmit` hook).
+    /// This is the only "a turn started" signal that always exists: a Workflow
+    /// run writes its agents' records somewhere else entirely, so the session
+    /// file — the spinner's other trigger — can stay silent for minutes while
+    /// the pane is plainly busy.
+    func noteTurnStarted(paneId: UUID) {
+        guard paneId == boundPaneId, !isWorking else { return }
+        workingReason = "prompt submitted"
+        lastRecordAt = Date()
+        isWorking = true
+    }
+
     func noteTurnEnded(paneId: UUID) {
         guard paneId == boundPaneId, isWorking else { return }
         workingReason = "hook said the turn ended"

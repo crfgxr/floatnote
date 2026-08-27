@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.94.4"
+let APP_VERSION = "v1.94.6"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -1478,6 +1478,15 @@ class EditorViewModel: ObservableObject {
         return (onPath.first(where: { $0.claudeSessionId == nil }) ?? first, false)
     }
 
+    /// Claude Code sends a `Notification` for two different things: "I need your
+    /// permission to use X" (the turn really is parked) and "I am waiting for
+    /// your input" (fired while nothing is running, but also 60s into a turn the
+    /// human has not answered). Only the first ends a turn.
+    static func isIdleNudge(_ message: String?) -> Bool {
+        guard let message else { return false }
+        return message.lowercased().contains("waiting for your input")
+    }
+
     func checkClaudeEvents() {
         let dir = Self.CLAUDE_EVENTS_DIR
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir),
@@ -1508,7 +1517,7 @@ class EditorViewModel: ObservableObject {
             }
             let tab = resolved.tab
             if stale {
-                if event == "Stop" || event == "Notification" {
+                if event == "Stop" || (event == "Notification" && !Self.isIdleNudge(obj["message"] as? String)) {
                     TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
                     clearPaneActivity(tab.id)
                 }
@@ -1539,9 +1548,31 @@ class EditorViewModel: ObservableObject {
                 if tab.id == activeTerminalId { TranscriptStore.shared.rebind(to: terminalTabs[idx]) }
             }
             dbg("claude event [\(event)] → pane \(tab.label) turnText=\(turnText.count)ch")
-            // Both events mean the transcript's spinner should stop: Stop ends
-            // the turn, Notification means Claude is waiting on the human.
-            if event == "Stop" || event == "Notification" {
+            // A conversation was started, resumed (`/resume`) or cleared in this
+            // pane. No banner — the stamp above is the whole point: `/resume`
+            // switches the CLI to a different session file without writing
+            // anything the app can see, so the transcript kept tailing the
+            // conversation the pane had BEFORE the resume until some later
+            // prompt happened to name the new one.
+            if event == "SessionStart" {
+                TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
+                clearPaneActivity(tab.id)
+                continue
+            }
+            // The human just submitted a prompt: the turn has started. This is
+            // the only start signal that always exists — a Workflow run keeps
+            // its agents' records out of the session file, so the pane can look
+            // idle on disk for minutes while it is plainly busy.
+            if event == "UserPromptSubmit" {
+                TranscriptStore.shared.noteTurnStarted(paneId: tab.id)
+                paneActivity[tab.id] = Date()
+                continue   // no banner: the human is right there, typing
+            }
+            // Stop ends the turn. So does a Notification that is a permission
+            // prompt — but NOT Claude Code's idle "waiting for your input"
+            // nudge, which arrives 60s into a long turn and used to stop a
+            // spinner over a pane that was still working.
+            if event == "Stop" || (event == "Notification" && !Self.isIdleNudge(obj["message"] as? String)) {
                 TranscriptStore.shared.noteTurnEnded(paneId: tab.id)
                 clearPaneActivity(tab.id)
             }
