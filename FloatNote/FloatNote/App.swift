@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.94.11"
+let APP_VERSION = "v1.94.12"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -922,6 +922,16 @@ class EditorViewModel: ObservableObject {
         guard let tv = editorCoordinator?.textView else { return }
         tv.window?.makeFirstResponder(tv)
     }
+
+    /// Restart every live pane after the toolbar changes its selected agent.
+    /// TerminalTab state is untouched, so routes, labels, ordering and note
+    /// bindings survive while each shell relaunches in its original directory.
+    func restartTerminalsForAgentChange() {
+        guard !terminalTabs.isEmpty else { return }
+        NotificationCenter.default.post(name: .floatnoteTerminalReset, object: nil)
+        focusActiveTerminal()
+    }
+
     /// Hide the panel but keep all sessions mounted/alive (hide ≠ kill).
     func hideTerminal() { isTerminalVisible = false; normalizeFilledPanelWidths() }
     func toggleTerminal() { isTerminalVisible ? hideTerminal() : applyTerminalRouteForActiveNote() }
@@ -5654,9 +5664,8 @@ struct FormatToolbar: View {
         .help(vm.isBrowserVisible ? "Hide browser (⌘⇧B)" : "Show browser (⌘⇧B)")
     }
 
-    /// Agent used when FloatNote opens or restores the next terminal tab.
-    /// Existing terminal processes keep running so changing this setting never
-    /// interrupts an active conversation.
+    /// Agent used by FloatNote's terminal tabs. Changing it restarts every live
+    /// pane in place so its route and note binding stay intact.
     private var agentMenu: some View {
         Menu {
             agentMenuItem("Codex", value: "codex")
@@ -5680,12 +5689,14 @@ struct FormatToolbar: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .onHover { hoveredButton = $0 ? "agent" : nil }
-        .help("Terminal agent: \(terminalAgent == "claude" ? "Claude" : "Codex"). Applies to new terminal tabs.")
+        .help("Terminal agent: \(terminalAgent == "claude" ? "Claude" : "Codex"). Changing it restarts open terminal tabs.")
     }
 
     private func agentMenuItem(_ title: String, value: String) -> some View {
         Button {
+            guard terminalAgent != value else { return }
             terminalAgent = value
+            vm.restartTerminalsForAgentChange()
         } label: {
             HStack {
                 Text(title)
