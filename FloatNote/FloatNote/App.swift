@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.94.7"
+let APP_VERSION = "v1.94.10"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -609,8 +609,8 @@ struct TerminalTab: Identifiable, Equatable, Codable {
     let path: String
     let label: String
     /// True for a pane the user explicitly added (toolbar + / Cmd+N) rather than
-    /// one opened by note routing. Such a pane always starts a fresh `claude`
-    /// instead of `--continue`-ing the conversation another pane may be running.
+    /// one opened by note routing. Such a pane always starts a fresh agent
+    /// session instead of continuing one another pane may already be running.
     var freshClaude: Bool = false
     /// The note this pane belongs to. Several panes can share a project
     /// directory, so path alone no longer identifies "the note's terminal" —
@@ -1100,8 +1100,8 @@ class EditorViewModel: ObservableObject {
 
     /// Open panes survive a quit. The *shells* can't — those die with the app —
     /// but the tabs, their working directories and their note bindings do, and
-    /// each restored pane re-runs `claude --continue`, so a relaunch lands back
-    /// on the same projects with their conversations resumed.
+    /// each restored pane asks the selected agent to resume, so a relaunch lands
+    /// back on the same projects with their conversations resumed when possible.
     private func saveTerminalTabs() {
         guard !isRestoringTerminals else { return }
         let defaults = UserDefaults.standard
@@ -5212,6 +5212,7 @@ extension View {
 struct FormatToolbar: View {
     @EnvironmentObject var vm: EditorViewModel
     @ObservedObject private var handsfree = HandsfreeManager.shared
+    @AppStorage("FloatNoteAgent") private var terminalAgent = "codex"
     @State private var hoveredButton: String?
 
     /// Controls currently scrolled/clipped out of the middle zone. Drives the
@@ -5327,6 +5328,7 @@ struct FormatToolbar: View {
             terminalButton
             newTerminalButton
             browserButton
+            agentMenu
             handsfreeButton
             themeButton
             pinButton
@@ -5631,6 +5633,49 @@ struct FormatToolbar: View {
         .buttonStyle(.plain)
         .onHover { hoveredButton = $0 ? "browser" : nil }
         .help(vm.isBrowserVisible ? "Hide browser (⌘⇧B)" : "Show browser (⌘⇧B)")
+    }
+
+    /// Agent used when FloatNote opens or restores the next terminal tab.
+    /// Existing terminal processes keep running so changing this setting never
+    /// interrupts an active conversation.
+    private var agentMenu: some View {
+        Menu {
+            agentMenuItem("Codex", value: "codex")
+            agentMenuItem("Claude", value: "claude")
+        } label: {
+            HStack(spacing: 3) {
+                Text(terminalAgent == "claude" ? "Claude" : "Codex")
+                    .font(.system(size: 11, weight: .medium))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 7)
+            .frame(height: 22)
+            .background(
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(hoveredButton == "agent" ? Color.primary.opacity(0.08) : Color.clear)
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .onHover { hoveredButton = $0 ? "agent" : nil }
+        .help("Terminal agent: \(terminalAgent == "claude" ? "Claude" : "Codex"). Applies to new terminal tabs.")
+    }
+
+    private func agentMenuItem(_ title: String, value: String) -> some View {
+        Button {
+            terminalAgent = value
+        } label: {
+            HStack {
+                Text(title)
+                if terminalAgent == value {
+                    Spacer()
+                    Image(systemName: "checkmark")
+                }
+            }
+        }
     }
 
     /// Hands-free voice toggle. Route-gated exactly like `terminalButton` —

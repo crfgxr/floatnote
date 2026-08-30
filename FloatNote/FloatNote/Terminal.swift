@@ -22,8 +22,8 @@ final class TerminalSessions {
     /// The live session for `id`, creating (and starting its shell) on first use.
     /// `cwd` is the shell's working directory, used only on first creation; an
     /// existing session keeps the directory it was started in.
-    /// `freshClaude` forces a brand-new Claude conversation for this pane
-    /// (plain `claude`, never `--continue`) — see `TerminalSession.freshClaude`.
+    /// The legacy-persisted `freshClaude` flag now means a brand-new selected-
+    /// agent conversation for this pane (never `--continue`).
     func session(for id: UUID, cwd: String, freshClaude: Bool = false) -> TerminalSession {
         if let existing = sessions[id] { return existing }
         let s = TerminalSession(id: id, cwd: cwd, freshClaude: freshClaude)
@@ -318,7 +318,9 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
             execName: "-\(NSString(string: shell).lastPathComponent)",
             currentDirectory: dir
         )
-        // Auto-run `claude` (or `claude --continue`, see claudeLaunchCommand)
+        // Auto-run the selected terminal agent. Prefer FloatNote's installed
+        // router by absolute path so login-shell PATH ordering cannot bypass
+        // the Codex/Claude preference after an app relaunch.
         // once the login shell has finished initializing. The shell already
         // starts in the target folder (via currentDirectory). The generation
         // guard ensures a restart invalidates a pending send from the
@@ -328,13 +330,48 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
         let gen = sessionGen
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak term] in
             guard let self, self.sessionGen == gen else { return }
-            let command = self.freshClaude ? "claude\n" : TerminalSession.claudeLaunchCommand(
+            let command = TerminalSession.agentLaunchCommand(
                 dir: dir,
                 home: home,
-                projectsRoot: home + "/.claude/projects"
+                projectsRoot: home + "/.claude/projects",
+                fresh: self.freshClaude
             )
             term?.send(txt: command)
         }
+    }
+
+    /// Builds the command for the currently selected FloatNote terminal agent.
+    /// The installer's router owns Codex's resume fallback and Claude lookup.
+    /// A source-only build still falls back to the corresponding CLI directly.
+    static func agentLaunchCommand(
+        dir: String,
+        home: String,
+        projectsRoot: String,
+        fresh: Bool,
+        fileManager: FileManager = .default,
+        defaults: UserDefaults = .standard
+    ) -> String {
+        let selected = defaults.string(forKey: "FloatNoteAgent") == "claude" ? "claude" : "codex"
+        let routerPath = home + "/.floatnote-bin/floatnote-agent"
+        let hasRouter = fileManager.isExecutableFile(atPath: routerPath)
+        let router = "'" + routerPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+
+        if selected == "codex" {
+            if hasRouter {
+                return fresh ? "\(router)\n" : "\(router) --continue\n"
+            }
+            return fresh ? "codex --no-alt-screen\n"
+                         : "codex resume --last --no-alt-screen\n"
+        }
+
+        let shouldContinue = !fresh && claudeLaunchCommand(
+            dir: dir,
+            home: home,
+            projectsRoot: projectsRoot,
+            fileManager: fileManager
+        ).contains("--continue")
+        let launcher = hasRouter ? router : "claude"
+        return shouldContinue ? "\(launcher) --continue\n" : "\(launcher)\n"
     }
 
     /// Munges an absolute path into Claude Code's session-store directory
