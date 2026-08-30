@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.94.10"
+let APP_VERSION = "v1.94.11"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -1749,6 +1749,10 @@ class EditorViewModel: ObservableObject {
         }
     }
     @Published var editingTabId: UUID?
+    /// A rename stays separate from the live note model until it is committed.
+    /// This prevents SwiftUI from publishing the whole tab collection for each
+    /// keystroke and gives drag/drop one reliable value to flush first.
+    @Published var editingTabTitle: String = ""
     @Published var draggingTabId: UUID?
     /// Folder currently being dragged in the sidebar (for folder→folder nesting).
     @Published var draggingFolderId: UUID?
@@ -2022,7 +2026,7 @@ class EditorViewModel: ObservableObject {
         }
         let data = tabs.map { $0.toData() }
         if let json = try? JSONEncoder().encode(data) {
-            try? json.write(to: URL(fileURLWithPath: LOCAL_TABS_PATH))
+            try? json.write(to: URL(fileURLWithPath: LOCAL_TABS_PATH), options: .atomic)
         }
         lastTabsModDate = tabsFileModDate()
         DispatchQueue.main.async { self.isSavingInternally = false }
@@ -2378,13 +2382,8 @@ class EditorViewModel: ObservableObject {
     func switchTab(_ id: UUID) {
         guard id != activeTabId, let newTab = tabs.first(where: { $0.id == id }) else { return }
 
-        // Commit any active rename
-        if let editId = editingTabId {
-            if let tab = tabs.first(where: { $0.id == editId }) {
-                renameTab(editId, title: tab.title)
-            }
-            editingTabId = nil
-        }
+        // Commit any active rename before changing the selected model.
+        commitTabRename()
 
         flushPendingHTML()
 
@@ -2512,12 +2511,29 @@ class EditorViewModel: ObservableObject {
         saveTabsLocal()
     }
 
-    func renameTab(_ id: UUID, title: String) {
-        BoardWindowController.shared.retitle(noteId: id, to: title)
+    func beginTabRename(_ id: UUID) {
+        if editingTabId != id { commitTabRename() }
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
-        tab.title = title
+        editingTabTitle = tab.title
+        editingTabId = id
+    }
+
+    func commitTabRename() {
+        guard let id = editingTabId else { return }
+        renameTab(id, title: editingTabTitle)
+    }
+
+    func renameTab(_ id: UUID, title: String) {
+        guard let tab = tabs.first(where: { $0.id == id }) else {
+            editingTabId = nil
+            return
+        }
+        if tab.title != title {
+            BoardWindowController.shared.retitle(noteId: id, to: title)
+            tab.title = title
+            saveTabsLocal()
+        }
         editingTabId = nil
-        saveTabsLocal()
     }
 
     func moveTab(from sourceId: UUID, to destId: UUID) {
@@ -4406,11 +4422,12 @@ struct FolderDropDelegate: DropDelegate {
     /// Paint either the nest-inside fill or the sibling insertion line — never both.
     private func updateIndicators(at location: CGPoint) {
         if let below = siblingEdge(at: location), let id = folderId {
-            vm.dropTargetFolderId = nil
-            vm.folderInsertIndicator = .init(id: id, below: below)
+            let indicator = EditorViewModel.FolderInsertIndicator(id: id, below: below)
+            if vm.dropTargetFolderId != nil { vm.dropTargetFolderId = nil }
+            if vm.folderInsertIndicator != indicator { vm.folderInsertIndicator = indicator }
         } else {
-            vm.dropTargetFolderId = folderId
-            vm.folderInsertIndicator = nil
+            if vm.dropTargetFolderId != folderId { vm.dropTargetFolderId = folderId }
+            if vm.folderInsertIndicator != nil { vm.folderInsertIndicator = nil }
         }
     }
 
@@ -4488,11 +4505,11 @@ struct SidebarNoteItemView: View {
                     .font(.system(size: 10))
             }
             if vm.editingTabId == tab.id {
-                TextField("", text: $tab.title)
+                TextField("", text: $vm.editingTabTitle)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
                     .focused($isFieldFocused)
-                    .onSubmit { vm.renameTab(tab.id, title: tab.title) }
+                    .onSubmit { vm.commitTabRename() }
                     .onAppear { isFieldFocused = true }
             } else {
                 Text(tab.title)
@@ -4539,18 +4556,19 @@ struct SidebarNoteItemView: View {
         )
         .opacity(isDragging ? 0.4 : 1.0)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { vm.editingTabId = tab.id }
+        .onTapGesture(count: 2) { vm.beginTabRename(tab.id) }
         .onTapGesture(count: 1) {
             if vm.editingTabId != tab.id { vm.switchTab(tab.id) }
         }
         .onDrag {
+            vm.commitTabRename()
             vm.clearDragIndicators()
             vm.draggingTabId = tab.id
             return NSItemProvider(object: tab.id.uuidString as NSString)
         }
         .onDrop(of: [.text], delegate: TabDropDelegate(tab: tab, vm: vm))
         .contextMenu {
-            Button("Rename") { vm.editingTabId = tab.id }
+            Button("Rename") { vm.beginTabRename(tab.id) }
             Divider()
             Button("Move to Trash", role: .destructive) {
                 vm.trashTab(tab.id)
@@ -4924,14 +4942,12 @@ struct TabItemView: View {
     var body: some View {
         HStack(spacing: 4) {
             if vm.editingTabId == tab.id {
-                TextField("", text: $tab.title)
+                TextField("", text: $vm.editingTabTitle)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11))
                     .frame(minWidth: 40, maxWidth: 140)
                     .focused($isFieldFocused)
-                    .onSubmit {
-                        vm.renameTab(tab.id, title: tab.title)
-                    }
+                    .onSubmit { vm.commitTabRename() }
                     .onAppear { isFieldFocused = true }
             } else {
                 HStack(spacing: 3) {
@@ -4959,7 +4975,7 @@ struct TabItemView: View {
             if hovering { NSCursor.arrow.push() } else { NSCursor.pop() }
         }
         .onTapGesture(count: 2) {
-            vm.editingTabId = tab.id
+            vm.beginTabRename(tab.id)
         }
         .onTapGesture(count: 1) {
             if vm.editingTabId != tab.id {
@@ -4967,6 +4983,7 @@ struct TabItemView: View {
             }
         }
         .onDrag {
+            vm.commitTabRename()
             vm.clearDragIndicators()
             vm.draggingTabId = tab.id
             return NSItemProvider(object: tab.id.uuidString as NSString)
@@ -4980,16 +4997,18 @@ struct TabDropDelegate: DropDelegate {
     let vm: EditorViewModel
 
     func performDrop(info: DropInfo) -> Bool {
+        let dragId = vm.draggingTabId
         // Clears the folder indicators too: the drag may have passed over a
         // folder header on its way here, which would otherwise stay filled.
         vm.clearDragIndicators()
+        guard let dragId, dragId != tab.id else { return dragId != nil }
+        vm.moveTab(from: dragId, to: tab.id)
         return true
     }
 
-    func dropEntered(info: DropInfo) {
-        guard let dragId = vm.draggingTabId, dragId != tab.id else { return }
-        vm.moveTab(from: dragId, to: tab.id)
-    }
+    // Reordering on hover caused a full save and animated sidebar rebuild for
+    // every row crossed. Apply the move once, only after the user drops.
+    func dropEntered(info: DropInfo) {}
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         DropProposal(operation: .move)
