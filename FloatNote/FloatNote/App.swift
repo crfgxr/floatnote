@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.94.12"
+let APP_VERSION = "v1.95.1"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -42,9 +42,9 @@ struct FloatNoteApp: App {
         .commands {
             CommandGroup(replacing: .newItem) { } // Disable Cmd+N / new window
             CommandGroup(replacing: .saveItem) {
-                Button("Export Notes…") { vm.exportNotes() }
+                Button("Export Topics…") { vm.exportNotes() }
                     .keyboardShortcut("e", modifiers: [.command, .shift])
-                Button("Import Notes…") { vm.importNotes() }
+                Button("Import Topics…") { vm.importNotes() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
             }
             // The toolbar's photo button lives in a horizontally scrolling zone,
@@ -463,6 +463,7 @@ struct TabData: Codable {
     var jobStatus: String? = nil  // busy label while a job runs on this note ("Summarizing…", MCP-set, …); nil = idle
     var jobStatusAt: Double? = nil  // epoch seconds the status was last set — drives the 30-min stale TTL
     var isBoardOpen: Bool? = nil  // was the Excalidraw board showing when this note was last left? nil/absent = no
+    var linkedTopicIds: [String]? = nil  // directed knowledge links: this topic may use these topics as context
 }
 
 class NoteTab: Identifiable, ObservableObject {
@@ -476,6 +477,9 @@ class NoteTab: Identifiable, ObservableObject {
     /// Per-note terminal-folder override. Non-nil = this note pins its own
     /// working directory, taking precedence over its folder chain. nil = inherit.
     @Published var localPath: String? = nil
+    /// Directed knowledge links. When this topic is active, linked topics are
+    /// retrieved before workspace-wide search results.
+    @Published var linkedTopicIds: [UUID] = []
     /// Number of unchecked (`☐`) checklist items in this note. Drives the sidebar badge.
     @Published var uncheckedCount: Int = 0
     /// Whether this note was showing its Excalidraw board rather than the text
@@ -527,7 +531,8 @@ class NoteTab: Identifiable, ObservableObject {
             localPath: localPath,
             jobStatus: jobStatus,
             jobStatusAt: jobStatusAt?.timeIntervalSince1970,
-            isBoardOpen: isBoardOpen
+            isBoardOpen: isBoardOpen,
+            linkedTopicIds: linkedTopicIds.map(\.uuidString)
         )
     }
 
@@ -541,6 +546,7 @@ class NoteTab: Identifiable, ObservableObject {
         tab.jobStatus = data.jobStatus
         tab.jobStatusAt = data.jobStatusAt.map { Date(timeIntervalSince1970: $0) }
         tab.isBoardOpen = data.isBoardOpen ?? false
+        tab.linkedTopicIds = (data.linkedTopicIds ?? []).compactMap(UUID.init(uuidString:))
         tab.recomputeUncheckedFromHTML()
         return tab
     }
@@ -603,11 +609,11 @@ class Folder: Identifiable, ObservableObject {
 let TRASH_FOLDER_ID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
 /// One terminal in the panel's tab bar. Identified for dedup by `path` (the
-/// shell's working directory); `label` is the folder name shown on the chip.
+/// shell's working directory); `label` is "Topic - Workspace" on the chip.
 struct TerminalTab: Identifiable, Equatable, Codable {
     let id: UUID
     let path: String
-    let label: String
+    var label: String
     /// True for a pane the user explicitly added (toolbar + / Cmd+N) rather than
     /// one opened by note routing. Such a pane always starts a fresh agent
     /// session instead of continuing one another pane may already be running.
@@ -626,6 +632,10 @@ struct TerminalTab: Identifiable, Equatable, Codable {
     /// the provisional resolution ladder.
     var claudeSessionId: String? = nil
     var claudeTranscriptPath: String? = nil
+    /// Codex identity is kept separately so changing to Claude cannot overwrite
+    /// the conversation this pane must resume when the user switches back.
+    var codexSessionId: String? = nil
+    var codexTranscriptPath: String? = nil
 }
 
 // MARK: - ViewModel
@@ -970,9 +980,9 @@ class EditorViewModel: ObservableObject {
             // is persisted, so its chip kept opening it forever and nothing in
             // normal use ever corrected the binding. The note you are working
             // in is the better answer, every time.
-            if let i = terminalTabs.firstIndex(where: { $0.id == chosen }),
-               terminalTabs[i].noteId != note {
-                terminalTabs[i].noteId = note
+            if let i = terminalTabs.firstIndex(where: { $0.id == chosen }) {
+                if terminalTabs[i].noteId != note { terminalTabs[i].noteId = note }
+                if terminalTabs[i].label != label { terminalTabs[i].label = label }
             }
         }
         isTerminalVisible = true
@@ -1133,7 +1143,12 @@ class EditorViewModel: ObservableObject {
               let saved = try? JSONDecoder().decode([TerminalTab].self, from: data),
               !saved.isEmpty else { return }
         isRestoringTerminals = true
-        defer { isRestoringTerminals = false }
+        defer {
+            isRestoringTerminals = false
+            // Persist format migrations and removal of routes that disappeared
+            // while FloatNote was closed.
+            saveTerminalTabs()
+        }
 
         if let map = defaults.dictionary(forKey: "fn.terminalForNote") as? [String: String] {
             terminalForNote = Dictionary(uniqueKeysWithValues: map.compactMap { k, v in
@@ -1144,6 +1159,24 @@ class EditorViewModel: ObservableObject {
 
         // Drop panes whose directory is gone (deleted or unmounted project).
         terminalTabs = saved.filter { FileManager.default.fileExists(atPath: $0.path) }
+        // Before Codex had its own fields, its bridge was stored in the legacy
+        // Claude slots. Migrate those persisted tabs without losing history.
+        for index in terminalTabs.indices {
+            let tab = terminalTabs[index]
+            if tab.codexSessionId == nil,
+               let transcript = tab.claudeTranscriptPath,
+               transcript.contains("/.floatnote-codex-transcripts/") {
+                terminalTabs[index].codexSessionId = tab.claudeSessionId
+                terminalTabs[index].codexTranscriptPath = transcript
+                terminalTabs[index].claudeSessionId = nil
+                terminalTabs[index].claudeTranscriptPath = nil
+            }
+            if let noteId = terminalTabs[index].noteId,
+               let topic = tabs.first(where: { $0.id == noteId }) {
+                terminalTabs[index].label = terminalLabel(for: topic,
+                                                          fallbackPath: terminalTabs[index].path)
+            }
+        }
         if let raw = defaults.string(forKey: "fn.activeTerminalId"),
            let id = UUID(uuidString: raw),
            terminalTabs.contains(where: { $0.id == id }) {
@@ -1195,21 +1228,57 @@ class EditorViewModel: ObservableObject {
         return nil
     }
 
+    /// The top-level workspace containing a topic. Capped so malformed parent
+    /// cycles in externally edited JSON cannot hang route resolution.
+    private func rootWorkspace(startingAt folderId: UUID) -> Folder? {
+        var currentId: UUID? = folderId
+        var result: Folder?
+        var visited: Set<UUID> = []
+        while let id = currentId, visited.insert(id).inserted, visited.count <= 64 {
+            guard let folder = folders.first(where: { $0.id == id }) else { break }
+            result = folder
+            currentId = folder.parentId
+        }
+        return result
+    }
+
+    /// The chip names the knowledge context; its tooltip continues to expose
+    /// the actual local directory used by the shell.
+    private func terminalLabel(for tab: NoteTab, fallbackPath: String? = nil) -> String {
+        if let folderId = tab.folderId,
+           let workspace = rootWorkspace(startingAt: folderId) {
+            return "\(tab.title) - \(workspace.name)"
+        }
+        if let fallbackPath, !fallbackPath.isEmpty {
+            return "\(tab.title) - \((fallbackPath as NSString).lastPathComponent)"
+        }
+        return tab.title
+    }
+
+    private func refreshTerminalLabels() {
+        for index in terminalTabs.indices {
+            guard let noteId = terminalTabs[index].noteId,
+                  let topic = tabs.first(where: { $0.id == noteId }) else { continue }
+            terminalTabs[index].label = terminalLabel(for: topic,
+                                                      fallbackPath: terminalTabs[index].path)
+        }
+    }
+
     /// Resolve a note's terminal working directory, with provenance:
     ///   1. the note's own `localPath` override (wins), else
     ///   2. the NEAREST ancestor project folder's `localPath`, else
     ///   3. none.
-    /// `label` is the terminal-tab label: the project folder's name when
-    /// inherited, the path's last component for an override.
+    /// `label` identifies the conversation as "Topic - Workspace"; the local
+    /// path remains independently visible in the chip tooltip.
     func effectiveRoute(for tab: NoteTab?) -> (path: String, label: String, source: RouteSource) {
         guard let tab else { return ("", "", .none) }
         if let own = expandedPath(tab.localPath) {
-            return (own, (own as NSString).lastPathComponent, .own)
+            return (own, terminalLabel(for: tab, fallbackPath: own), .own)
         }
         if let folderId = tab.folderId,
            let folder = nearestLinkedFolder(startingAt: folderId),
            let path = expandedPath(folder.localPath) {
-            return (path, folder.name, .inherited)
+            return (path, terminalLabel(for: tab, fallbackPath: path), .inherited)
         }
         return ("", "", .none)
     }
@@ -1453,7 +1522,9 @@ class EditorViewModel: ObservableObject {
         guard let first = onPath.first else { return nil }
         if onPath.count == 1 { return (first, true) }
         if let sid = sessionId, !sid.isEmpty,
-           let known = onPath.first(where: { $0.claudeSessionId == sid }) {
+           let known = onPath.first(where: {
+               $0.claudeSessionId == sid || $0.codexSessionId == sid
+           }) {
             return (known, true)
         }
         // The hook ran as a child of the pane's own shell, so the pane's shell
@@ -1485,7 +1556,9 @@ class EditorViewModel: ObservableObject {
                 }
             }
         }
-        return (onPath.first(where: { $0.claudeSessionId == nil }) ?? first, false)
+        return (onPath.first(where: {
+            $0.claudeSessionId == nil && $0.codexSessionId == nil
+        }) ?? first, false)
     }
 
     /// Claude Code sends a `Notification` for two different things: "I need your
@@ -1549,13 +1622,26 @@ class EditorViewModel: ObservableObject {
             }
             if resolved.identified,
                let sid = obj["session_id"] as? String, !sid.isEmpty,
-               let idx = terminalTabs.firstIndex(where: { $0.id == tab.id }),
-               terminalTabs[idx].claudeSessionId != sid {
-                terminalTabs[idx].claudeSessionId = sid
-                terminalTabs[idx].claudeTranscriptPath = obj["transcript_path"] as? String
-                saveTerminalTabs()
-                dbg("transcript: pane \(tab.label) bound to session \(sid.prefix(8))")
-                if tab.id == activeTerminalId { TranscriptStore.shared.rebind(to: terminalTabs[idx]) }
+               let idx = terminalTabs.firstIndex(where: { $0.id == tab.id }) {
+                let transcript = obj["transcript_path"] as? String
+                let isCodex = transcript?.contains("/.floatnote-codex-transcripts/") == true
+                let changed: Bool
+                if isCodex {
+                    changed = terminalTabs[idx].codexSessionId != sid
+                        || terminalTabs[idx].codexTranscriptPath != transcript
+                    terminalTabs[idx].codexSessionId = sid
+                    terminalTabs[idx].codexTranscriptPath = transcript
+                } else {
+                    changed = terminalTabs[idx].claudeSessionId != sid
+                        || terminalTabs[idx].claudeTranscriptPath != transcript
+                    terminalTabs[idx].claudeSessionId = sid
+                    terminalTabs[idx].claudeTranscriptPath = transcript
+                }
+                if changed {
+                    saveTerminalTabs()
+                    dbg("transcript: pane \(tab.label) bound to \(isCodex ? "Codex" : "Claude") session \(sid.prefix(8))")
+                    if tab.id == activeTerminalId { TranscriptStore.shared.rebind(to: terminalTabs[idx]) }
+                }
             }
             dbg("claude event [\(event)] → pane \(tab.label) turnText=\(turnText.count)ch")
             // A conversation was started, resumed (`/resume`) or cleared in this
@@ -1750,6 +1836,14 @@ class EditorViewModel: ObservableObject {
     @Published var isDictating: Bool = false
     var wantsDictation: Bool = false  // user intent: keep dictation alive
     @Published var tabs: [NoteTab] = []
+    /// The folder row currently selected as the sidebar context. This is kept
+    /// separate from `activeTabId`: selecting a folder opens its first note,
+    /// while the folder itself remains the target for toolbar folder actions.
+    @Published var selectedFolderId: UUID?
+    var selectedFolder: Folder? {
+        guard let id = selectedFolderId else { return nil }
+        return folders.first(where: { !$0.isTrashed && $0.id == id })
+    }
     @Published var activeTabId: UUID? {
         // Remember the last note the user had open so cold start restores it.
         didSet {
@@ -1961,6 +2055,9 @@ class EditorViewModel: ObservableObject {
             if existing.localPath != diskTab.localPath {
                 existing.localPath = diskTab.localPath
             }
+            if existing.linkedTopicIds != diskTab.linkedTopicIds {
+                existing.linkedTopicIds = diskTab.linkedTopicIds
+            }
             // Sync the busy label (MCP set_note_status) — active tab included.
             if existing.jobStatus != diskTab.jobStatus {
                 existing.jobStatus = diskTab.jobStatus
@@ -2024,6 +2121,10 @@ class EditorViewModel: ObservableObject {
                     if tab.localPath != dt.localPath {
                         tab.localPath = dt.localPath
                     }
+                    let diskLinks = (dt.linkedTopicIds ?? []).compactMap(UUID.init(uuidString:))
+                    if tab.linkedTopicIds != diskLinks {
+                        tab.linkedTopicIds = diskLinks
+                    }
                     // Body/title/recording: don't overwrite the active tab
                     // (user may be typing); for others, adopt the disk version.
                     if diskId != activeTabId, tab.html != dt.html {
@@ -2079,11 +2180,12 @@ class EditorViewModel: ObservableObject {
             if let data = try? Data(contentsOf: URL(fileURLWithPath: LOCAL_FOLDERS_PATH)),
                let list = try? JSONDecoder().decode([FolderData].self, from: data) {
                 folders = list.map { Folder.from($0) }
+                refreshTerminalLabels()
             }
         }
     }
 
-    func addFolder(name: String = "New Folder") {
+    func addFolder(name: String = "New Workspace") {
         let folder = Folder(name: name, isExpanded: true)
         folders.append(folder)
         editingFolderId = folder.id
@@ -2101,6 +2203,7 @@ class EditorViewModel: ObservableObject {
             f.name = "Untitled"
         }
         folders = folders  // re-fire @Published (nested prop mutated)
+        refreshTerminalLabels()
         editingFolderId = nil
         saveFoldersLocal()
     }
@@ -2109,6 +2212,34 @@ class EditorViewModel: ObservableObject {
         guard let f = folders.first(where: { $0.id == id }) else { return }
         f.isExpanded.toggle()
         saveFoldersLocal()
+    }
+
+    /// Select a folder without treating selection as a disclosure action.
+    /// A collapsed folder opens so the note being activated stays visible.
+    func selectFolder(_ id: UUID) {
+        guard let folder = folders.first(where: { !$0.isTrashed && $0.id == id }) else { return }
+        commitTabRename()
+        editingFolderId = nil
+        selectedFolderId = id
+        if !folder.isExpanded {
+            folder.isExpanded = true
+            folders = folders
+            saveFoldersLocal()
+        }
+        var visited: Set<UUID> = []
+        if let first = firstSidebarNote(in: id, visited: &visited) {
+            switchTab(first.id, preservingFolderSelection: true)
+        }
+    }
+
+    /// Match the sidebar's visual order: child folders recursively, then notes
+    /// directly inside this folder. The visited set makes corrupt cycles safe.
+    private func firstSidebarNote(in folderId: UUID, visited: inout Set<UUID>) -> NoteTab? {
+        guard visited.insert(folderId).inserted else { return nil }
+        for child in folders where !child.isTrashed && child.parentId == folderId {
+            if let note = firstSidebarNote(in: child.id, visited: &visited) { return note }
+        }
+        return tabs.first(where: { $0.folderId == folderId })
     }
 
     /// Link a folder to a local directory, making it a "project". Notes in its
@@ -2246,6 +2377,7 @@ class EditorViewModel: ObservableObject {
         guard let f = folders.first(where: { $0.id == id }) else { return }
         // Cascade: the folder and every subfolder beneath it go to Trash together.
         let subtree = descendantFolderIds(of: id).union([id])
+        if selectedFolderId.map({ subtree.contains($0) }) == true { selectedFolderId = nil }
         for folder in folders where subtree.contains(folder.id) {
             folder.isTrashed = true
         }
@@ -2283,6 +2415,7 @@ class EditorViewModel: ObservableObject {
     func permanentlyDeleteFolder(_ id: UUID) {
         // Cascade: this folder plus every subfolder beneath it, and all their notes.
         let doomedFolderIds = descendantFolderIds(of: id).union([id])
+        if selectedFolderId.map({ doomedFolderIds.contains($0) }) == true { selectedFolderId = nil }
         let doomedTabs = tabs.filter { $0.folderId.map { doomedFolderIds.contains($0) } ?? false }
         let doomedActive = doomedTabs.contains { $0.id == activeTabId }
         for tab in doomedTabs {
@@ -2389,7 +2522,8 @@ class EditorViewModel: ObservableObject {
         DispatchQueue.main.async { self.isLoadingContent = false }
     }
 
-    func switchTab(_ id: UUID) {
+    func switchTab(_ id: UUID, preservingFolderSelection: Bool = false) {
+        if !preservingFolderSelection { selectedFolderId = nil }
         guard id != activeTabId, let newTab = tabs.first(where: { $0.id == id }) else { return }
 
         // Commit any active rename before changing the selected model.
@@ -2444,6 +2578,7 @@ class EditorViewModel: ObservableObject {
     }
 
     func addTab() {
+        selectedFolderId = nil
         flushPendingHTML()
         // Save current tab
         if let current = activeTab {
@@ -2460,9 +2595,41 @@ class EditorViewModel: ObservableObject {
         charCount = 0
         onContentLoaded?(NSAttributedString(string: ""))
         saveTabsLocal()
-        status = "New note"
+        status = "New topic"
         applyTerminalRouteForActiveNote(focusTerminal: false)
         focusEditor()
+    }
+
+    /// Topics available as directed context dependencies. Trashed topics and
+    /// the topic itself are excluded; connections may cross workspaces.
+    func connectionCandidates(for topic: NoteTab) -> [NoteTab] {
+        let trashedFolderIds = Set(folders.filter { $0.isTrashed }.map(\.id))
+        return tabs.filter {
+            $0.id != topic.id &&
+            $0.folderId != TRASH_FOLDER_ID &&
+            !($0.folderId.map { trashedFolderIds.contains($0) } ?? false)
+        }
+    }
+
+    func toggleTopicConnection(from sourceId: UUID, to targetId: UUID) {
+        guard sourceId != targetId,
+              let source = tabs.first(where: { $0.id == sourceId }),
+              tabs.contains(where: { $0.id == targetId }) else { return }
+        if let index = source.linkedTopicIds.firstIndex(of: targetId) {
+            source.linkedTopicIds.remove(at: index)
+        } else {
+            source.linkedTopicIds.append(targetId)
+        }
+        tabs = tabs
+        saveTabsLocal()
+    }
+
+    func clearTopicConnections(_ sourceId: UUID) {
+        guard let source = tabs.first(where: { $0.id == sourceId }),
+              !source.linkedTopicIds.isEmpty else { return }
+        source.linkedTopicIds = []
+        tabs = tabs
+        saveTabsLocal()
     }
 
     /// Move a note to Trash. Reversible via `restoreTab`.
@@ -2541,6 +2708,10 @@ class EditorViewModel: ObservableObject {
         if tab.title != title {
             BoardWindowController.shared.retitle(noteId: id, to: title)
             tab.title = title
+            for index in terminalTabs.indices where terminalTabs[index].noteId == id {
+                terminalTabs[index].label = terminalLabel(for: tab,
+                                                          fallbackPath: terminalTabs[index].path)
+            }
             saveTabsLocal()
         }
         editingTabId = nil
@@ -3948,7 +4119,9 @@ struct TerminalPanel: View {
 
     /// The terminal itself, unchanged — just lifted out so the split can place it.
     private func terminalSurface(_ tab: TerminalTab) -> some View {
-        SwiftTermContainer(id: tab.id, cwd: tab.path, freshClaude: tab.freshClaude)
+        SwiftTermContainer(id: tab.id, cwd: tab.path,
+                           freshClaude: tab.freshClaude,
+                           codexSessionId: tab.codexSessionId)
             .id(tab.id)
             .background(palette.backgroundColor)
             // Scrolled up? Say how far behind the live output we are.
@@ -4178,7 +4351,7 @@ struct NotesSidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 2) {
-                Text("NOTES")
+                Text("WORKSPACES")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(.secondary)
                     .kerning(0.6)
@@ -4190,7 +4363,7 @@ struct NotesSidebar: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("New folder")
+                .help("New workspace")
                 Button(action: { vm.addTab() }) {
                     Image(systemName: "plus")
                         .font(.system(size: 11))
@@ -4198,7 +4371,7 @@ struct NotesSidebar: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("New note")
+                .help("New topic")
             }
             .padding(.horizontal, 12)
             .padding(.top, 10)
@@ -4235,7 +4408,7 @@ struct NotesSidebar: View {
         }
         .background(vm.theme.chromeBackground)
         .alert(
-            "Permanently delete folder?",
+            "Permanently delete workspace?",
             isPresented: Binding(
                 get: { vm.folderPendingDeletion != nil },
                 set: { if !$0 { vm.folderPendingDeletion = nil } }
@@ -4248,7 +4421,7 @@ struct NotesSidebar: View {
             }
             Button("Cancel", role: .cancel) { vm.folderPendingDeletion = nil }
         } message: { folder in
-            Text("\"\(folder.name)\" and all notes inside will be permanently removed. This cannot be undone.")
+            Text("\"\(folder.name)\" and all topics inside will be permanently removed. This cannot be undone.")
         }
         .alert(
             "Empty Trash?",
@@ -4257,7 +4430,7 @@ struct NotesSidebar: View {
             Button("Empty Trash", role: .destructive) { vm.emptyTrash() }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("All notes and folders in the Trash will be permanently deleted. This cannot be undone.")
+            Text("All topics and workspaces in the Trash will be permanently deleted. This cannot be undone.")
         }
     }
 }
@@ -4276,9 +4449,9 @@ struct SidebarFolderView: View {
     private var tabsInFolder: [NoteTab] { vm.tabs.filter { $0.folderId == folder.id } }
     /// Live subfolders nested directly under this folder.
     private var subfolders: [Folder] { vm.folders.filter { !$0.isTrashed && $0.parentId == folder.id } }
-    /// A folder row has no "selected" state — the only thing that fills it is an
-    /// in-flight drag. The `isDragging` gate makes a leaked `dropTargetFolderId`
-    /// unpaintable, so a forgotten reset can never look like a selection.
+    private var isSelected: Bool { vm.selectedFolderId == folder.id }
+    /// The `isDragging` gate makes a leaked `dropTargetFolderId` unpaintable,
+    /// so a forgotten reset can never look like a selection.
     private var isDropTarget: Bool { vm.dropTargetFolderId == folder.id && vm.isDragging }
     /// Measured height of the header row, used to split it into the
     /// above / inside / below drop zones.
@@ -4330,7 +4503,8 @@ struct SidebarFolderView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(isDropTarget ? Color.accentColor.opacity(0.22) : Color.clear)
+                    .fill(isDropTarget ? Color.accentColor.opacity(0.22)
+                          : (isSelected ? Color.accentColor.opacity(0.18) : Color.clear))
             )
             .background(
                 GeometryReader { geo in
@@ -4349,19 +4523,19 @@ struct SidebarFolderView: View {
             .contentShape(Rectangle())
             .onTapGesture(count: 2) { vm.editingFolderId = folder.id }
             .onTapGesture(count: 1) {
-                if vm.editingFolderId != folder.id { vm.toggleFolderExpanded(folder.id) }
+                if vm.editingFolderId != folder.id { vm.selectFolder(folder.id) }
             }
             .contextMenu {
                 Button("Rename") { vm.editingFolderId = folder.id }
                 Divider()
                 if folder.localPath == nil {
-                    Button("Link Local Folder…") { pickFolderForLink() }
+                    Button("Attach Local Folder…") { pickFolderForLink() }
                 } else {
-                    Button("Change Folder…") { pickFolderForLink() }
-                    Button("Unlink Folder") { vm.unlinkFolder(folder.id) }
+                    Button("Change Attached Folder…") { pickFolderForLink() }
+                    Button("Detach Local Folder") { vm.unlinkFolder(folder.id) }
                 }
                 Divider()
-                Button("Move Folder to Trash", role: .destructive) {
+                Button("Move Workspace to Trash", role: .destructive) {
                     vm.trashFolder(folder.id)
                 }
             }
@@ -4394,7 +4568,7 @@ struct SidebarFolderView: View {
     /// Native folder picker → link (or re-link) this folder to a local directory.
     private func pickFolderForLink() {
         let panel = NSOpenPanel()
-        panel.title = "Link a local folder to “\(folder.name)”"
+        panel.title = "Attach a local folder to “\(folder.name)”"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -4556,13 +4730,22 @@ struct SidebarNoteItemView: View {
             if tab.uncheckedCount > 0 {
                 UncheckedBadge(count: tab.uncheckedCount)
             }
+            if !tab.linkedTopicIds.isEmpty {
+                Label("\(tab.linkedTopicIds.count)", systemImage: "link")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary.opacity(0.65))
+                    .labelStyle(.titleAndIcon)
+                    .help("Uses \(tab.linkedTopicIds.count) connected topic\(tab.linkedTopicIds.count == 1 ? "" : "s") as context")
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(isActive ? Color.accentColor.opacity(0.18) : Color.clear)
+                .fill(isActive
+                      ? Color.accentColor.opacity(vm.selectedFolderId == nil ? 0.18 : 0.07)
+                      : Color.clear)
         )
         .opacity(isDragging ? 0.4 : 1.0)
         .contentShape(Rectangle())
@@ -4579,8 +4762,28 @@ struct SidebarNoteItemView: View {
         .onDrop(of: [.text], delegate: TabDropDelegate(tab: tab, vm: vm))
         .contextMenu {
             Button("Rename") { vm.beginTabRename(tab.id) }
+            Menu("Use Context From") {
+                let candidates = vm.connectionCandidates(for: tab)
+                if candidates.isEmpty {
+                    Text("No other topics")
+                } else {
+                    ForEach(candidates) { candidate in
+                        Button {
+                            vm.toggleTopicConnection(from: tab.id, to: candidate.id)
+                        } label: {
+                            Label(candidate.title,
+                                  systemImage: tab.linkedTopicIds.contains(candidate.id)
+                                    ? "checkmark.circle.fill" : "circle")
+                        }
+                    }
+                    if !tab.linkedTopicIds.isEmpty {
+                        Divider()
+                        Button("Clear Connections") { vm.clearTopicConnections(tab.id) }
+                    }
+                }
+            }
             Divider()
-            Button("Move to Trash", role: .destructive) {
+            Button("Move Topic to Trash", role: .destructive) {
                 vm.trashTab(tab.id)
             }
         }
@@ -5775,11 +5978,62 @@ struct FormatToolbar: View {
         .help(vm.isPinned ? "Unpin from top" : "Pin to top")
     }
 
+    /// Folder selection is a distinct sidebar context: while a folder row is
+    /// selected, this control links that folder itself. Otherwise it retains
+    /// the existing per-note override/inheritance behavior.
+    @ViewBuilder
+    private var folderChip: some View {
+        if let folder = vm.selectedFolder {
+            selectedFolderChip(folder)
+        } else {
+            noteFolderChip
+        }
+    }
+
+    private func selectedFolderChip(_ folder: Folder) -> some View {
+        let path = folder.localPath ?? ""
+        let dirName = path.isEmpty ? "Link folder…" : (path as NSString).lastPathComponent
+        return Button(action: { pickLocalFolder(for: folder) }) {
+            HStack(spacing: 4) {
+                Image(systemName: path.isEmpty ? "folder.badge.plus" : "link")
+                    .font(.system(size: 10))
+                Text(dirName)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.accentColor)
+            .padding(.horizontal, 7)
+            .frame(height: 22)
+            .background(
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(hoveredButton == "folder" ? Color.primary.opacity(0.08) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hoveredButton = $0 ? "folder" : nil }
+        .help(path.isEmpty
+              ? "Link a local folder to “\(folder.name)”"
+              : "Local folder for “\(folder.name)”: \((path as NSString).abbreviatingWithTildeInPath)")
+        .contextMenu {
+            Button(path.isEmpty ? "Link Local Folder…" : "Change Local Folder…") {
+                pickLocalFolder(for: folder)
+            }
+            if !path.isEmpty {
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                }
+                Divider()
+                Button("Unlink Folder") { vm.unlinkFolder(folder.id) }
+            }
+        }
+        .fixedSize()
+    }
+
     /// The note's terminal-folder chip. Shows the effective directory's name
     /// (accent = inherited from a project folder, amber = this note's own
     /// override, gray "Set folder…" = none). Click → native folder picker sets
     /// the note's own path; the ✕ (override only) clears it back to inheriting.
-    private var folderChip: some View {
+    private var noteFolderChip: some View {
         let route = vm.activeRoute
         let dirName = route.path.isEmpty ? "" : (route.path as NSString).lastPathComponent
         return HStack(spacing: 1) {
@@ -5823,6 +6077,19 @@ struct FormatToolbar: View {
             }
         }
         .fixedSize()
+    }
+
+    private func pickLocalFolder(for folder: Folder) {
+        let panel = NSOpenPanel()
+        panel.title = "Link a local folder to “\(folder.name)”"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if let current = folder.localPath {
+            panel.directoryURL = URL(fileURLWithPath: current)
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        vm.linkFolder(folder.id, to: url.path)
     }
 
     private func chipColor(_ source: EditorViewModel.RouteSource) -> Color {

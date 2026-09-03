@@ -1,10 +1,10 @@
 {
   "name": "floatnote",
-  "version": "1.1.0",
+  "version": "1.7.0",
   "description": "FloatNote MCP server",
   "main": "mcp-server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node tests/mcp-knowledge-smoke.js"
   },
   "keywords": [],
   "author": "",

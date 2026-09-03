@@ -24,9 +24,14 @@ final class TerminalSessions {
     /// existing session keeps the directory it was started in.
     /// The legacy-persisted `freshClaude` flag now means a brand-new selected-
     /// agent conversation for this pane (never `--continue`).
-    func session(for id: UUID, cwd: String, freshClaude: Bool = false) -> TerminalSession {
-        if let existing = sessions[id] { return existing }
-        let s = TerminalSession(id: id, cwd: cwd, freshClaude: freshClaude)
+    func session(for id: UUID, cwd: String, freshClaude: Bool = false,
+                 codexSessionId: String? = nil) -> TerminalSession {
+        if let existing = sessions[id] {
+            existing.codexSessionId = codexSessionId
+            return existing
+        }
+        let s = TerminalSession(id: id, cwd: cwd, freshClaude: freshClaude,
+                                codexSessionId: codexSessionId)
         sessions[id] = s
         return s
     }
@@ -254,6 +259,10 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
     /// pane on the same project would otherwise `--continue` straight into the
     /// conversation the first pane is already running.
     let freshClaude: Bool
+    /// The exact Codex conversation owned by this pane. `resume --last` is not
+    /// pane-safe: another terminal, subagent, or approval reviewer can become
+    /// newest while this shell is restarting.
+    var codexSessionId: String?
     private var resetObserver: NSObjectProtocol?
     /// Bumped on each (re)start so a delayed `claude` auto-send from a prior
     /// session can never land in a newer shell.
@@ -263,10 +272,12 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
     /// `exit` — only the latter auto-closes the pane.
     private var expectedTermination = false
 
-    init(id: UUID, cwd: String, freshClaude: Bool = false) {
+    init(id: UUID, cwd: String, freshClaude: Bool = false,
+         codexSessionId: String? = nil) {
         self.id = id
         self.cwd = cwd
         self.freshClaude = freshClaude
+        self.codexSessionId = codexSessionId
         self.view = LocalProcessTerminalView(frame: .zero)
         super.init()
         view.processDelegate = self
@@ -334,7 +345,8 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
                 dir: dir,
                 home: home,
                 projectsRoot: home + "/.claude/projects",
-                fresh: self.freshClaude
+                fresh: self.freshClaude,
+                codexSessionId: self.codexSessionId
             )
             term?.send(txt: command)
         }
@@ -348,6 +360,7 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
         home: String,
         projectsRoot: String,
         fresh: Bool,
+        codexSessionId: String? = nil,
         fileManager: FileManager = .default,
         defaults: UserDefaults = .standard
     ) -> String {
@@ -357,6 +370,11 @@ final class TerminalSession: NSObject, LocalProcessTerminalViewDelegate {
         let router = "'" + routerPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
 
         if selected == "codex" {
+            if let sessionId = codexSessionId, !sessionId.isEmpty {
+                let quoted = "'" + sessionId.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                return hasRouter ? "\(router) --continue \(quoted)\n"
+                                 : "codex resume \(quoted) --no-alt-screen\n"
+            }
             if hasRouter {
                 return fresh ? "\(router)\n" : "\(router) --continue\n"
             }
@@ -457,6 +475,7 @@ struct SwiftTermContainer: NSViewRepresentable {
     let id: UUID
     let cwd: String
     var freshClaude: Bool = false
+    var codexSessionId: String? = nil
 
     func makeNSView(context: Context) -> NSView {
         let container = NSView()
@@ -469,7 +488,9 @@ struct SwiftTermContainer: NSViewRepresentable {
     }
 
     private func attachTerminal(to container: NSView) {
-        let term = TerminalSessions.shared.session(for: id, cwd: cwd, freshClaude: freshClaude).view
+        let term = TerminalSessions.shared.session(for: id, cwd: cwd,
+                                                   freshClaude: freshClaude,
+                                                   codexSessionId: codexSessionId).view
         guard term.superview !== container else { return }
         term.removeFromSuperview()
         term.translatesAutoresizingMaskIntoConstraints = false

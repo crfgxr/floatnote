@@ -9,6 +9,7 @@ const os = require("os");
 
 const TABS_PATH = path.join(os.homedir(), ".floatnote-tabs.json");
 const FOLDERS_PATH = path.join(os.homedir(), ".floatnote-folders.json");
+const MEMORY_PATH = path.join(os.homedir(), ".floatnote-workspace-memory.json");
 const IMAGES_DIR = path.join(os.homedir(), ".floatnote-images");
 
 // Inline images are stored as PNGs and referenced from a note's HTML by the
@@ -46,6 +47,17 @@ function readTabs() { return readJSON(TABS_PATH); }
 function writeTabs(tabs) { writeJSON(TABS_PATH, tabs); }
 function readFolders() { return readJSON(FOLDERS_PATH); }
 function writeFolders(folders) { writeJSON(FOLDERS_PATH, folders); }
+function readMemories() { return readJSON(MEMORY_PATH); }
+function writeMemories(memories) { writeJSON(MEMORY_PATH, memories); }
+
+function findTopic(tabs, identifier) {
+  const value = String(identifier || "").toLowerCase();
+  return (
+    tabs.find((t) => t.id === identifier) ||
+    tabs.find((t) => t.title.toLowerCase() === value) ||
+    tabs.find((t) => t.title.toLowerCase().includes(value))
+  );
+}
 
 function findFolder(folders, identifier) {
   return (
@@ -53,6 +65,64 @@ function findFolder(folders, identifier) {
     folders.find((f) => f.name.toLowerCase() === identifier.toLowerCase()) ||
     folders.find((f) => f.name.toLowerCase().includes(identifier.toLowerCase()))
   );
+}
+
+function descendantWorkspaceIds(folders, rootId) {
+  const ids = new Set([rootId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const folder of folders) {
+      if (folder.parentId && ids.has(folder.parentId) && !ids.has(folder.id)) {
+        ids.add(folder.id);
+        changed = true;
+      }
+    }
+  }
+  return ids;
+}
+
+function rootWorkspaceForFolder(folders, folderId) {
+  let current = folders.find((f) => f.id === folderId);
+  const visited = new Set();
+  while (current && current.parentId && !visited.has(current.id)) {
+    visited.add(current.id);
+    current = folders.find((f) => f.id === current.parentId) || current;
+    if (visited.has(current.id)) break;
+  }
+  return current || null;
+}
+
+function topicWorkspace(folders, topic) {
+  return topic && topic.folderId ? rootWorkspaceForFolder(folders, topic.folderId) : null;
+}
+
+function normalizedWords(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}_-]+/gu, " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 1);
+}
+
+function lexicalScore(query, title, body) {
+  const words = [...new Set(normalizedWords(query))];
+  if (words.length === 0) return 0;
+  const lowTitle = String(title || "").toLowerCase();
+  const lowBody = String(body || "").toLowerCase();
+  return words.reduce((score, word) =>
+    score + (lowTitle.includes(word) ? 5 : 0) + (lowBody.includes(word) ? 1 : 0), 0);
+}
+
+function compactExcerpt(value, maxChars) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function resolveWorkspace(folders, identifier) {
+  const folder = findFolder(folders, identifier);
+  return folder ? rootWorkspaceForFolder(folders, folder.id) : null;
 }
 
 /// Base64 PNG for a file on disk, downscaled via macOS `sips` when it's larger
@@ -350,7 +420,7 @@ function describeElement(el, elements) {
 
 // --- MCP Server ---
 
-const MCP_VERSION = "1.6.0";
+const MCP_VERSION = "1.7.0";
 
 // Sentinel folder ID for loose-trashed notes (notes moved to Trash by themselves).
 // Mirrors `TRASH_FOLDER_ID` in App.swift — must stay in sync.
@@ -359,6 +429,8 @@ const TRASH_FOLDER_ID = "00000000-0000-0000-0000-000000000001";
 const server = new McpServer({
   name: "floatnote",
   version: MCP_VERSION,
+}, {
+  instructions: "FloatNote organizes durable knowledge as Workspaces containing Topics. At the start of topic work, call get_topic_context so the active topic, its directed connections, and relevant workspace memories are loaded within a small budget. After a meaningful durable decision, fact, or open task, call save_workspace_memory. Do not checkpoint routine conversation, transient output, secrets, credentials, or personal data.",
 });
 
 /*
@@ -372,6 +444,245 @@ const server = new McpServer({
 */
 
 // --- Tools ---
+
+server.tool(
+  "list_workspaces",
+  "List FloatNote workspaces. A workspace is a top-level FloatNote folder; its notes are topics and nested folders remain inside that workspace.",
+  {},
+  async () => {
+    const folders = readFolders();
+    const tabs = readTabs();
+    const workspaces = folders.filter((f) => !f.isTrashed && !f.parentId);
+    if (workspaces.length === 0) {
+      return { content: [{ type: "text", text: "No workspaces found." }] };
+    }
+    const lines = workspaces.map((workspace) => {
+      const scope = descendantWorkspaceIds(folders, workspace.id);
+      const count = tabs.filter((t) => scope.has(t.folderId)).length;
+      const source = workspace.localPath ? ` · local source: ${workspace.localPath}` : "";
+      return `[${workspace.id}] ${workspace.name} (${count} topic${count === 1 ? "" : "s"})${source}`;
+    });
+    return { content: [{ type: "text", text: `FloatNote MCP v${MCP_VERSION}\n\n${lines.join("\n")}` }] };
+  }
+);
+
+server.tool(
+  "list_topics",
+  "List FloatNote topics, optionally limited to one workspace. Returns compact metadata only, not full topic bodies.",
+  {
+    workspace: z.string().optional().describe("Workspace ID or name. Omit to list all topics."),
+  },
+  async ({ workspace }) => {
+    const folders = readFolders();
+    let tabs = readTabs().filter((t) => t.folderId !== TRASH_FOLDER_ID);
+    let heading = "All topics";
+    if (workspace) {
+      const root = resolveWorkspace(folders, workspace);
+      if (!root) return { content: [{ type: "text", text: `Workspace not found: "${workspace}"` }] };
+      const scope = descendantWorkspaceIds(folders, root.id);
+      tabs = tabs.filter((t) => scope.has(t.folderId));
+      heading = root.name;
+    }
+    if (tabs.length === 0) return { content: [{ type: "text", text: `${heading} has no topics.` }] };
+    const lines = tabs.map((topic) => {
+      const root = topicWorkspace(folders, topic);
+      const links = Array.isArray(topic.linkedTopicIds) ? topic.linkedTopicIds.length : 0;
+      return `[${topic.id}] ${topic.title} · workspace: ${root?.name || "Unassigned"} · uses: ${links}`;
+    });
+    return { content: [{ type: "text", text: `${heading}\n\n${lines.join("\n")}` }] };
+  }
+);
+
+server.tool(
+  "connect_topics",
+  "Create or remove a directed topic connection. When source uses target, get_topic_context retrieves target before workspace search.",
+  {
+    source: z.string().describe("Source topic ID or title"),
+    target: z.string().describe("Target topic ID or title to use as context"),
+    connected: z.boolean().optional().describe("true/add (default) or false/remove"),
+  },
+  async ({ source, target, connected = true }) => {
+    const tabs = readTabs();
+    const sourceTopic = findTopic(tabs, source);
+    const targetTopic = findTopic(tabs, target);
+    if (!sourceTopic) return { content: [{ type: "text", text: `Source topic not found: "${source}"` }] };
+    if (!targetTopic) return { content: [{ type: "text", text: `Target topic not found: "${target}"` }] };
+    if (sourceTopic.id === targetTopic.id) {
+      return { content: [{ type: "text", text: "A topic cannot use itself as connected context." }] };
+    }
+    const links = new Set(Array.isArray(sourceTopic.linkedTopicIds) ? sourceTopic.linkedTopicIds : []);
+    if (connected) links.add(targetTopic.id); else links.delete(targetTopic.id);
+    sourceTopic.linkedTopicIds = [...links];
+    writeTabs(tabs);
+    const verb = connected ? "now uses" : "no longer uses";
+    return { content: [{ type: "text", text: `"${sourceTopic.title}" ${verb} "${targetTopic.title}" as context.` }] };
+  }
+);
+
+server.tool(
+  "save_workspace_memory",
+  "Save or update one small durable workspace checkpoint. Use for decisions, facts, and open tasks that should survive into another session; never store secrets or routine chat.",
+  {
+    workspace: z.string().describe("Workspace ID or name"),
+    content: z.string().min(1).max(2000).describe("One concise durable statement"),
+    type: z.enum(["decision", "fact", "task"]).describe("Checkpoint kind"),
+    topic: z.string().optional().describe("Primary topic ID or title"),
+    relatedTopics: z.array(z.string()).max(12).optional().describe("Related topic IDs or titles"),
+    sourceSession: z.string().max(200).optional().describe("Agent session/thread ID when available"),
+    memoryId: z.string().optional().describe("Existing memory ID to revise instead of creating a new entry"),
+  },
+  async ({ workspace, content, type, topic, relatedTopics = [], sourceSession, memoryId }) => {
+    const crypto = require("crypto");
+    const folders = readFolders();
+    const tabs = readTabs();
+    const root = resolveWorkspace(folders, workspace);
+    if (!root) return { content: [{ type: "text", text: `Workspace not found: "${workspace}"` }] };
+    const primary = topic ? findTopic(tabs, topic) : null;
+    if (topic && !primary) return { content: [{ type: "text", text: `Topic not found: "${topic}"` }] };
+    const related = [];
+    for (const identifier of relatedTopics) {
+      const match = findTopic(tabs, identifier);
+      if (!match) return { content: [{ type: "text", text: `Related topic not found: "${identifier}"` }] };
+      if (!related.includes(match.id)) related.push(match.id);
+    }
+    const memories = readMemories();
+    const trimmed = content.trim();
+    const now = new Date().toISOString();
+    let entry = memoryId ? memories.find((item) => item.id === memoryId) : null;
+    if (!entry && !memoryId) {
+      entry = memories.find((item) =>
+        item.workspaceId === root.id && item.topicId === (primary?.id || null) &&
+        item.type === type && String(item.content).toLowerCase() === trimmed.toLowerCase()
+      );
+    }
+    if (memoryId && !entry) return { content: [{ type: "text", text: `Memory not found: "${memoryId}"` }] };
+    if (entry) {
+      entry.workspaceId = root.id;
+      entry.topicId = primary?.id || null;
+      entry.relatedTopicIds = related;
+      entry.type = type;
+      entry.content = trimmed;
+      entry.sourceSession = sourceSession || entry.sourceSession || null;
+      entry.revision = (entry.revision || 1) + 1;
+      entry.updatedAt = now;
+    } else {
+      entry = {
+        id: crypto.randomUUID(), workspaceId: root.id, topicId: primary?.id || null,
+        relatedTopicIds: related, type, content: trimmed,
+        sourceSession: sourceSession || null, revision: 1, createdAt: now, updatedAt: now,
+      };
+      memories.push(entry);
+    }
+    writeMemories(memories);
+    return { content: [{ type: "text", text: `Memory checkpoint saved [${entry.id}] revision ${entry.revision}.` }] };
+  }
+);
+
+server.tool(
+  "list_workspace_memory",
+  "Review durable checkpoint memories for a workspace, newest first.",
+  {
+    workspace: z.string().describe("Workspace ID or name"),
+    limit: z.number().int().min(1).max(100).optional().describe("Maximum entries; default 30"),
+  },
+  async ({ workspace, limit = 30 }) => {
+    const folders = readFolders();
+    const tabs = readTabs();
+    const root = resolveWorkspace(folders, workspace);
+    if (!root) return { content: [{ type: "text", text: `Workspace not found: "${workspace}"` }] };
+    const titleById = new Map(tabs.map((t) => [t.id, t.title]));
+    const memories = readMemories()
+      .filter((item) => item.workspaceId === root.id)
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+      .slice(0, limit);
+    if (memories.length === 0) return { content: [{ type: "text", text: `${root.name} has no saved memory checkpoints.` }] };
+    const lines = memories.map((item) =>
+      `- [${item.id}] ${item.type} · ${titleById.get(item.topicId) || "workspace"} · r${item.revision || 1}\n  ${item.content}`
+    );
+    return { content: [{ type: "text", text: `${root.name} memory\n\n${lines.join("\n")}` }] };
+  }
+);
+
+server.tool(
+  "forget_workspace_memory",
+  "Permanently remove one workspace memory checkpoint by its exact ID.",
+  { memoryId: z.string().describe("Exact memory ID from list_workspace_memory") },
+  async ({ memoryId }) => {
+    const memories = readMemories();
+    const index = memories.findIndex((item) => item.id === memoryId);
+    if (index < 0) return { content: [{ type: "text", text: `Memory not found: "${memoryId}"` }] };
+    const removed = memories.splice(index, 1)[0];
+    writeMemories(memories);
+    return { content: [{ type: "text", text: `Forgot memory [${removed.id}]: ${removed.content}` }] };
+  }
+);
+
+server.tool(
+  "get_topic_context",
+  "Build a token-conscious context bundle: active topic first, directed topic connections second, durable workspace memory third, lexical workspace search last.",
+  {
+    identifier: z.string().describe("Active topic ID or title"),
+    query: z.string().optional().describe("Current task/question for ranking memories and fallback topics"),
+    maxChars: z.number().int().min(2000).max(30000).optional().describe("Hard output budget in characters; default 12000"),
+  },
+  async ({ identifier, query = "", maxChars = 12000 }) => {
+    const tabs = readTabs().filter((t) => t.folderId !== TRASH_FOLDER_ID);
+    const folders = readFolders();
+    const active = findTopic(tabs, identifier);
+    if (!active) return { content: [{ type: "text", text: `Topic not found: "${identifier}"` }] };
+    const workspace = topicWorkspace(folders, active);
+    const workspaceScope = workspace ? descendantWorkspaceIds(folders, workspace.id) : new Set();
+    const linkedIds = new Set(Array.isArray(active.linkedTopicIds) ? active.linkedTopicIds : []);
+    const linked = tabs.filter((t) => linkedIds.has(t.id)).slice(0, 5);
+    const rankingQuery = `${query} ${active.title} ${stripHTML(active.html).slice(0, 1200)}`;
+    const memories = workspace ? readMemories()
+      .filter((item) => item.workspaceId === workspace.id)
+      .map((item) => ({ item, score: lexicalScore(rankingQuery, item.type, item.content) + (item.topicId === active.id ? 8 : 0) }))
+      .sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)))
+      .slice(0, 6).map(({ item }) => item) : [];
+    const fallback = tabs
+      .filter((t) => workspaceScope.has(t.folderId) && t.id !== active.id && !linkedIds.has(t.id))
+      .map((topic) => ({ topic, score: lexicalScore(rankingQuery, topic.title, stripHTML(topic.html)) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3).map(({ topic }) => topic);
+
+    const titleById = new Map(tabs.map((t) => [t.id, t.title]));
+    const sections = [];
+    let used = 0;
+    const add = (heading, body, sourceId) => {
+      const prefix = `## ${heading}${sourceId ? ` [${sourceId}]` : ""}\n`;
+      const remaining = maxChars - used - prefix.length - 2;
+      if (remaining <= 80) return false;
+      const excerpt = compactExcerpt(body, remaining);
+      sections.push(prefix + (excerpt || "(empty)"));
+      used += prefix.length + excerpt.length + 2;
+      return true;
+    };
+
+    const manifest = [
+      `Workspace: ${workspace?.name || "Unassigned"}${workspace ? ` [${workspace.id}]` : ""}`,
+      `Active topic: ${active.title} [${active.id}]`,
+      `Directed connections: ${linked.map((t) => `${t.title} [${t.id}]`).join(", ") || "none"}`,
+      `Budget: ${maxChars} characters`,
+    ].join("\n");
+    add("Context manifest", manifest);
+    add(`Active topic · ${active.title}`, stripHTML(active.html), active.id);
+    for (const topic of linked) {
+      if (!add(`Connected topic · ${topic.title}`, stripHTML(topic.html), topic.id)) break;
+    }
+    if (memories.length > 0) {
+      const body = memories.map((item) =>
+        `- ${item.type} [${item.id}] · ${titleById.get(item.topicId) || "workspace"}: ${item.content}`
+      ).join("\n");
+      add("Durable workspace memory", body);
+    }
+    for (const topic of fallback) {
+      if (!add(`Workspace search · ${topic.title}`, stripHTML(topic.html), topic.id)) break;
+    }
+    return { content: [{ type: "text", text: sections.join("\n\n") }] };
+  }
+);
 
 server.tool("list_notes", "List all FloatNote tabs with their IDs and titles. Each tab has: id (UUID), title, html (content), recordingPath (optional .m4a path for audio recordings). Notes with a non-empty attached whiteboard are marked [has diagram] (see read_board / draw_on_board).", {}, async () => {
   const tabs = readTabs();

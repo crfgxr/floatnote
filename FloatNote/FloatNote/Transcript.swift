@@ -350,7 +350,24 @@ enum TranscriptResolver {
     ///     because some other session's mtime moved is worse than a stale one.
     static func resolve(for tab: TerminalTab, claimed: Set<String> = [],
                         sticky: Resolution? = nil) -> Resolution? {
-        // 1. The hook told us. Claude Code named the session itself.
+        // 1. The selected agent's hook told us. Keep Codex and Claude identity
+        // separate: switching agents must not overwrite the other conversation.
+        let selectedCodex = UserDefaults.standard.string(forKey: "FloatNoteAgent") != "claude"
+        if selectedCodex {
+            if let path = tab.codexTranscriptPath, FileManager.default.fileExists(atPath: path) {
+                return Resolution(path: path, authoritative: true)
+            }
+            if let sid = tab.codexSessionId {
+                let path = NSHomeDirectory() + "/.floatnote-codex-transcripts/" + sid + ".jsonl"
+                if FileManager.default.fileExists(atPath: path) {
+                    return Resolution(path: path, authoritative: true)
+                }
+            }
+            if let sticky, FileManager.default.fileExists(atPath: sticky.path) { return sticky }
+            return nil
+        }
+
+        // Claude Code named the session itself.
         if let path = tab.claudeTranscriptPath, FileManager.default.fileExists(atPath: path) {
             return Resolution(path: path, authoritative: true)
         }
