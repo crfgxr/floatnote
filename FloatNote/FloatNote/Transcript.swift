@@ -1525,7 +1525,12 @@ enum TranscriptDocument {
             let start = out.length
             defer {
                 if out.length > start {
-                    out.addAttribute(.transcriptTurnStart, value: true,
+                    // "user:<id>" / "other:<id>": the view re-anchors when a NEW
+                    // prompt lands, so it has to tell a prompt from a tool line
+                    // and this turn from the last one it anchored on.
+                    var marker = "other:"
+                    if case .user = turn.kind { marker = "user:" }
+                    out.addAttribute(.transcriptTurnStart, value: marker + turn.id,
                                      range: NSRange(location: start, length: 1))
                 }
             }
@@ -1559,12 +1564,13 @@ enum TranscriptDocument {
         return out
     }
 
-    /// Where the newest turn begins, for the initial scroll position.
-    static func lastTurnStart(in document: NSAttributedString) -> Int? {
-        var found: Int?
+    /// Where the newest turn begins, for the initial scroll position, with its
+    /// marker ("user:<id>" or "other:<id>", see `build`).
+    static func lastTurnStart(in document: NSAttributedString) -> (location: Int, marker: String)? {
+        var found: (Int, String)?
         document.enumerateAttribute(.transcriptTurnStart,
                                     in: NSRange(location: 0, length: document.length)) { value, range, _ in
-            if value != nil { found = range.location }
+            if let marker = value as? String { found = (range.location, marker) }
         }
         return found
     }
@@ -1814,11 +1820,16 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         /// Length of the document installed last time, to tell an append (the
         /// tail grew) from a fresh load (a pane switch, or a restyle).
         var lastLength = 0
-        /// The pane follows the tail only while the reader is already at it.
-        var following = true
         /// Identity of the conversation installed last time; a change means a
         /// rebind, which has to re-anchor rather than scroll on.
         var lastDocumentId = 0
+        /// Marker of the turn the pane last anchored on, so a NEW prompt (a new
+        /// exchange) re-anchors wherever the reader had left the view.
+        var lastAnchoredTurn: String?
+        /// While set, appends scroll the view toward the tail but never past
+        /// this offset — the top of the newest prompt. Cleared once reached, or
+        /// the moment the reader scrolls by hand.
+        var followUntil: CGFloat?
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -1869,18 +1880,20 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
 
         context.coordinator.textView = textView
         context.coordinator.scrollView = scroll
+        // The reader's own scrolling ends any follow in progress. Live-scroll
+        // notifications fire for gestures only, never for the programmatic
+        // scrolls below, so this cannot misfire on the pane's own moves.
         NotificationCenter.default.addObserver(
-            forName: NSView.boundsDidChangeNotification,
-            object: scroll.contentView, queue: .main
+            forName: NSScrollView.willStartLiveScrollNotification, object: scroll, queue: .main
         ) { _ in
-            MainActor.assumeIsolated {
-                guard let doc = scroll.documentView else { return }
-                let maxY = max(0, doc.bounds.height - scroll.contentView.bounds.height)
-                context.coordinator.following = scroll.contentView.bounds.origin.y >= maxY - 24
-            }
+            MainActor.assumeIsolated { context.coordinator.followUntil = nil }
         }
-        scroll.contentView.postsBoundsChangedNotifications = true
         context.coordinator.lastDocumentId = documentId
+        // Record the document we install here so SwiftUI's first update pass
+        // cannot mistake it for an append and immediately jump to the end.
+        context.coordinator.lastGeneration = generation
+        context.coordinator.lastStyleGeneration = styleGeneration
+        context.coordinator.lastMeasure = measure
         apply(document, to: context.coordinator, animated: false)
         return scroll
     }
@@ -1889,12 +1902,10 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         guard context.coordinator.lastGeneration != generation
                 || context.coordinator.lastStyleGeneration != styleGeneration
                 || context.coordinator.lastDocumentId != documentId else { return }
-        // A different conversation: open it the way a fresh read opens, on the
-        // newest turn, and start following its tail again.
+        // A different conversation is a fresh read: open on its newest turn.
         if context.coordinator.lastDocumentId != documentId {
             context.coordinator.lastDocumentId = documentId
             context.coordinator.lastLength = 0
-            context.coordinator.following = true
         }
         // A width change re-lays out everything, bubbles included, so it counts
         // as a restyle — otherwise resizing the panel left the old measure.
@@ -1931,11 +1942,19 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
         coordinator.lastLength = document.length
         textView.textStorage?.setAttributedString(document)
 
-        // A fresh document (pane switch, first read) opens at the TOP of the
-        // newest turn — landing at the very end shows you the last line of the
-        // answer and none of its beginning. A grown one keeps following the tail.
-        if previous == 0 || document.length < previous {
-            let index = TranscriptDocument.lastTurnStart(in: document)
+        // Two things move the pane: a fresh document (pane switch, first read,
+        // restyle, shorter replacement) opens at the TOP of its newest turn,
+        // clamped to the end; a NEW PROMPT scrolls to the end so the prompt is
+        // in view with the conversation still above it. From either, appends
+        // follow the tail only until the newest turn's top reaches the top of
+        // the viewport, then hold — so the start of the reply never scrolls out
+        // of sight, and the reader scrolls on from there. (Padding the document
+        // to put the prompt at the top pushed the earlier texts out of view.)
+        let newest = TranscriptDocument.lastTurnStart(in: document)
+        let newPrompt = newest.map { $0.marker.hasPrefix("user:") && $0.marker != coordinator.lastAnchoredTurn } ?? false
+        if previous == 0 || document.length < previous || newPrompt {
+            coordinator.lastAnchoredTurn = newest?.marker
+            let index = newest?.location
             DispatchQueue.main.async {
                 guard let layout = textView.layoutManager,
                       let container = textView.textContainer else { return }
@@ -1956,15 +1975,20 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
 
                 let clip = scroll.contentView
                 let maxY = max(0, textView.bounds.height - clip.bounds.height)
-                var y = maxY
+                var turnTop = maxY
                 if let index, index < document.length {
                     let glyphs = layout.glyphRange(forCharacterRange: NSRange(location: index, length: 1),
                                                    actualCharacterRange: nil)
                     let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
-                    y = min(max(0, rect.minY + textView.textContainerInset.height - 12), maxY)
+                    turnTop = max(0, rect.minY + textView.textContainerInset.height - 12)
                 }
+                let y = newPrompt ? maxY : min(turnTop, maxY)
+                coordinator.followUntil = turnTop > y ? turnTop : nil
                 clip.scroll(to: NSPoint(x: 0, y: y))
                 scroll.reflectScrolledClipView(clip)
+                dbg("transcript: \(newPrompt ? "new prompt" : "fresh document") shown at y=\(Int(y)) of \(Int(maxY)), "
+                    + "newest turn top at \(Int(turnTop)) (char \(index ?? -1) of \(document.length))"
+                    + (coordinator.followUntil == nil ? "" : " — following until it reaches the top"))
                 // One more pass after the scroll settles: the clip view's own
                 // bounds change can leave the newly exposed rows unpainted.
                 DispatchQueue.main.async {
@@ -1974,9 +1998,23 @@ struct TranscriptTextViewRepresentable: NSViewRepresentable {
             }
             return
         }
-        guard coordinator.following else { return }
+        guard let cap = coordinator.followUntil else { return }
         DispatchQueue.main.async {
-            textView.scrollToEndOfDocument(nil)
+            guard let layout = textView.layoutManager,
+                  let container = textView.textContainer else { return }
+            layout.ensureLayout(for: container)
+            textView.sizeToFit()
+            let clip = scroll.contentView
+            let maxY = max(0, textView.bounds.height - clip.bounds.height)
+            let y = min(maxY, cap)
+            if maxY >= cap {
+                coordinator.followUntil = nil
+                dbg("transcript: newest turn reached the top at y=\(Int(cap)) — holding")
+            }
+            // Never scroll up on an append: the reader may have parked here.
+            guard y > clip.bounds.origin.y else { return }
+            clip.scroll(to: NSPoint(x: 0, y: y))
+            scroll.reflectScrolledClipView(clip)
         }
     }
 }

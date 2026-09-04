@@ -18,7 +18,7 @@ func dbg(_ msg: String) {
     }
 }
 
-let APP_VERSION = "v1.95.1"
+let APP_VERSION = "v1.95.3"
 let LOCAL_SAVE_PATH = NSHomeDirectory() + "/.floatnote-local.html"
 let LOCAL_TABS_PATH = NSHomeDirectory() + "/.floatnote-tabs.json"
 let LOCAL_FOLDERS_PATH = NSHomeDirectory() + "/.floatnote-folders.json"
@@ -1516,6 +1516,22 @@ class EditorViewModel: ObservableObject {
     private func paneForClaudeEvent(cwd: String, sessionId: String?,
                                     transcriptPath: String?,
                                     pidChain: [Int]) -> (tab: TerminalTab, identified: Bool)? {
+        // Ancestry first, over EVERY pane: the hook runs as a child of the
+        // pane's own shell, so a pane whose shell pid is in the chain is the
+        // answer whatever `cwd` says. Claude's working directory follows its
+        // shell — one `cd` into a subfolder by the agent's own tool calls and
+        // the path filter below dropped the pane's Stop event, leaving the
+        // spinner on until the quiet cap.
+        if !pidChain.isEmpty {
+            let chain = Set(pidChain)
+            if let match = terminalTabs.first(where: { tab in
+                guard let pid = TerminalSessions.shared.existing(tab.id)?.view.process.shellPid,
+                      pid > 0 else { return false }
+                return chain.contains(Int(pid))
+            }) {
+                return (match, true)
+            }
+        }
         let onPath = terminalTabs.filter {
             URL(fileURLWithPath: $0.path).standardizedFileURL.path == cwd
         }
@@ -1527,25 +1543,13 @@ class EditorViewModel: ObservableObject {
            }) {
             return (known, true)
         }
-        // The hook ran as a child of the pane's own shell, so the pane's shell
-        // pid is somewhere up the chain it recorded. Exact, and free on this
-        // side — no `lsof`, no guessing. This is the signal that actually
-        // identifies a fork: the open-fd probe below cannot, because Claude does
-        // not hold its session file open between turns and a subagent inherits
-        // its parent session's descriptor.
-        if !pidChain.isEmpty {
-            let chain = Set(pidChain)
-            if let match = onPath.first(where: { tab in
-                guard let pid = TerminalSessions.shared.existing(tab.id)?.view.process.shellPid,
-                      pid > 0 else { return false }
-                return chain.contains(Int(pid))
-            }) {
-                return (match, true)
-            }
-        }
-        // A session this app has not seen before, with siblings in the running:
-        // ask the shells which one is holding the file open. Same probe the
-        // transcript uses (~16ms), and only ever on this path.
+        // No shell pid in the chain (an older hook install, or a restored pane
+        // whose shell was replaced) and siblings in the running: ask the shells
+        // which one is holding the file open. Same probe the transcript uses
+        // (~16ms), and only ever on this path. It cannot tell a fork apart —
+        // Claude does not hold its session file open between turns and a
+        // subagent inherits its parent's descriptor — which is why ancestry
+        // above is the primary signal.
         if let path = transcriptPath, !path.isEmpty {
             let store = (path as NSString).deletingLastPathComponent
             for tab in onPath {
